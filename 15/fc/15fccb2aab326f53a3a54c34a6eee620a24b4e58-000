@@ -1,0 +1,262 @@
+# 12 October 2026: shared differentiable DSP of the tonal and effect blocks of the sound bank (task A2).
+# Everything here is torch, differentiable in every continuous parameter, and deterministic (fixed-seed noise only
+# through Block.noise). Derived from the published mathematics (RBJ Audio EQ Cookbook formulas, which its author
+# placed in the public domain; Karplus and Strong 1983; Jot and Chaigne 1991 for the feedback delay network;
+# Valimaki and Huovilainen 2007 for polyBLEP), no code copied.
+# What it adds to bank.py (task A0) without changing it:
+#   * EffectBlock: a Block whose forward() processes a fixed deterministic test exciter (so the effect can be rendered,
+#     verified and fitted alone like any block), and whose process(x, n, sr) transforms a bus inside a chain;
+#     bank.mix_modules sends the running sum of the previous entries through every entry whose KIND is "effect".
+#   * stereo: an effect with fx_stereo() returns [2, n]; in a mono chain its left channel is used (so pan and width
+#     stay identifiable by the mono loss), render_chain_stereo() renders both channels.
+#   * frequency-domain tools: FFT convolution, fractional delay by phase shift, biquad magnitude responses evaluated
+#     on the STFT grid (time-varying cutoffs per frame), exponential envelope followers, polyBLEP oscillators.
+# FR : DSP différentiable commun aux blocs tonals et aux effets (A2) ; un effet traite un excitateur fixe quand il est
+# rendu seul, et le bus d'une chaîne quand il y est inséré.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import torch
+
+from . import bank
+from .bank import Block, db_to_amp, envelope
+
+TWO_PI = 2.0 * math.pi
+
+
+# 12 October 2026: oscillators. FR : oscillateurs.
+def cycles(f: torch.Tensor, sr: int) -> torch.Tensor:
+    """Accumulated cycles (unwrapped, float32 drift kept small by the frac below)."""
+    return torch.cumsum(f / sr, dim=0)
+
+
+def frac(c: torch.Tensor) -> torch.Tensor:
+    """Fractional part with the identity gradient (floor is detached)."""
+    return c - torch.floor(c.detach())
+
+
+def poly_blep(p: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+    """polyBLEP residual at phase p in [0, 1) for a phase increment dt (Valimaki and Huovilainen 2007)."""
+    dt = torch.clamp(dt, 1e-6, 0.5)
+    a = p / dt
+    b = (p - 1.0) / dt
+    left = torch.where(p < dt, 2.0 * a - a * a - 1.0, torch.zeros_like(p))
+    right = torch.where(p > 1.0 - dt, b * b + 2.0 * b + 1.0, torch.zeros_like(p))
+    return left + right
+
+
+def saw(f: torch.Tensor, sr: int, phase0: float = 0.0) -> torch.Tensor:
+    """Band-limited sawtooth (polyBLEP), amplitude in [-1, 1]."""
+    p = frac(cycles(f, sr) + phase0)
+    return 2.0 * p - 1.0 - poly_blep(p, f / sr)
+
+
+def pulse(f: torch.Tensor, sr: int, width: torch.Tensor) -> torch.Tensor:
+    """Band-limited pulse of duty cycle `width`, built as the difference of two polyBLEP saws."""
+    c = cycles(f, sr)
+    dt = f / sr
+    p1 = frac(c)
+    p2 = frac(c + width)
+    s1 = 2.0 * p1 - 1.0 - poly_blep(p1, dt)
+    s2 = 2.0 * p2 - 1.0 - poly_blep(p2, dt)
+    return 0.5 * (s1 - s2)
+
+
+def nyquist_mask(f: torch.Tensor, sr: int) -> torch.Tensor:
+    """Smooth gate that silences partials above 0.95 Nyquist instead of aliasing them."""
+    return torch.sigmoid((0.475 * sr - f) / 150.0)
+
+
+def partials(t: torch.Tensor, sr: int, freqs: list, gains: list, decays: list, onset, attack) -> torch.Tensor:
+    """Sum of decaying sines (modal synthesis): freqs, gains (linear) and T60 decays are lists of tensors."""
+    out = torch.zeros_like(t)
+    for f, g, d in zip(freqs, gains, decays):
+        out = out + g * nyquist_mask(f, sr) * envelope(t, onset, attack, d) * torch.sin(TWO_PI * f * t)
+    return out
+
+
+# 12 October 2026: frequency-domain helpers. FR : outils dans le domaine fréquentiel.
+def next_pow2(n: int) -> int:
+    return 1 << int(math.ceil(math.log2(max(2, n))))
+
+
+def fft_conv(x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    """Linear convolution by FFT, truncated to len(x)."""
+    n = x.shape[-1]
+    N = next_pow2(n + h.shape[-1])
+    return torch.fft.irfft(torch.fft.rfft(x, N) * torch.fft.rfft(h, N), N)[..., :n]
+
+
+def apply_response(x: torch.Tensor, H_fn, extra: int) -> torch.Tensor:
+    """y = irfft(X * H(omega)) on a grid long enough (n + extra samples) that the response does not wrap around."""
+    n = x.shape[-1]
+    N = next_pow2(n + extra)
+    w = torch.linspace(0.0, math.pi, N // 2 + 1, device=x.device)
+    return torch.fft.irfft(torch.fft.rfft(x, N) * H_fn(w), N)[..., :n]
+
+
+def delay_phase(w: torch.Tensor, samples) -> torch.Tensor:
+    """exp(-j omega d): a fractional delay of d samples, differentiable in d."""
+    return torch.polar(torch.ones_like(w), -w * samples)
+
+
+def biquad_mag(kind: str, freqs: torch.Tensor, f0: torch.Tensor, q: torch.Tensor, gain_db=None, sr: int = 48000):
+    """Magnitude of an RBJ cookbook biquad (public domain formulas) at `freqs` (broadcast with f0, q)."""
+    w0 = TWO_PI * torch.clamp(f0, 10.0, 0.49 * sr) / sr
+    alpha = torch.sin(w0) / (2.0 * q)
+    cw = torch.cos(w0)
+    if kind == "lowpass":
+        b = [(1 - cw) / 2, 1 - cw, (1 - cw) / 2]
+        a = [1 + alpha, -2 * cw, 1 - alpha]
+    elif kind == "highpass":
+        b = [(1 + cw) / 2, -(1 + cw), (1 + cw) / 2]
+        a = [1 + alpha, -2 * cw, 1 - alpha]
+    elif kind == "bandpass":
+        b = [alpha, torch.zeros_like(alpha), -alpha]
+        a = [1 + alpha, -2 * cw, 1 - alpha]
+    elif kind == "peak":
+        A = torch.pow(10.0, gain_db / 40.0)
+        b = [1 + alpha * A, -2 * cw, 1 - alpha * A]
+        a = [1 + alpha / A, -2 * cw, 1 - alpha / A]
+    else:
+        raise ValueError(f"unknown biquad kind '{kind}'")
+    w = TWO_PI * freqs / sr
+    z1 = torch.polar(torch.ones_like(w), -w)
+    z2 = z1 * z1
+    num = b[0] + b[1] * z1 + b[2] * z2
+    den = a[0] + a[1] * z1 + a[2] * z2
+    return torch.abs(num) / torch.abs(den)
+
+
+def exp_kernel(n: int, tau_s, sr: int, device) -> torch.Tensor:
+    """Normalised one-pole impulse response exp(-i / (tau sr)), length n (differentiable in tau)."""
+    i = torch.arange(n, device=device, dtype=torch.float32)
+    k = torch.exp(-i / (tau_s * sr))
+    return k / k.sum()
+
+
+def env_rms(x: torch.Tensor, tau_s, sr: int) -> torch.Tensor:
+    """Exponential RMS envelope follower (one time constant), as a convolution so that tau gets a gradient."""
+    return torch.sqrt(torch.clamp(fft_conv(x * x, exp_kernel(x.shape[-1], tau_s, sr, x.device)), min=1e-12))
+
+
+def frac_delay_time(x: torch.Tensor, d_samples: torch.Tensor) -> torch.Tensor:
+    """Time-varying fractional delay y[i] = x[i - d[i]] by linear interpolation (gradient flows into d)."""
+    n = x.shape[-1]
+    pos = torch.arange(n, device=x.device, dtype=torch.float32) - d_samples
+    pos = torch.clamp(pos, 0.0, n - 1.001)
+    i0 = torch.floor(pos.detach()).long()
+    fr = pos - i0.float()
+    return x[i0] * (1.0 - fr) + x[torch.clamp(i0 + 1, max=n - 1)] * fr
+
+
+# 12 October 2026: the fixed test exciter of every effect block rendered alone: a harmonic tone (220 Hz, 8 partials,
+# 1/k) with a noise layer at 0.02 s, then a short noise click at 0.45 s, so dynamics, filters, echoes and tails all
+# show in one second. FR : excitateur fixe des effets rendus seuls.
+EXCITER = {"toneHz": 220.0, "partials": 8, "toneDb": -14.0, "toneT60": 0.5, "noiseDb": -20.0, "noiseT60": 0.15,
+           "clickAt": 0.45, "clickDb": -16.0, "clickT60": 0.08, "onset": 0.02}
+
+
+def exciter(t: torch.Tensor, sr: int, noise: torch.Tensor) -> torch.Tensor:
+    e = EXCITER
+    tone = sum(torch.sin(TWO_PI * e["toneHz"] * k * t) / k for k in range(1, e["partials"] + 1)) / 2.0
+    on = torch.tensor(e["onset"], device=t.device)
+    x = 10 ** (e["toneDb"] / 20) * envelope(t, on, torch.tensor(0.002), torch.tensor(e["toneT60"])) * tone
+    x = x + 10 ** (e["noiseDb"] / 20) * envelope(t, on, torch.tensor(0.001), torch.tensor(e["noiseT60"])) * noise
+    x = x + 10 ** (e["clickDb"] / 20) * envelope(t, torch.tensor(e["clickAt"]), torch.tensor(0.001), torch.tensor(e["clickT60"])) * noise
+    return x
+
+
+class EffectBlock(Block):
+    """An effect: fx(v, x, t, sr) -> mono, or fx_stereo(v, x, t, sr) -> [2, n] (STEREO = True)."""
+
+    KIND = "effect"
+    STEREO = False
+
+    def _values(self):
+        return {p["name"]: self.value(p["name"]) for p in self.PARAMS}
+
+    def _t(self, n, sr, dev):
+        return torch.arange(n, device=dev, dtype=torch.float32) / sr
+
+    def process(self, x: torch.Tensor, n: int, sr: int) -> torch.Tensor:
+        """Mono bus in, mono bus out (left channel for a stereo effect)."""
+        y = self.fx_any(x, n, sr)
+        return y[0] if y.dim() == 2 else y
+
+    def fx_any(self, x, n, sr):
+        t = self._t(n, sr, x.device)
+        v = self._values()
+        return self.fx_stereo(v, x, t, sr) if self.STEREO else self.fx(v, x, t, sr)
+
+    def forward(self, n: int, sr: int) -> torch.Tensor:
+        dev = next(iter(self.raw.values())).device
+        t = self._t(n, sr, dev)
+        return self.process(exciter(t, sr, self.noise(n, dev)), n, sr)
+
+    def fx(self, v, x, t, sr):  # pragma: no cover
+        raise NotImplementedError
+
+    def fx_stereo(self, v, x, t, sr):  # pragma: no cover
+        raise NotImplementedError
+
+
+def render_chain_stereo(chain: dict, device="cpu") -> np.ndarray:
+    """[2, n] render of a chain: sources sum to a mono bus; a stereo effect splits it; later effects run per channel."""
+    from . import config
+    sr = chain.get("sr") or config.get("bank.sampleRate")
+    n = int(round(chain.get("seconds", config.get("bank.demoSeconds")) * sr))
+    mods = bank.chain_modules(chain, device)
+    with torch.no_grad():
+        bus = None
+        for m, b in zip(mods, chain["blocks"]):
+            g = 10.0 ** (b.get("gainDb", 0.0) / 20.0)
+            if getattr(m, "KIND", "source") == "effect":
+                if bus is None:
+                    bus = m.fx_any(exciter(torch.arange(n, dtype=torch.float32, device=device) / sr, sr, m.noise(n, device)), n, sr) * g
+                elif bus.dim() == 1:
+                    bus = m.fx_any(bus, n, sr) * g
+                else:
+                    bus = torch.stack([m.process(bus[c], n, sr) for c in range(2)]) * g
+                continue
+            y = bank.shift(m(n, sr) * g, int(round(b.get("offsetS", 0.0) * sr)), n)
+            bus = y if bus is None else bus + y
+        if bus.dim() == 1:
+            bus = torch.stack([bus, bus])
+        bus = bus * (10.0 ** (chain.get("masterGainDb", 0.0) / 20.0))
+    return bus.detach().cpu().numpy().astype(np.float32)
+
+
+_SEEDED: dict = {}
+
+
+def seeded_noise(n: int, seed: int, device) -> torch.Tensor:
+    """12 October 2026: a second fixed-seed white noise (reverb impulse responses), independent of Block.noise."""
+    key = (n, seed, str(device))
+    if key not in _SEEDED:
+        g = torch.Generator().manual_seed(int(seed))
+        _SEEDED[key] = torch.randn(n, generator=g).to(device)
+    return _SEEDED[key]
+
+
+def param(name: str, unit: str, lo: float, hi: float, default: float, scale: str = "lin", description: str = "") -> dict:
+    """12 October 2026: one PARAMS entry (name, unit, min, max, default, scale, description)."""
+    return {"name": name, "unit": unit, "min": float(lo), "max": float(hi), "default": float(default), "scale": scale,
+            "description": description}
+
+
+def amp(v) -> torch.Tensor:
+    return db_to_amp(v["amp_db"])
+
+
+def env_of(t, v, attack=None, decay_key="decay_s"):
+    """Attack and 60 dB decay envelope of a source block from its onset_s, attack_s and decay_s values."""
+    return envelope(t, v["onset_s"], v["attack_s"] if attack is None else attack, v[decay_key])
+
+
+SOURCE = "original (derived from the published mathematics, no code copied)"
+RBJ = {"what": "biquad magnitude responses", "url": "https://www.w3.org/TR/audio-eq-cookbook/",
+       "reference": "R. Bristow-Johnson, Audio EQ Cookbook (formulas placed in the public domain by the author)",
+       "licence": "public domain (formulas), code original"}

@@ -1,0 +1,1116 @@
+# 12 October 2026: task M1, transcription of a reference into a procedural score (score.json), the measurement
+# benchmark of the music 1:1 rule (Rules.md, rule-music-1to1-benchmark-20261012). Deterministic signal processing
+# only: band spectral flux and peak picking (drums), pyin (monophonic bass and vocals), harmonic-constrained NMF on a
+# CQT of the harmonic part of the "other" stem (polyphony, chords, sustain), novelty sections, RMS automation.
+# Demucs stems are an accepted analysis input. No generative model, and the score holds numbers only: no sample of
+# the reference ever leaves this module. Every threshold lives in datasets/transcribe-params.json (HDA interface).
+# Score layout (version "zrmd.score/1"):
+#   tempo {bpm, period, t0, firstKick, beats[{i,t,tRefined,bar,beatInBar}], bars[{index,start,end,bpm}]}
+#   sections[{index,start,end,startBar,endBar,levels}]
+#   drums[{t,class,velocity,levelDb,step,bar,beatInBar,stepInBar,offsetMs}]
+#   voices{bass:{notes[{t,dur,midi,cents,velocity,levelDb,glide?}]}, otherLow/otherMid/otherHigh:{notes}, vocals}
+#   chords[{t,end,label,root,quality,pitches,score}]
+#   automation{hop, stems{drums,bass,other,vocals: [dB]}}
+# render_score() plays a score with sine and noise voices (verification only, not a sound design), and evaluate()
+# measures onset F-measure and chroma similarity against each stem.
+# FR : transcription deterministe d'une reference en partition procedurale (score.json), banc de mesure du 1:1.
+from __future__ import annotations
+
+import copy
+import json
+import math
+import os
+from concurrent.futures import ProcessPoolExecutor
+from functools import lru_cache
+from pathlib import Path
+
+import librosa
+import numpy as np
+import soundfile as sf
+from scipy import signal
+
+from . import config, music
+
+SCORE_VERSION = "zrmd.score/1"
+OVERRIDES_ENV = "ZRMD_TRANSCRIBE_OVERRIDES"
+DRUM_CLASSES = ["kick", "snare", "clap", "hatClosed", "hatOpen", "tom", "perc"]
+STEMS = ["drums", "bass", "other", "vocals"]
+
+
+# ---------------------------------------------------------------- parameters (12 October 2026)
+
+def params_path() -> Path:
+    return config.params_path().parent / "transcribe-params.json"
+
+
+def _merge(base: dict, over: dict) -> dict:
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+@lru_cache(maxsize=1)
+def _load() -> dict:
+    data = json.loads(params_path().read_text(encoding="utf-8"))
+    extra = os.environ.get(OVERRIDES_ENV)
+    return _merge(data, json.loads(extra)) if extra else data
+
+
+def params() -> dict:
+    """A private copy of the parameter tree (file values plus ZRMD_TRANSCRIBE_OVERRIDES)."""
+    return copy.deepcopy(_load())
+
+
+def _need(node: dict, key: str, where: str):
+    if key not in node:
+        raise KeyError(f"transcribe-params.json has no '{where}.{key}'")
+    return node[key]
+
+
+# ---------------------------------------------------------------- small helpers
+
+def db(x, floor=-120.0):
+    return np.maximum(20 * np.log10(np.abs(x) + 1e-12), floor)
+
+
+def rms_db(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    return float(10 * np.log10(np.mean(x ** 2) + 1e-12)) if x.size else -120.0
+
+
+def hz_to_midi(f):
+    return 69.0 + 12.0 * np.log2(np.asarray(f, dtype=np.float64) / 440.0)
+
+
+def midi_to_hz(m):
+    return 440.0 * 2.0 ** ((np.asarray(m, dtype=np.float64) - 69.0) / 12.0)
+
+
+def velocity_of(level_db: float, max_db: float, range_db: float) -> float:
+    return round(float(np.clip(1.0 + (level_db - max_db) / range_db, 0.05, 1.0)), 3)
+
+
+def load_stems(stem_dir: Path, sr: int) -> dict:
+    """Mono float32 stems resampled to sr (measurement only; never written anywhere)."""
+    out = {}
+    for k in STEMS:
+        x, s = sf.read(str(Path(stem_dir) / f"{k}.wav"), dtype="float32", always_2d=True)
+        x = x.mean(axis=1)
+        out[k] = librosa.resample(x, orig_sr=s, target_sr=sr) if s != sr else x
+    return out
+
+
+def _band_sos(sr, lo, hi, order=4):
+    hi = min(hi, 0.45 * sr)
+    return signal.butter(order, [lo, hi], btype="bandpass", fs=sr, output="sos")
+
+
+def onset_times(x: np.ndarray, sr: int, delta: float, hop: int = 256) -> np.ndarray:
+    env = librosa.onset.onset_strength(y=np.asarray(x, dtype=np.float32), sr=sr, hop_length=hop)
+    return librosa.onset.onset_detect(onset_envelope=env, sr=sr, hop_length=hop, units="time", delta=delta)
+
+
+# ---------------------------------------------------------------- tempo map, bars, sections (12 October 2026)
+
+def tempo_map(stems: dict, sr: int, P: dict) -> dict:
+    """Global grid from the measured kicks (music.kick_grid), refined beat by beat on the nearest drum onset."""
+    mcfg = config.cfg()
+    grid = music.kick_grid(stems["drums"], sr, mcfg)
+    duration = len(stems["drums"]) / sr
+    period, first = float(grid["period"]), float(grid.get("firstKick", grid["t0"]))
+    beats = music.beat_times(first, period, duration)
+    g = P["grid"]
+    bpb = g["beatsPerBar"]
+    first_idx = int(np.argmin(np.abs(beats - first)))
+    tol = g["refineToleranceMs"] / 1000.0
+    on = onset_times(stems["drums"], sr, 0.05, hop=128)
+    rows = []
+    for i, t in enumerate(beats):
+        rel = i - first_idx
+        bar = rel // bpb + 1
+        near = on[np.abs(on - t) <= tol] if on.size else on
+        tr = float(near[np.argmin(np.abs(near - t))]) if near.size else None
+        rows.append({"i": i, "t": round(float(t), 4), "tRefined": None if tr is None else round(tr, 4),
+                     "bar": int(bar), "beatInBar": int(rel % bpb + 1)})
+    bars = []
+    for bar in sorted({r["bar"] for r in rows}):
+        bb = [r for r in rows if r["bar"] == bar]
+        start = bb[0]["t"] - (bb[0]["beatInBar"] - 1) * period
+        ref = [r["tRefined"] for r in bb if r["tRefined"] is not None]
+        local = 60.0 / float(np.mean(np.diff(ref))) if len(ref) >= 2 and np.mean(np.diff(ref)) > 0 else 60.0 / period
+        bars.append({"index": bar, "start": round(max(start, 0.0), 4), "end": round(min(start + bpb * period, duration), 4),
+                     "bpm": round(local, 3)})
+    return {"bpm": round(60.0 / period, 3), "period": round(period, 6), "t0": round(float(beats[0]), 4),
+            "firstKick": round(first, 4), "beatsPerBar": bpb, "stepsPerBeat": g["stepsPerBeat"],
+            "gridResidualMs": grid.get("residualMs"), "duration": round(duration, 4), "beats": rows, "bars": bars}
+
+
+def sections(stems: dict, sr: int, tempo: dict) -> list[dict]:
+    """Novelty sections (music.sections_of), boundaries snapped to the nearest bar line."""
+    mcfg = config.cfg()
+    beats = np.array([b["t"] for b in tempo["beats"]])
+    feat = music.beat_features(stems, sr, beats, tempo["duration"], mcfg)
+    secs = music.sections_of(feat, beats, tempo["duration"], mcfg)
+    bar_starts = np.array([b["start"] for b in tempo["bars"]] + [tempo["duration"]])
+    bar_ids = [b["index"] for b in tempo["bars"]] + [tempo["bars"][-1]["index"] + 1]
+    out = []
+    for i, s in enumerate(secs):
+        a = int(np.argmin(np.abs(bar_starts - s["start"])))
+        b = int(np.argmin(np.abs(bar_starts - s["end"])))
+        out.append({"index": i, "start": round(float(bar_starts[a]) if i else 0.0, 4), "end": round(float(bar_starts[b]), 4),
+                    "startBar": bar_ids[a], "endBar": bar_ids[b], "levels": {k: s[k] for k in ("kickDb", "hatDb", "bassDb", "otherDb", "mixDb")}})
+    out[-1]["end"] = tempo["duration"]
+    merged = [out[0]]
+    for s in out[1:]:
+        if s["start"] <= merged[-1]["start"]:
+            merged[-1]["end"] = s["end"]
+            merged[-1]["endBar"] = s["endBar"]
+        else:
+            merged[-1]["end"] = s["start"]
+            merged[-1]["endBar"] = s["startBar"]
+            merged.append(s)
+    merged = [s for s in merged if s["end"] > s["start"] + 1e-6]  # 12 October 2026: no empty tail section
+    for i, s in enumerate(merged):
+        s["index"] = i
+    return merged
+
+
+def _grid_pos(t: float, tempo: dict) -> dict:
+    period = tempo["period"]
+    step = period / tempo["stepsPerBeat"]
+    first = tempo["firstKick"]
+    k = int(round((t - first) / step))
+    spb = tempo["stepsPerBeat"] * tempo["beatsPerBar"]
+    return {"step": k, "bar": k // spb + 1, "beatInBar": (k % spb) // tempo["stepsPerBeat"] + 1,
+            "stepInBar": k % spb + 1, "offsetMs": round(1000.0 * (t - (first + k * step)), 2)}
+
+
+# ---------------------------------------------------------------- drums (12 October 2026)
+
+def _band_flux(S_db: np.ndarray, freqs: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    band = (freqs >= lo) & (freqs < hi)
+    d = np.maximum(np.diff(S_db[band], axis=1, prepend=S_db[band][:, :1]), 0.0)
+    f = d.mean(axis=0)
+    return f / (f.max() + 1e-12)
+
+
+def _pick(flux: np.ndarray, hop_s: float, delta: float, wait_ms: float, avg_ms: float) -> np.ndarray:
+    w = max(1, int(round(wait_ms / 1000 / hop_s)))
+    a = max(1, int(round(avg_ms / 1000 / hop_s)))
+    idx = librosa.util.peak_pick(flux, pre_max=3, post_max=3, pre_avg=a, post_avg=a, delta=delta, wait=w)
+    return np.asarray(idx, dtype=int)
+
+
+def _sub_attacks(seg: np.ndarray, sr: int, rise_db: float, within_db: float = 12.0, gap_ms: float = 5.0) -> int:
+    """Number of separate bursts in the first 40 ms (a clap is a short flam of bursts). 12 October 2026: the 1 ms
+    power is smoothed over 3 ms, and a burst is a peak of prominence rise_db, at least gap_ms from the previous one and
+    within within_db of the loudest, so the grain of a noise snare does not count. FR : nombre de salves d'un clap."""
+    w = max(1, sr // 1000)
+    n = min(len(seg), int(0.04 * sr)) // w * w
+    if n < 4 * w:
+        return 0
+    pw = np.mean(seg[:n].reshape(-1, w) ** 2, axis=1)
+    env = db(np.sqrt(np.convolve(pw, np.ones(3) / 3, mode="same")))
+    peaks, _ = signal.find_peaks(np.concatenate([[env.min() - 2 * rise_db], env]), prominence=rise_db,
+                                 distance=max(1, int(gap_ms)), height=env.max() - within_db)
+    return int(len(peaks))
+
+
+def _decay_ms(seg: np.ndarray, sr: int, drop_db: float) -> float:
+    w = max(1, int(0.002 * sr))
+    n = len(seg) // w * w
+    if n < 2 * w:
+        return 0.0
+    env = db(np.sqrt(np.mean(seg[:n].reshape(-1, w) ** 2, axis=1)))
+    i = int(np.argmax(env))
+    below = np.nonzero(env[i:] <= env[i] - drop_db)[0]
+    return 1000.0 * (below[0] if below.size else len(env) - i) * w / sr
+
+
+def drums(x: np.ndarray, sr: int, tempo: dict, P: dict) -> list[dict]:
+    """Hits per class from three band onset detectors (low, mid, high) so that simultaneous hits survive."""
+    d = P["drums"]
+    hop = int(d["hopMs"] * sr / 1000)
+    S = np.abs(librosa.stft(x, n_fft=d["nFft"], hop_length=hop, center=True))
+    S_db = db(S, floor=-100.0)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=d["nFft"])
+    hop_s = hop / sr
+    bands = d["bands"]
+    sos = {b: _band_sos(sr, lo, hi) for b, (lo, hi) in bands.items()}
+    filt = {b: signal.sosfiltfilt(s, x) for b, s in sos.items()}
+    # 12 October 2026: each band pick is re-timed on its own band envelope: the peak inside peakSearchMs after the
+    # pick, then the first frame (from snapBackMs before) where the envelope comes within attackDb of that peak (bounded by snapBackMs), since a
+    # pitch-drop kick enters the low band late and an STFT flux fires early. A pick is kept only if the band level
+    # really jumps (minRiseDb within riseMs; a riser rises slowly), and a weaker pick inside tailMergeMs after a kept
+    # one is that hit's tail. FR : recalage sur l'enveloppe de bande, test de montee franche, fusion des queues.
+    rise_n = max(1, int(d["riseMs"] / 1000 / hop_s))
+    look = max(1, int(d["peakSearchMs"] / 1000 / hop_s))
+    back_n = max(1, int(d["snapBackMs"] / 1000 / hop_s))
+    picks = {}
+    for b, (lo, hi) in bands.items():
+        flux = _band_flux(S_db, freqs, lo, hi)
+        raw = _pick(flux, hop_s, d["pickDelta"][b], d["pickWaitMs"], d["pickAvgMs"]) * hop_s
+        env = db(librosa.feature.rms(y=filt[b], frame_length=2 * hop, hop_length=hop)[0])
+        kept = []
+        for t in raw:
+            i0 = int(round(t / hop_s))
+            if i0 >= len(env):
+                continue
+            p = i0 + int(np.argmax(env[i0:i0 + look]))
+            L = env[p]
+            lo_i = max(0, i0 - back_n)
+            k = lo_i + int(np.argmax(env[lo_i:p + 1] >= L - d["attackDb"]))  # first crossing, robust to dips
+            pre = env[max(0, k - rise_n):k + 1]
+            if L - pre.min() < d["minRiseDb"][b]:
+                continue
+            ts = k * hop_s
+            if kept and ts - kept[-1][0] <= d["tailMergeMs"] / 1000:
+                if L > kept[-1][1] and ts - kept[-1][0] > 1e-6:
+                    kept[-1] = (ts, L)
+                continue
+            kept.append((ts, L))
+        picks[b] = np.array(sorted({round(k[0], 5) for k in kept}))
+    body = signal.sosfiltfilt(_band_sos(sr, 150.0, 300.0), x)
+    nf, nl = int(d["featureMs"] * sr / 1000), int(d["levelMs"] * sr / 1000)
+    co = d["coincideMs"] / 1000.0
+    hits = []
+
+    def seg_of(arr, t, n):
+        i = int(t * sr)
+        return arr[i:i + n]
+
+    # Low band: kick or tom by dominant frequency and sustain.
+    for t in picks["low"]:
+        s = seg_of(x, t, int(0.25 * sr))
+        if len(s) < nf:
+            continue
+        spec = np.abs(np.fft.rfft(s[int(0.015 * sr):nf + int(0.015 * sr)] * np.hanning(len(s[int(0.015 * sr):nf + int(0.015 * sr)])), n=1 << 14))
+        fr = np.fft.rfftfreq(1 << 14, 1 / sr)
+        m = (fr >= 30) & (fr <= 400)
+        peak = float(fr[m][np.argmax(spec[m])])
+        sustain = _decay_ms(seg_of(filt["low"], t, int(0.4 * sr)), sr, 20.0)
+        # 12 October 2026: a short low onset above kickMaxHz is the body of a snare or clap, not a hit of its own.
+        if peak <= d["kickMaxHz"]:
+            cls = "kick"
+        elif sustain >= d["tomMinSustainMs"] and float(np.mean(seg_of(filt["mid"], t, nf) ** 2)) \
+                <= d["tomMaxMidRatio"] * float(np.mean(seg_of(filt["low"], t, nf) ** 2)):
+            cls = "tom"  # 12 October 2026: a pitched low hit with a loud noisy mid band is a snare body, not a tom
+        else:
+            continue
+        hits.append({"t": float(t), "class": cls, "levelDb": rms_db(seg_of(filt["low"], t, nl)), "pitchHz": round(peak, 1)})
+    low_t = np.array([h["t"] for h in hits])
+    # Mid band: snare, clap or percussion; kick bleed is dropped when the mid share stays small.
+    for t in picks["mid"]:
+        s = seg_of(x, t, nf)
+        if len(s) < nf:
+            continue
+        e_mid = float(np.mean(seg_of(filt["mid"], t, nf) ** 2))
+        e_all = float(np.mean(s ** 2)) + 1e-20
+        # 12 October 2026: the mid-band edge of a hat is the hat, not a percussion hit.
+        if picks["high"].size and np.min(np.abs(picks["high"] - t)) <= co and \
+                float(np.mean(seg_of(filt["high"], t, nl) ** 2)) / (float(np.mean(seg_of(filt["mid"], t, nl) ** 2)) + 1e-20) >= d["hatOverMidRatio"]:
+            continue
+        if low_t.size and np.min(np.abs(low_t - t)) <= co and e_mid / e_all < d["midBleedMaxShare"]:
+            continue
+        mag_all = np.abs(np.fft.rfft(seg_of(filt["mid"], t, nf) * np.hanning(nf))) + 1e-12
+        fr_mid = np.fft.rfftfreq(nf, 1 / sr)
+        mag = mag_all[(fr_mid >= bands["mid"][0]) & (fr_mid <= bands["mid"][1])]
+        flat = float(np.exp(np.mean(np.log(mag))) / np.mean(mag))  # flatness inside the band only (12 October 2026)
+        subs = _sub_attacks(seg_of(filt["mid"], t, nf), sr, d["subAttackRiseDb"], d["subAttackPeakWithinDb"], d["subAttackMinGapMs"])
+        body_share = float(np.mean(seg_of(body, t, nf) ** 2)) / e_all
+        if subs >= d["clapMinSubAttacks"] and flat >= d["clapMinFlatness"]:
+            cls = "clap"
+        elif flat >= d["noiseFlatness"] or body_share >= d["snareBodyShare"]:
+            cls = "snare"
+        else:
+            cls = "perc"
+        pk = fr_mid[int(np.argmax(mag_all))]
+        hits.append({"t": float(t), "class": cls, "levelDb": rms_db(seg_of(filt["mid"], t, nl)), "pitchHz": round(float(pk), 1),
+                     "flatness": round(flat, 3), "subAttacks": subs})
+    mid_t = np.array([h["t"] for h in hits if h["class"] in ("snare", "clap", "perc")])
+    # High band: hats, closed or open by decay; dropped when a snare or clap already explains the high band.
+    for t in picks["high"]:
+        hs = seg_of(filt["high"], t, int(0.4 * sr))
+        if len(hs) < nl:
+            continue
+        if mid_t.size and np.min(np.abs(mid_t - t)) <= co:
+            ratio = float(np.mean(seg_of(filt["high"], t, nl) ** 2)) / (float(np.mean(seg_of(filt["mid"], t, nl) ** 2)) + 1e-20)
+            if ratio < d["hatOverMidRatio"]:
+                continue
+        dec = _decay_ms(hs, sr, d["hatDecayDropDb"])
+        cls = "hatOpen" if dec >= d["openHatMs"] else "hatClosed"
+        hits.append({"t": float(t), "class": cls, "levelDb": rms_db(seg_of(filt["high"], t, nl)), "decayMs": round(dec, 1)})
+    top = {c: max(h["levelDb"] for h in hits if h["class"] == c) for c in {h["class"] for h in hits}}
+    out = []
+    for h in sorted(hits, key=lambda h: h["t"]):
+        if h["levelDb"] < top[h["class"]] - d["minDbBelowClassMax"]:
+            continue
+        h["velocity"] = velocity_of(h["levelDb"], top[h["class"]], d["velocityRangeDb"])
+        h["levelDb"] = round(h["levelDb"], 2)
+        h.update(_grid_pos(h["t"], tempo))
+        h["t"] = round(h["t"], 4)
+        out.append(h)
+    return out
+
+
+# ---------------------------------------------------------------- monophonic notes, pyin (12 October 2026)
+
+def _pyin_chunk(args):
+    x, sr, fmin, fmax, frame, hop = args
+    f0, voiced, prob = librosa.pyin(x, fmin=fmin, fmax=fmax, sr=sr, frame_length=frame, hop_length=hop)
+    # 12 October 2026: the HMM voiced flag is folded into the probability (flagged frames count as 1), because pyin
+    # keeps glides voiced while their frame probability stays low. FR : le drapeau voise de pyin garde les glissades.
+    return np.nan_to_num(f0, nan=0.0), np.where(voiced, 1.0, prob)
+
+
+def pyin_track(x: np.ndarray, sr: int, fmin: float, fmax: float, P: dict, workers: int) -> tuple[np.ndarray, np.ndarray]:
+    """pyin in padded time chunks on parallel processes; frames are reassembled on the global hop grid."""
+    mo = P["mono"]
+    hop, frame = mo["hop"], mo["frameLength"]
+    chunk = int(mo["chunkS"] * sr) // hop * hop
+    pad = int(mo["padS"] * sr) // hop * hop
+    n_frames = 1 + len(x) // hop
+    jobs, spans = [], []
+    for a in range(0, len(x), chunk):
+        lo, hi = max(0, a - pad), min(len(x), a + chunk + pad)
+        jobs.append((x[lo:hi].astype(np.float32), sr, fmin, fmax, frame, hop))
+        spans.append((a, lo))
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        res = list(ex.map(_pyin_chunk, jobs))
+    f0 = np.zeros(n_frames)
+    prob = np.zeros(n_frames)
+    for (a, lo), (f, p) in zip(spans, res):
+        first = (a - lo) // hop
+        k0 = a // hop
+        take = min(chunk // hop, n_frames - k0, len(f) - first)
+        f0[k0:k0 + take] = f[first:first + take]
+        prob[k0:k0 + take] = p[first:first + take]
+    return f0, prob
+
+
+def mono_notes(x: np.ndarray, sr: int, fmin: float, fmax: float, P: dict, workers: int) -> list[dict]:
+    """Notes from a pyin track: stable semitone runs, legato changes, glides (slow monotonic moves), re-attacks."""
+    mo = P["mono"]
+    hop = mo["hop"]
+    hop_s = hop / sr
+    f0, prob = pyin_track(x, sr, fmin, fmax, P, workers)
+    frame_rms = librosa.feature.rms(y=x, frame_length=2048, hop_length=hop)[0]
+    n = min(len(f0), len(frame_rms))
+    f0, prob, lvl = f0[:n], prob[:n], db(frame_rms[:n])
+    voiced = (f0 > 0) & (prob >= mo["voicedProb"]) & (lvl >= lvl.max() - mo["silenceDbBelowMax"])
+    midi = np.where(voiced, hz_to_midi(np.where(f0 > 0, f0, 1.0)), np.nan)
+    sm = midi.copy()
+    k = mo["medianFrames"] // 2
+    for i in range(n):
+        if voiced[i]:
+            w = midi[max(0, i - k):i + k + 1]
+            sm[i] = np.nanmedian(w)
+    on = onset_times(x, sr, mo["onsetDelta"], hop=hop)
+    min_f = max(1, int(mo["minNoteMs"] / 1000 / hop_s))
+    q = np.where(voiced, np.round(np.nan_to_num(sm, nan=0.0)), -1).astype(int)
+    stable = np.zeros(n, dtype=bool)
+    for i in range(n):
+        stable[i] = voiced[i] and abs(sm[i] - q[i]) <= mo["stableSemi"] / 2
+    # Runs of one stable semitone at least minNoteMs long.
+    runs = []
+    i = 0
+    while i < n:
+        if not stable[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and stable[j + 1] and q[j + 1] == q[i]:
+            j += 1
+        if j - i + 1 >= min_f:
+            runs.append([i, j, int(q[i])])
+        i = j + 1
+    # Merge runs of the same pitch separated by a short unstable blip (vibrato), not by silence or an onset.
+    merged = []
+    for r in runs:
+        if merged and merged[-1][2] == r[2] and voiced[merged[-1][1]:r[0] + 1].all() and r[0] - merged[-1][1] <= min_f \
+                and not np.any((on > merged[-1][1] * hop_s) & (on < r[0] * hop_s)):
+            merged[-1][1] = r[1]
+        else:
+            merged.append(r)
+    notes = []
+    match = mo["onsetMatchMs"] / 1000.0
+    back = mo["onsetLookBackMs"] / 1000.0
+    for idx, (a, b, p) in enumerate(merged):
+        # 12 October 2026: the voiced, unstable frames just before a stable run belong to its attack. When they move
+        # monotonically toward the run for glideMin..glideMax ms they are a glide, whether the note starts from
+        # silence or is tied to the previous note. FR : les trames instables avant une note sont son attaque ou sa glissade.
+        prev_end = merged[idx - 1][1] if idx else -1
+        k = a
+        while k - 1 > prev_end and voiced[k - 1]:
+            k -= 1
+        tied = idx and k - 1 == prev_end
+        lead = sm[k:a + 1]
+        gms = (a - k) * hop_s * 1000
+        glide = None
+        start = k
+        if lead.size >= 2 and mo["glideMinMs"] <= gms <= mo["glideMaxMs"]:
+            frm = int(merged[idx - 1][2]) if tied else int(round(lead[0]))
+            mono = np.all(np.diff(lead) >= -0.1) if p > frm else np.all(np.diff(lead) <= 0.1)
+            if frm != p and mono and abs(lead[0] - p) >= 1.0:
+                glide = {"fromMidi": frm, "ms": round(gms, 1)}
+        if glide is None and tied:
+            start = k + (a - k) // 2
+        t0 = start * hop_s
+        near = on[(on >= t0 - back) & (on <= t0 + match)]
+        if near.size and glide is None:
+            t0 = float(near[np.argmin(np.abs(near - t0))])
+        end_t = (b + 1) * hop_s
+        # Re-attacks of the same pitch: onsets inside the run where the level jumps up.
+        cuts = [t0]
+        for o in on[(on > t0 + mo["minNoteMs"] / 1000) & (on < end_t - mo["minNoteMs"] / 1000)]:
+            fi = int(o / hop_s)
+            before = lvl[max(0, fi - int(0.05 / hop_s)):fi]
+            after = lvl[fi:fi + int(0.05 / hop_s)]
+            if before.size and after.size and after.max() - before.min() >= mo["splitRiseDb"]:
+                cuts.append(float(o))
+        cuts.append(end_t)
+        cents = float(np.nanmedian(sm[a:b + 1]) - p) * 100.0
+        for ci in range(len(cuts) - 1):
+            ta, tb = cuts[ci], cuts[ci + 1]
+            fa, fb = int(ta / hop_s), max(int(tb / hop_s), int(ta / hop_s) + 1)
+            note = {"t": round(ta, 4), "dur": round(tb - ta, 4), "midi": int(p), "cents": round(cents, 1),
+                    "levelDb": round(float(np.max(lvl[fa:fb])), 2)}
+            if ci == 0 and glide:
+                note["glide"] = glide
+            notes.append(note)
+    # 12 October 2026: pyin lags a fast glide, so the move can leave a short tied fragment between the glide start and
+    # the arrival; a fragment shorter than glideAbsorbMs, tied to the next note and part of a glide, joins that glide.
+    # FR : un court fragment au milieu d'une glissade rejoint la note d'arrivee.
+    absorb = mo["glideAbsorbMs"] / 1000.0
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(notes) - 1):
+            A, B = notes[i], notes[i + 1]
+            tied = abs(A["t"] + A["dur"] - B["t"]) <= 2 * hop_s
+            if tied and A["dur"] <= absorb and "glide" in A and A["midi"] == B["midi"] and "glide" not in B:
+                A["dur"] = round(B["t"] + B["dur"] - A["t"], 4)  # a re-attack cut inside a glide is spurious
+                A["levelDb"] = max(A["levelDb"], B["levelDb"])
+                notes.pop(i + 1)
+                changed = True
+                break
+            near = abs(B["midi"] - A["midi"]) <= mo["fragmentSemi"]  # an attack pitch blip (808 drop, overshoot)
+            if tied and A["dur"] <= absorb and ("glide" in A or "glide" in B or near) and A["midi"] != B["midi"]:
+                frm = A["glide"]["fromMidi"] if "glide" in A else A["midi"]
+                if near or (B["midi"] - frm) * (B["midi"] - A["midi"]) > 0:
+                    B["glide"] = {"fromMidi": int(frm), "ms": round((B["t"] - A["t"]) * 1000 + B.get("glide", {}).get("ms", 0.0), 1)}
+                    B["dur"] = round(B["dur"] + (B["t"] - A["t"]), 4)
+                    B["t"] = A["t"]
+                    B["levelDb"] = max(A["levelDb"], B["levelDb"])
+                    notes.pop(i)
+                    changed = True
+                    break
+    if notes:
+        top = max(nt["levelDb"] for nt in notes)
+        for nt in notes:
+            nt["velocity"] = velocity_of(nt["levelDb"], top, mo["velocityRangeDb"])
+    return notes
+
+
+# ---------------------------------------------------------------- polyphony, CQT + harmonic NMF (12 October 2026)
+
+def harmonic_dictionary(P: dict) -> tuple[np.ndarray, list[int]]:
+    pp = P["poly"]
+    bpo = pp["binsPerOctave"]
+    n_bins = bpo * pp["octaves"]
+    fmin_midi = librosa.note_to_midi(pp["fminNote"])
+    pitches = list(range(pp["minMidi"], pp["maxMidi"] + 1))
+    W = np.zeros((n_bins, len(pitches) + pp["noiseComponents"]))
+    b = np.arange(n_bins)
+    per = bpo / 12.0
+    for j, p in enumerate(pitches):
+        for h in range(1, pp["harmonics"] + 1):
+            c = (p - fmin_midi) * per + bpo * math.log2(h)
+            if c > n_bins - 1:
+                break
+            g = np.exp(-0.5 * ((b - c) / pp["spreadBins"]) ** 2)
+            g[np.abs(b - c) > 1.5] = 0.0
+            W[:, j] += h ** (-pp["harmonicDecay"]) * g
+    W[:, len(pitches):] = 1.0
+    W /= W.sum(axis=0, keepdims=True)
+    return W, pitches
+
+
+def harmonic_nmf(V: np.ndarray, W0: np.ndarray, P: dict) -> tuple[np.ndarray, np.ndarray]:
+    """KL multiplicative updates; zeros of W0 stay zero, so every pitch column keeps its harmonic support."""
+    pp = P["poly"]
+    W = W0.copy()
+    H = np.full((W.shape[1], V.shape[1]), float(V.mean()) + 1e-9)
+    eps = 1e-12
+    for _ in range(pp["iterations"]):
+        R = V / (W @ H + eps)
+        H *= (W.T @ R) / (W.sum(axis=0)[:, None] + pp["sparsity"] + eps)
+        R = V / (W @ H + eps)
+        W *= (R @ H.T) / (H.sum(axis=1)[None, :] + eps)
+        s = W.sum(axis=0, keepdims=True) + eps
+        W /= s
+        H *= s.T
+    return W, H
+
+
+@lru_cache(maxsize=4)
+def _cqt_calibration(sr: int, hop: int, bpo: int, n_bins: int, fmin: float, gamma=None) -> float:
+    """VQT magnitude of a unit-amplitude 440 Hz sine, so an activation converts to a sine amplitude."""
+    t = np.arange(int(sr * 1.0)) / sr
+    C = np.abs(librosa.vqt(np.sin(2 * np.pi * 440.0 * t).astype(np.float32), sr=sr, hop_length=hop, fmin=fmin,
+                           n_bins=n_bins, bins_per_octave=bpo, gamma=gamma))
+    return float(C[:, C.shape[1] // 4: 3 * C.shape[1] // 4].sum(axis=0).mean())
+
+
+def poly_notes(x: np.ndarray, sr: int, P: dict) -> tuple[list[dict], dict]:
+    pp = P["poly"]
+    harm = librosa.effects.harmonic(x, margin=pp["hpssMargin"])
+    bpo, hop = pp["binsPerOctave"], pp["hop"]
+    n_bins = bpo * pp["octaves"]
+    fmin = float(librosa.note_to_hz(pp["fminNote"]))
+    V = np.abs(librosa.vqt(harm, sr=sr, hop_length=hop, fmin=fmin, n_bins=n_bins, bins_per_octave=bpo, gamma=pp["vqtGamma"]))
+    W0, pitches = harmonic_dictionary(P)
+    W, H = harmonic_nmf(V, W0, P)
+    calib = _cqt_calibration(sr, hop, bpo, n_bins, fmin, pp["vqtGamma"])
+    A = H[:len(pitches)] / calib  # approximate sine amplitude per pitch and frame
+    if pp["medianFrames"] > 1:
+        A = signal.medfilt(A, kernel_size=[1, pp["medianFrames"]])
+    hop_s = hop / sr
+    Adb = db(A)
+    top = float(Adb.max())
+    # 12 October 2026: a pitch is only "on" within frameRelDb of the loudest pitch of the same frame (transient spray).
+    Adb = np.where(Adb >= Adb.max(axis=0, keepdims=True) - pp["frameRelDb"], Adb, -120.0)
+    fund_bin = [int(round((p - librosa.note_to_midi(pp["fminNote"])) * bpo / 12.0)) for p in pitches]
+    Vdb = db(V / calib)
+    on_thr, off_thr = top - pp["onDbBelowMax"], top - pp["offDbBelowMax"]
+    on = onset_times(harm, sr, pp["onsetDelta"], hop=hop)
+    min_f = max(1, int(pp["minNoteMs"] / 1000 / hop_s))
+    win = max(1, int(pp["splitWindowMs"] / 1000 / hop_s))
+    match = pp["onsetMatchMs"] / 1000.0
+    notes = []
+    for j, p in enumerate(pitches):
+        a = Adb[j]
+        active = False
+        start = 0
+        for i in range(len(a) + 1):
+            v = a[i] if i < len(a) else -999.0
+            if not active and v >= on_thr:
+                active, start = True, i
+            elif active and v < off_thr:
+                active = False
+                if i - start >= min_f:
+                    notes.append([j, start, i])
+            elif active and i - start >= max(min_f, 2 * win) and v - a[max(start, i - win):i].min() >= pp["splitRiseDb"] \
+                    and on.size and np.min(np.abs(on - i * hop_s)) <= match and a[i - 1] < v:
+                notes.append([j, start, i])
+                start = i
+    out = []
+    for j, a, b in notes:
+        # Fundamental salience: a sub-harmonic ghost has no energy at its own fundamental (12 October 2026).
+        fb = fund_bin[j]
+        f_db = float(np.median(Vdb[max(0, fb - 1):fb + 2, a:b].max(axis=0)))
+        if f_db < float(Adb[j, a:b].max()) + pp["fundamentalMinDb"]:
+            continue
+        near = on[np.abs(on - a * hop_s) <= match]
+        if near.size:
+            shift = int(round((float(near[np.argmin(np.abs(near - a * hop_s))]) - a * hop_s) / hop_s))
+            a = max(0, a + shift)
+        out.append({"t": round(a * hop_s, 4), "dur": round((b - a) * hop_s, 4), "midi": int(pitches[j]),
+                    "levelDb": round(float(Adb[j, a:b].max()) - 3.01, 2), "_j": j, "_a": a, "_b": b})
+    # Octave and twelfth ghosts: a note inside a much louder note a harmonic interval below is dropped.
+    keep = []
+    for n1 in out:
+        ghost = False
+        for n0 in out:
+            iv = n1["midi"] - n0["midi"]
+            if n1 is n0:
+                continue
+            if iv in pp["ghostIntervals"]:
+                need = pp["ghostDb"]
+            elif abs(iv) in pp["neighborIntervals"]:
+                need = pp["neighborDb"]  # spectral leakage onto a neighbour semitone (12 October 2026)
+            else:
+                continue
+            ov = min(n1["_b"], n0["_b"]) - max(n1["_a"], n0["_a"])
+            if ov >= 0.8 * (n1["_b"] - n1["_a"]) and n0["levelDb"] - n1["levelDb"] >= need:
+                ghost = True
+                break
+        if not ghost:
+            keep.append(n1)
+    for n_ in keep:
+        for k in ("_j", "_a", "_b"):
+            n_.pop(k)
+    if keep:
+        mx = max(n_["levelDb"] for n_ in keep)
+        for n_ in keep:
+            n_["velocity"] = velocity_of(n_["levelDb"], mx, pp["velocityRangeDb"])
+    keep.sort(key=lambda n_: (n_["t"], n_["midi"]))
+    info = {"frames": int(V.shape[1]), "bins": int(n_bins), "pitches": [pitches[0], pitches[-1]],
+            "noiseShare": round(float((W[:, len(pitches):] @ H[len(pitches):]).sum() / ((W @ H).sum() + 1e-12)), 4)}
+    return keep, info
+
+
+def split_voices(notes: list[dict], P: dict) -> dict:
+    pp = P["poly"]
+    edges = [-1] + list(pp["voiceSplitsMidi"]) + [1000]
+    voices = {name: {"kind": "poly", "notes": []} for name in pp["voiceNames"]}
+    for n_ in notes:
+        for name, lo, hi in zip(pp["voiceNames"], edges[:-1], edges[1:]):
+            if lo < n_["midi"] <= hi or (lo == -1 and n_["midi"] <= hi):
+                voices[name]["notes"].append(n_)
+                break
+    return voices
+
+
+def chords(notes: list[dict], tempo: dict, P: dict) -> list[dict]:
+    """Chord label per beat by pitch class templates (12 roots x qualities), merged into spans."""
+    q = P["chords"]["qualities"]
+    beats = [b["t"] for b in tempo["beats"]] + [tempo["duration"]]
+    names = music.NOTE_NAMES
+    rows = []
+    for a, b in zip(beats[:-1], beats[1:]):
+        v = np.zeros(12)
+        pitches = set()
+        for n_ in notes:
+            ov = min(b, n_["t"] + n_["dur"]) - max(a, n_["t"])
+            if ov > 0:
+                v[n_["midi"] % 12] += ov * n_.get("velocity", 1.0)
+                pitches.add(n_["midi"])
+        if v.sum() <= 0:
+            rows.append({"t": round(a, 4), "end": round(b, 4), "label": "N", "pitches": []})
+            continue
+        best = (-1.0, 0, "")
+        for qual, iv in q.items():
+            tpl = np.zeros(12)
+            tpl[[i % 12 for i in iv]] = 1.0
+            for r in range(12):
+                tr = np.roll(tpl, r)
+                s = float(v @ tr / (np.linalg.norm(v) * np.linalg.norm(tr) + 1e-12))
+                if s > best[0] + 1e-9:
+                    best = (s, r, qual)
+        label = f"{names[best[1]]}{'' if best[2] == 'maj' else best[2]}" if best[0] >= P["chords"]["minScore"] else "X"
+        rows.append({"t": round(a, 4), "end": round(b, 4), "label": label, "root": names[best[1]], "quality": best[2],
+                     "score": round(best[0], 3), "pitches": sorted(pitches)})
+    spans = []
+    for r in rows:
+        if spans and spans[-1]["label"] == r["label"] and spans[-1]["pitches"] == r["pitches"]:
+            spans[-1]["end"] = r["end"]
+        else:
+            spans.append(dict(r))
+    return spans
+
+
+# ---------------------------------------------------------------- vocals, automation (12 October 2026)
+
+def _band_envelopes(x: np.ndarray, sr: int, P: dict) -> dict:
+    au = P["automation"]
+    w, h = int(au["windowMs"] * sr / 1000), int(au["hopMs"] * sr / 1000)
+    out = {}
+    for lo, hi in au["textureBandsHz"]:
+        y = signal.sosfiltfilt(_band_sos(sr, lo, hi), x)
+        r = librosa.feature.rms(y=y, frame_length=w, hop_length=h)[0]
+        out[f"{lo}-{hi}"] = [round(float(v), 2) for v in np.maximum(db(r), au["floorDb"])]
+    return out
+
+
+def vocals(x: np.ndarray, sr: int, P: dict, workers: int) -> dict:
+    vc = P["vocals"]
+    level = rms_db(x)
+    f0, prob = pyin_track(x, sr, vc["fminHz"], vc["fmaxHz"], P, workers) if level >= vc["tonalMinDb"] else (np.zeros(1), np.zeros(1))
+    voiced = float(np.mean((f0 > 0) & (prob >= P["mono"]["voicedProb"]))) if level >= vc["tonalMinDb"] else 0.0
+    if level >= vc["tonalMinDb"] and voiced >= vc["tonalMinVoiced"]:
+        return {"kind": "melody", "levelDb": round(level, 2), "voicedRatio": round(voiced, 3),
+                "notes": mono_notes(x, sr, vc["fminHz"], vc["fmaxHz"], P, workers)}
+    return {"kind": "texture", "levelDb": round(level, 2), "voicedRatio": round(voiced, 3),
+            "reason": f"stem level {level:.1f} dB below {vc['tonalMinDb']} dB or voiced ratio under {vc['tonalMinVoiced']}",
+            "bands": _band_envelopes(x, sr, P), "notes": []}
+
+
+def automation(stems: dict, sr: int, P: dict) -> dict:
+    au = P["automation"]
+    w, h = int(au["windowMs"] * sr / 1000), int(au["hopMs"] * sr / 1000)
+    out = {}
+    for k, x in stems.items():
+        r = librosa.feature.rms(y=x, frame_length=w, hop_length=h)[0]
+        out[k] = [round(float(v), 2) for v in np.maximum(db(r), au["floorDb"])]
+    return {"hopS": h / sr, "windowS": w / sr, "stems": out}
+
+
+# ---------------------------------------------------------------- the whole transcription (12 October 2026)
+
+def _drum_job(args):
+    stem_dir, tempo, P = args
+    d_sr = P["analysis"]["drumSr"]
+    x = load_stems(stem_dir, d_sr)["drums"]
+    return drums(x, d_sr, tempo, P)
+
+
+def _poly_job(args):
+    x, sr, P = args
+    return poly_notes(x, sr, P)
+
+
+def transcribe(stem_dir: Path, P: dict | None = None, slug: str = "") -> dict:
+    P = P or params()
+    sr = P["analysis"]["sr"]
+    workers = P["analysis"]["workers"]
+    stems = load_stems(stem_dir, sr)
+    tempo = tempo_map(stems, sr, P)
+    with ProcessPoolExecutor(max_workers=2) as ex:
+        f_drums = ex.submit(_drum_job, (stem_dir, tempo, P))
+        f_poly = ex.submit(_poly_job, (stems["other"], sr, P))
+        bass = mono_notes(stems["bass"], sr, P["bass"]["fminHz"], P["bass"]["fmaxHz"], P, workers - 2)
+        voc = vocals(stems["vocals"], sr, P, workers - 2)
+        hits = f_drums.result()
+        poly, poly_info = f_poly.result()
+    voices = {"bass": {"kind": "mono", "notes": bass}}
+    voices.update(split_voices(poly, P))
+    voices["vocals"] = voc
+    key = music.key_of(stems["bass"] + stems["other"], sr, config.cfg())
+    return {"version": SCORE_VERSION, "slug": slug, "createdBy": "zrmd.audio.transcribe (12 October 2026)",
+            "sampleRate": sr, "key": {k: key[k] for k in ("name", "tonic", "mode", "correlation")},
+            "tempo": tempo, "sections": sections(stems, sr, tempo), "drums": hits, "voices": voices,
+            "chords": chords(poly, tempo, P), "automation": automation(stems, sr, P),
+            "analysis": {"poly": poly_info, "params": str(params_path())}}
+
+
+def summary(score: dict) -> dict:
+    cls = {}
+    for h in score["drums"]:
+        cls[h["class"]] = cls.get(h["class"], 0) + 1
+    return {"bpm": score["tempo"]["bpm"], "bars": len(score["tempo"]["bars"]), "sections": len(score["sections"]),
+            "drums": cls, "notes": {k: len(v.get("notes", [])) for k, v in score["voices"].items()},
+            "glides": sum(1 for n_ in score["voices"]["bass"]["notes"] if "glide" in n_),
+            "vocals": score["voices"]["vocals"]["kind"], "chordSpans": len(score["chords"]),
+            "chordLabels": sorted({c["label"] for c in score["chords"]})}
+
+
+# ---------------------------------------------------------------- verification render (12 October 2026)
+
+def shifted(score: dict, dt: float = 0.0, semi: int = 0) -> dict:
+    """A deliberately wrong copy: every event (and the automation) moved by dt seconds, every pitch by semi semitones."""
+    s = copy.deepcopy(score)
+    au = s.get("automation", {})
+    if dt and au.get("stems"):
+        k = int(round(dt / au["hopS"]))
+        for name, curve in au["stems"].items():
+            au["stems"][name] = ([curve[0]] * k + curve[:-k]) if k > 0 else curve
+    for h in s["drums"]:
+        h["t"] = round(h["t"] + dt, 4)
+        if "pitchHz" in h:
+            h["pitchHz"] = round(h["pitchHz"] * 2 ** (semi / 12.0), 1)
+    for v in s["voices"].values():
+        for n_ in v.get("notes", []):
+            n_["t"] = round(n_["t"] + dt, 4)
+            n_["midi"] += semi
+            if "glide" in n_:
+                n_["glide"]["fromMidi"] += semi
+    return s
+
+
+def _env(n: int, sr: int, attack_ms: float, release_ms: float) -> np.ndarray:
+    e = np.ones(n)
+    a, r = min(n, max(1, int(attack_ms * sr / 1000))), min(n, max(1, int(release_ms * sr / 1000)))
+    e[:a] = np.linspace(0, 1, a)
+    e[n - r:] *= np.linspace(1, 0, r)
+    return e
+
+
+def _drum_hit(cls: str, h: dict, sr: int, R: dict, rng: np.random.Generator) -> np.ndarray:
+    def dec(ms, n):
+        return np.exp(-np.arange(n) / (ms / 1000 * sr))
+    if cls == "kick":
+        n = int(0.4 * sr)
+        f = R["kickHz"][1] + (R["kickHz"][0] - R["kickHz"][1]) * np.exp(-np.arange(n) / (0.03 * sr))
+        y = np.sin(2 * np.pi * np.cumsum(f) / sr) * dec(R["kickDecayMs"], n)
+    elif cls in ("tom", "perc"):
+        n = int(0.4 * sr)
+        f0 = h.get("pitchHz") or 200.0
+        y = np.sin(2 * np.pi * f0 * np.arange(n) / sr) * dec(R["tomDecayMs"] if cls == "tom" else R["percDecayMs"], n)
+    elif cls == "snare":
+        n = int(0.4 * sr)
+        nz = signal.sosfilt(_band_sos(sr, 1000, 5000), rng.standard_normal(n))
+        y = (nz + 0.5 * np.sin(2 * np.pi * R["snareToneHz"] * np.arange(n) / sr)) * dec(R["snareDecayMs"], n)
+    elif cls == "clap":
+        n = int(0.3 * sr)
+        nz = signal.sosfilt(_band_sos(sr, 1000, 3000), rng.standard_normal(n))
+        e = np.zeros(n)
+        g = int(R["clapGapMs"] * sr / 1000)
+        for k in range(3):
+            e[k * g:] += dec(8.0 if k < 2 else 80.0, n - k * g)
+        y = nz * e
+    else:
+        n = int(0.5 * sr)
+        nz = signal.sosfilt(signal.butter(4, 7000, btype="highpass", fs=sr, output="sos"), rng.standard_normal(n))
+        y = nz * dec(R["openHatMs"] if cls == "hatOpen" else R["closedHatMs"], n)
+    nl = int(0.03 * sr)
+    y = y / (np.sqrt(np.mean(y[:nl] ** 2)) + 1e-12)
+    return y * 10 ** (h["levelDb"] / 20.0)
+
+
+def _note_tone(n_: dict, sr: int, R: dict) -> tuple[int, np.ndarray]:
+    m = int(max(1, round(n_["dur"] * sr)))
+    target = n_["midi"] + n_.get("cents", 0.0) / 100.0
+    pitch = np.full(m, target, dtype=np.float64)
+    g = n_.get("glide")
+    if g:
+        k = min(m, int(g["ms"] / 1000 * sr))
+        pitch[:k] = np.linspace(g["fromMidi"], target, k)
+    ph = 2 * np.pi * np.cumsum(midi_to_hz(pitch)) / sr
+    amp = math.sqrt(2) * 10 ** (n_["levelDb"] / 20.0)
+    return int(round(n_["t"] * sr)), amp * np.sin(ph) * _env(m, sr, R["attackMs"], R["releaseMs"])
+
+
+def _add(buf: np.ndarray, at: int, y: np.ndarray):
+    if at >= len(buf):
+        return
+    if at < 0:
+        y, at = y[-at:], 0
+    k = min(len(y), len(buf) - at)
+    buf[at:at + k] += y[:k]
+
+
+def apply_automation(out: dict, score: dict, sr: int, P: dict) -> None:
+    """12 October 2026: per-voice loudness automation of the score applied as a gain curve (target minus the render's
+    own level, clipped, never on a silent render), like a fader lane in a DAW. FR : automation de volume par voix."""
+    au, R = score.get("automation", {}), P["render"]
+    if not au.get("stems"):
+        return
+    w, h = int(round(au["windowS"] * sr)), int(round(au["hopS"] * sr))
+    lo, hi = R["automationGainDb"]
+    for k, curve in au["stems"].items():
+        if k not in out:
+            continue
+        own = db(librosa.feature.rms(y=out[k], frame_length=w, hop_length=h)[0])
+        tgt = np.asarray(curve, dtype=np.float64)
+        m = min(len(own), len(tgt))
+        g = np.where(own[:m] > R["automationSilentDb"], np.clip(tgt[:m] - own[:m], lo, hi), 0.0)
+        gs = np.interp(np.arange(len(out[k])), np.arange(m) * h, g)
+        out[k] = out[k] * 10 ** (gs / 20.0)
+
+
+def render_score(score: dict, sr: int, P: dict | None = None, seed: int = 0, automation: bool = False) -> dict:
+    """Sine and noise voices, one buffer per stem (plus the automation lanes when asked). Verification only: it tests
+    notes, timing and levels, not timbre."""
+    P = P or params()
+    R = P["render"]
+    n = int(score["tempo"]["duration"] * sr) + 1
+    rng = np.random.default_rng(seed)
+    out = {k: np.zeros(n) for k in STEMS}
+    for h in score["drums"]:
+        _add(out["drums"], int(round(h["t"] * sr)), _drum_hit(h["class"], h, sr, R, rng))
+    for name, v in score["voices"].items():
+        stem = "bass" if name == "bass" else ("vocals" if name == "vocals" else "other")
+        for n_ in v.get("notes", []):
+            at, y = _note_tone(n_, sr, R)
+            _add(out[stem], at, y)
+    voc = score["voices"].get("vocals", {})
+    if voc.get("kind") == "texture" and voc.get("bands"):
+        hop = int(score["automation"]["hopS"] * sr)
+        for band, curve in voc["bands"].items():
+            lo, hi = (float(v) for v in band.split("-"))
+            nz = signal.sosfilt(_band_sos(sr, lo, hi), rng.standard_normal(n))
+            nz /= np.sqrt(np.mean(nz ** 2)) + 1e-12
+            g = np.interp(np.arange(n), np.arange(len(curve)) * hop, 10 ** (np.asarray(curve) / 20.0))
+            out["vocals"] += nz * g
+    if automation:
+        apply_automation(out, score, sr, P)
+    return {k: v.astype(np.float32) for k, v in out.items()}
+
+
+# ---------------------------------------------------------------- metrics (12 October 2026)
+
+def match_f(ref: np.ndarray, est: np.ndarray, tol: float) -> dict:
+    """Greedy one-to-one matching inside +-tol (both lists sorted), then precision, recall, F-measure."""
+    ref, est = np.sort(np.asarray(ref)), np.sort(np.asarray(est))
+    used = np.zeros(len(est), dtype=bool)
+    hit = 0
+    j0 = 0
+    for r in ref:
+        while j0 < len(est) and est[j0] < r - tol:
+            j0 += 1
+        best, bj = tol + 1, -1
+        j = j0
+        while j < len(est) and est[j] <= r + tol:
+            if not used[j] and abs(est[j] - r) < best:
+                best, bj = abs(est[j] - r), j
+            j += 1
+        if bj >= 0:
+            used[bj] = True
+            hit += 1
+    p = hit / len(est) if len(est) else 0.0
+    rc = hit / len(ref) if len(ref) else 0.0
+    f = 2 * p * rc / (p + rc) if p + rc else 0.0
+    return {"f": round(f, 4), "precision": round(p, 4), "recall": round(rc, 4), "ref": int(len(ref)), "est": int(len(est))}
+
+
+def chroma_similarity(ref: np.ndarray, est: np.ndarray, sr: int, P: dict) -> float:
+    v = P["verify"]
+    hop = v["chromaHop"]
+    cr = librosa.feature.chroma_cqt(y=ref.astype(np.float32), sr=sr, hop_length=hop, norm=None)
+    ce = librosa.feature.chroma_cqt(y=est.astype(np.float32), sr=sr, hop_length=hop, norm=None)
+    k = min(cr.shape[1], ce.shape[1])
+    cr, ce = cr[:, :k], ce[:, :k]
+    e = db(np.linalg.norm(cr, axis=0))
+    keep = e >= e.max() - v["chromaEnergyFloorDb"]
+    num = (cr * ce).sum(axis=0)
+    den = np.linalg.norm(cr, axis=0) * np.linalg.norm(ce, axis=0) + 1e-12
+    return round(float(np.mean((num / den)[keep])), 4) if keep.any() else 0.0
+
+
+def envelope_corr(ref: np.ndarray, est: np.ndarray, sr: int, P: dict) -> float:
+    h = int(P["verify"]["envelopeHopMs"] * sr / 1000)
+    a = db(librosa.feature.rms(y=ref, frame_length=2 * h, hop_length=h)[0], -80)
+    b = db(librosa.feature.rms(y=est, frame_length=2 * h, hop_length=h)[0], -80)
+    k = min(len(a), len(b))
+    if k < 3 or np.std(a[:k]) < 1e-6 or np.std(b[:k]) < 1e-6:
+        return 0.0
+    return round(float(np.corrcoef(a[:k], b[:k])[0, 1]), 4)
+
+
+def evaluate(rendered: dict, stems: dict, sr: int, P: dict | None = None) -> dict:
+    P = P or params()
+    v = P["verify"]
+    tol, delta = v["onsetToleranceS"], v["onsetDelta"]
+    out = {}
+    for k in STEMS:
+        ref, est = stems[k], rendered[k][:len(stems[k])]
+        row = {"onset": match_f(onset_times(ref, sr, delta), onset_times(est, sr, delta), tol),
+               "chroma": chroma_similarity(ref, est, sr, P) if rms_db(est) > -100 else 0.0,
+               "envelopeCorr": envelope_corr(ref, est, sr, P)}
+        out[k] = row
+    return out
+
+
+def passes(metrics: dict, P: dict) -> dict:
+    ps = P["verify"]["pass"]
+    res = {}
+    for k, row in metrics.items():
+        checks = {}
+        if k in ps["onsetF"]:
+            checks["onsetF"] = row["onset"]["f"] >= ps["onsetF"][k]
+        if k in ps["chroma"]:
+            checks["chroma"] = row["chroma"] >= ps["chroma"][k]
+        if k in ps["envelopeCorr"]:
+            checks["envelopeCorr"] = row["envelopeCorr"] >= ps["envelopeCorr"][k]
+        res[k] = {"checks": checks, "pass": all(checks.values()) if checks else True}
+    return res
+
+
+def note_f(truth: list[dict], est: list[dict], tol: float) -> dict:
+    """Note-level F-measure: onset within tol and same MIDI pitch (one-to-one)."""
+    used = set()
+    hit = 0
+    for t in truth:
+        best, bi = tol + 1, -1
+        for i, e in enumerate(est):
+            if i in used or e["midi"] != t["midi"]:
+                continue
+            d = abs(e["t"] - t["t"])
+            if d <= tol and d < best:
+                best, bi = d, i
+        if bi >= 0:
+            used.add(bi)
+            hit += 1
+    p = hit / len(est) if est else 0.0
+    r = hit / len(truth) if truth else 0.0
+    return {"f": round(2 * p * r / (p + r), 4) if p + r else 0.0, "precision": round(p, 4), "recall": round(r, 4),
+            "truth": len(truth), "est": len(est)}
+
+
+def drum_f(truth: list[dict], est: list[dict], tol: float, groups: dict | None = None) -> dict:
+    """Hit F-measure with class equality (classes may be grouped, e.g. both hats count as 'hat')."""
+    g = groups or {}
+    def c(x):
+        return g.get(x, x)
+    used = set()
+    hit = 0
+    for t in truth:
+        best, bi = tol + 1, -1
+        for i, e in enumerate(est):
+            if i in used or c(e["class"]) != c(t["class"]):
+                continue
+            d = abs(e["t"] - t["t"])
+            if d <= tol and d < best:
+                best, bi = d, i
+        if bi >= 0:
+            used.add(bi)
+            hit += 1
+    p = hit / len(est) if est else 0.0
+    r = hit / len(truth) if truth else 0.0
+    return {"f": round(2 * p * r / (p + r), 4) if p + r else 0.0, "precision": round(p, 4), "recall": round(r, 4),
+            "truth": len(truth), "est": len(est)}
+
+
+def known_score(P: dict, bars: int = 8, bpm: float = 100.0) -> dict:
+    """12 October 2026: a synthetic score with a known answer (drums of every class, a bass line with one glide,
+    three-note chords plus a top line), used to prove the transcriber green on a case whose truth is exact."""
+    period = 60.0 / bpm
+    step = period / 4
+    t0 = 0.5
+    dur = t0 + bars * 4 * period + 1.0
+    hits = []
+    for bar in range(bars):
+        base = t0 + bar * 16 * step
+        for k in (0, 8, 10):
+            hits.append({"t": base + k * step, "class": "kick", "levelDb": -12.0})
+        for k in (4, 12):
+            hits.append({"t": base + k * step, "class": "snare" if bar % 2 == 0 else "clap", "levelDb": -16.0})
+        for k in (2, 6, 14):
+            hits.append({"t": base + k * step, "class": "hatClosed", "levelDb": -26.0})
+        hits.append({"t": base + 10 * step, "class": "hatOpen", "levelDb": -26.0})
+        if bar % 4 == 3:
+            hits.append({"t": base + 15 * step, "class": "tom", "levelDb": -14.0, "pitchHz": 160.0})
+    prog = [[48, 51, 55], [44, 48, 51], [51, 55, 58], [46, 50, 53]]
+    bass_root = [36, 32, 39, 34]
+    bass, other = [], []
+    for bar in range(bars):
+        base = t0 + bar * 16 * step
+        r = bass_root[bar % 4]
+        bass.append({"t": base, "dur": 6 * step, "midi": r, "levelDb": -14.0})
+        nt = {"t": base + 8 * step, "dur": 6 * step, "midi": r + 7, "levelDb": -14.0}
+        if bar == 2:
+            nt["glide"] = {"fromMidi": r, "ms": 80.0}
+        bass.append(nt)
+        for p in prog[bar % 4]:
+            other.append({"t": base, "dur": 14 * step, "midi": p + 12, "levelDb": -22.0})
+        other.append({"t": base + 8 * step, "dur": 3 * step, "midi": 72 + (bar % 3) * 2, "levelDb": -24.0})
+    hits.sort(key=lambda h: h["t"])
+    return {"version": SCORE_VERSION, "tempo": {"duration": dur, "bpm": bpm, "period": period, "firstKick": t0,
+                                                "stepsPerBeat": 4, "beatsPerBar": 4},
+            "drums": hits, "voices": {"bass": {"kind": "mono", "notes": bass}, "other": {"kind": "poly", "notes": other},
+                                       "vocals": {"kind": "texture", "notes": []}},
+            "automation": {"hopS": 0.05}}
+
+
+def known_case(P: dict, sr: int, workers: int) -> dict:
+    """Render the known score with the verification voices, transcribe it back, compare to the exact truth."""
+    truth = known_score(P)
+    st = render_score(truth, sr, P, seed=1)
+    tempo = truth["tempo"]
+    d_sr = P["analysis"]["drumSr"]
+    st_d = render_score(truth, d_sr, P, seed=1)["drums"]
+    hits = drums(st_d.astype(np.float64), d_sr, tempo, P)
+    bass = mono_notes(st["bass"], sr, P["bass"]["fminHz"], P["bass"]["fmaxHz"], P, workers)
+    poly, _ = poly_notes(st["other"], sr, P)
+    tol = P["verify"]["onsetToleranceS"]
+    hat = {"hatClosed": "hat", "hatOpen": "hat"}
+    res = {"drums": drum_f(truth["drums"], hits, tol), "drumsHatGroup": drum_f(truth["drums"], hits, tol, hat),
+           "bass": note_f(truth["voices"]["bass"]["notes"], bass, tol), "other": note_f(truth["voices"]["other"]["notes"], poly, tol),
+           "bassGlides": {"truth": 1, "found": sum(1 for n_ in bass if "glide" in n_)}}
+    # Red: the same transcription judged against a shifted truth must collapse.
+    sh = shifted(truth, P["verify"]["shiftS"], P["verify"]["shiftSemi"])
+    res["redShifted"] = {"drums": drum_f(sh["drums"], hits, tol)["f"],
+                         "bass": note_f(sh["voices"]["bass"]["notes"], bass, tol)["f"],
+                         "other": note_f(sh["voices"]["other"]["notes"], poly, tol)["f"]}
+    classes = {}
+    for h in hits:
+        classes[h["class"]] = classes.get(h["class"], 0) + 1
+    truth_classes = {}
+    for h in truth["drums"]:
+        truth_classes[h["class"]] = truth_classes.get(h["class"], 0) + 1
+    res["drumClasses"] = {"truth": truth_classes, "found": classes}
+    return res

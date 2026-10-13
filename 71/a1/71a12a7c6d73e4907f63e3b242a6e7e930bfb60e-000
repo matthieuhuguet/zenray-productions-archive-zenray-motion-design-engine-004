@@ -1,0 +1,161 @@
+# 12 October 2026: shared building blocks of every SFX recipe (numpy and scipy only, no sample from anywhere).
+# Level convention: the peak of a short-term RMS (levelWindowMs) equals gainDb, or a smoothed RMS for long noisy
+# sounds, so a level never depends on the noise seed. All constants come from sfx-params.json "synthesis".
+# FR : briques communes des recettes ; niveau defini sur une RMS courte, jamais sur la crete d'un bruit.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from scipy import signal
+
+from .. import config
+
+
+def syn() -> dict:
+    return config.cfg()["synthesis"]
+
+
+def axis(seconds: float, sr: int) -> np.ndarray:
+    return np.arange(max(1, int(round(seconds * sr)))) / sr
+
+
+def short_rms_peak(x: np.ndarray, sr: int, window_ms: float) -> float:
+    win = max(1, int(round(sr * window_ms / 1000.0)))
+    energy = np.convolve(x * x, np.ones(win) / win, mode="same")
+    return float(np.sqrt(energy.max())) if energy.size else 0.0
+
+
+def set_level(x: np.ndarray, sr: int, gain_db: float, window_ms: float | None = None) -> np.ndarray:
+    window_ms = window_ms if window_ms is not None else syn()["levelWindowMs"]
+    peak = short_rms_peak(x, sr, window_ms)
+    return x * (10.0 ** (gain_db / 20.0) / peak) if peak > 0 else x
+
+
+def set_level_long(x: np.ndarray, sr: int, gain_db: float) -> np.ndarray:
+    return set_level(x, sr, gain_db, syn()["longLevelSmoothMs"])
+
+
+def fade(x: np.ndarray, sr: int) -> np.ndarray:
+    """Short raised-cosine fade in and out so no recipe starts or stops with a step."""
+    n = min(len(x) // 4, max(1, int(round(syn()["fadeMs"] * sr / 1000.0))))
+    if n > 1:
+        ramp = 0.5 - 0.5 * np.cos(np.linspace(0.0, math.pi, n))
+        x = x.copy()
+        x[:n] *= ramp
+        x[-n:] *= ramp[::-1]
+    return x
+
+
+def rise_fall(t: np.ndarray, total: float, peak_pos: float, curve: float) -> np.ndarray:
+    """(t / tp) ** c before the peak, ((T - t) / (T - tp)) ** c after it."""
+    tp = max(peak_pos * total, 1e-6)
+    rise = np.clip(t / tp, 0.0, 1.0) ** curve
+    fall = np.clip((total - t) / max(total - tp, 1e-6), 0.0, 1.0) ** curve
+    return np.where(t < tp, rise, fall)
+
+
+def shaped_noise(seconds: float, sr: int, seed: int, mask_fn) -> np.ndarray:
+    """White noise shaped in the STFT domain by mask_fn(freqs, times) -> (n_freq, n_frames) gain."""
+    s = syn()
+    n_fft, hop = s["stftFft"], s["stftHop"]
+    total = max(1, int(round(seconds * sr)))
+    rng = np.random.default_rng(seed)
+    noise = rng.standard_normal(total + n_fft)
+    freqs, times, spec = signal.stft(noise, fs=sr, nperseg=n_fft, noverlap=n_fft - hop)
+    mask = mask_fn(freqs, times)
+    mask[0, :] = 0.0
+    _, shaped = signal.istft(spec * mask, fs=sr, nperseg=n_fft, noverlap=n_fft - hop)
+    return shaped[:total]
+
+
+def log_gauss(freqs: np.ndarray, centre: np.ndarray, width_oct: float) -> np.ndarray:
+    """Gaussian band in log-frequency, FWHM = width_oct octaves, centre per frame."""
+    sigma = max(width_oct, 1e-3) / 2.3548
+    with np.errstate(divide="ignore"):
+        distance = np.log2(np.maximum(freqs[:, None], 1e-9) / np.maximum(centre[None, :], 1e-9))
+    return np.exp(-0.5 * (distance / sigma) ** 2)
+
+
+def soft_lowpass(freqs: np.ndarray, cutoff: np.ndarray) -> np.ndarray:
+    """Smooth time-varying low-pass gain (12 dB per octave above the cutoff, per frame)."""
+    soft = syn()["riserLpOrderSoftness"]
+    ratio = np.maximum(freqs[:, None], 1.0) / np.maximum(cutoff[None, :], 1.0)
+    return 1.0 / (1.0 + ratio ** (2.0 / soft))
+
+
+def glide(f_start: float, f_end: float, t: np.ndarray, total: float, curve: float = 1.0) -> np.ndarray:
+    u = np.clip(t / max(total, 1e-9), 0.0, 1.0) ** curve
+    return f_start * (f_end / f_start) ** u
+
+
+def phase_of(freq: np.ndarray, sr: int) -> np.ndarray:
+    return 2.0 * math.pi * np.cumsum(freq) / sr
+
+
+def bl_saw(freq: np.ndarray, sr: int) -> np.ndarray:
+    """Band-limited sawtooth: harmonics k <= Nyquist / f, summed with amplitude 1/k (fade at the limit)."""
+    phase = phase_of(freq, sr)
+    out = np.zeros_like(phase)
+    kmax = syn()["sawHarmonicsMax"]
+    for k in range(1, kmax + 1):
+        gain = np.clip((0.5 * sr - k * freq) / (0.05 * sr), 0.0, 1.0)
+        if not gain.any():
+            break
+        out += gain * np.sin(k * phase) / k
+    return out
+
+
+def bl_square_morph(freq: float, t: np.ndarray, sr: int, shape: float) -> np.ndarray:
+    """Sine (shape 0) to band-limited square (shape 1): odd harmonics weighted by shape."""
+    phase = 2.0 * math.pi * freq * t
+    out = np.sin(phase)
+    k = 3
+    while k * freq < 0.45 * sr:
+        out = out + shape * np.sin(k * phase) / k
+        k += 2
+    return out
+
+
+def damped_mode(freq: float, decay_s: float, t: np.ndarray) -> np.ndarray:
+    return np.sin(2.0 * math.pi * freq * t) * np.exp(-t / max(decay_s, 1e-5))
+
+
+def unit_energy(x: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(x))
+    return x / n if n > 0 else x
+
+
+def synth_reverb(x: np.ndarray, sr: int, tail_s: float, mix: float) -> np.ndarray:
+    """Convolution with a synthetic response (fixed-seed noise under an exponential decay); the response is ours."""
+    if mix <= 0:
+        return x
+    t = axis(tail_s, sr)
+    rng = np.random.default_rng(syn()["reverbSeed"])
+    ir = rng.standard_normal(len(t)) * np.exp(-6.9 * t / max(tail_s, 1e-3))
+    dry = np.concatenate([x, np.zeros(len(t))])
+    wet = np.zeros(len(dry))
+    conv = signal.fftconvolve(x, unit_energy(ir))[: len(dry)]
+    wet[: len(conv)] = conv
+    wet *= (np.linalg.norm(dry) / (np.linalg.norm(wet) + 1e-30))
+    return math.sqrt(1.0 - mix) * dry + math.sqrt(mix) * wet
+
+
+def highpass(x: np.ndarray, sr: int, hz: float, order: int = 2) -> np.ndarray:
+    sos = signal.butter(order, min(hz, 0.45 * sr), btype="highpass", fs=sr, output="sos")
+    return signal.sosfilt(sos, x)
+
+
+def lowpass(x: np.ndarray, sr: int, hz: float, order: int = 2) -> np.ndarray:
+    sos = signal.butter(order, min(hz, 0.45 * sr), btype="lowpass", fs=sr, output="sos")
+    return signal.sosfilt(sos, x)
+
+
+def bandpass(x: np.ndarray, sr: int, centre: float, q: float, order: int = 2) -> np.ndarray:
+    lo, hi = centre / (1 + 0.5 / q), centre * (1 + 0.5 / q)
+    sos = signal.butter(order, [max(lo, 20.0), min(hi, 0.45 * sr)], btype="bandpass", fs=sr, output="sos")
+    return signal.sosfilt(sos, x)
+
+
+def out32(x: np.ndarray) -> np.ndarray:
+    return np.asarray(x, dtype=np.float32)

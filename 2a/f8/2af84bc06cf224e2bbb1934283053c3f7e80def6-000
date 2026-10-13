@@ -1,0 +1,88 @@
+# 12 October 2026: noise-sweep family (whoosh, swoosh, swipe, riser, downlifter, reverse).
+# Every sound is our own synthesis: fixed-seed white noise shaped in the STFT domain, plus oscillators for risers.
+# FR : famille des bruits balayes ; tout est synthese, graine fixe, aucune donnee de reference.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from . import common as c
+
+
+def whoosh(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Band-pass noise whose centre glides fStart -> fEnd under a rise and fall envelope (R03 lab recipe)."""
+    T = p["duration"]
+
+    def mask(freqs, times):
+        centre = c.glide(p["fStart"], p["fEnd"], times, T, p["sweepCurve"])
+        return c.log_gauss(freqs, centre, p["bandwidthOct"])
+
+    x = c.shaped_noise(T, sr, seed, mask)
+    t = np.arange(len(x)) / sr
+    return c.out32(c.set_level_long(x * c.rise_fall(t, T, p["peakPos"], p["envCurve"]), sr, p["gainDb"]))
+
+
+def swoosh(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Short bright whoosh plus a resonant narrow band that follows the same centre (Q sets its width)."""
+    T = p["duration"]
+    narrow = 1.0 / max(p["q"], 1e-3) * 1.4427  # octave width of a band of quality Q (bandwidth = f / Q)
+
+    def mask(freqs, times):
+        centre = c.glide(p["fStart"], p["fEnd"], times, T)
+        wide = c.log_gauss(freqs, centre, p["bandwidthOct"])
+        res = c.log_gauss(freqs, centre, narrow) * math.sqrt(p["bandwidthOct"] / narrow)
+        return math.sqrt(1.0 - p["resMix"]) * wide + math.sqrt(p["resMix"]) * res
+
+    x = c.shaped_noise(T, sr, seed, mask)
+    t = np.arange(len(x)) / sr
+    return c.out32(c.set_level_long(x * c.rise_fall(t, T, p["peakPos"], 1.5), sr, p["gainDb"]))
+
+
+def swipe(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Very short high whoosh; the pan trajectory (pan0 -> pan1) is applied by the SFX bus, not here."""
+    T = p["duration"]
+
+    def mask(freqs, times):
+        return c.log_gauss(freqs, c.glide(p["fStart"], p["fEnd"], times, T), p["bandwidthOct"])
+
+    x = c.shaped_noise(T, sr, seed, mask)
+    t = np.arange(len(x)) / sr
+    return c.out32(c.set_level(c.fade(x * c.rise_fall(t, T, 0.4, p["envCurve"]), sr), sr, p["gainDb"]))
+
+
+def _lifter(p: dict, seed: int, sr: int, rising: bool) -> np.ndarray:
+    """Riser (rising=True) or downlifter: low-pass noise whose cutoff moves, plus a sawtooth that glides in pitch."""
+    T = p["duration"]
+    f_lo, f_hi = p["cutoffStart"], p["cutoffEnd"]
+    semis = p["pitchRiseSemis"] if rising else -p["pitchDropSemis"]
+
+    def mask(freqs, times):
+        return c.soft_lowpass(freqs, c.glide(f_lo, f_hi, times, T))
+
+    noise = c.unit_energy(c.shaped_noise(T, sr, seed, mask))
+    t = np.arange(len(noise)) / sr
+    freq = p["pitchStart"] * 2.0 ** (semis / 12.0 * np.clip(t / T, 0.0, 1.0))
+    saw = c.unit_energy(c.bl_saw(freq, sr))
+    x = math.sqrt(1.0 - p["sawMix"]) * noise + math.sqrt(p["sawMix"]) * saw
+    u = np.clip(t / T, 0.0, 1.0)
+    env = (u if rising else 1.0 - u) ** p["envCurve"]
+    return c.out32(c.set_level_long(c.fade(x * env, sr), sr, p["gainDb"]))
+
+
+def riser(p: dict, seed: int, sr: int) -> np.ndarray:
+    return _lifter(p, seed, sr, rising=True)
+
+
+def downlifter(p: dict, seed: int, sr: int) -> np.ndarray:
+    return _lifter(p, seed, sr, rising=False)
+
+
+def reverse(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Our own synthetic tail (band-limited noise under exp(-t / tau)), reversed in time: it swells up to its end."""
+    T = p["duration"]
+    t = c.axis(T, sr)
+    rng = np.random.default_rng(seed)
+    tail = c.lowpass(c.highpass(rng.standard_normal(len(t)), sr, p["highpass"]), sr, p["lowpass"])
+    tail *= np.exp(-t / p["tau"])
+    return c.out32(c.set_level_long(c.fade(tail[::-1], sr), sr, p["gainDb"]))

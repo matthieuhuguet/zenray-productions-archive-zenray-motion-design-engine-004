@@ -1,0 +1,37 @@
+# 13 October 2026: every sound-bank block must render a finite signal of the requested length on short windows (the fit
+# windows of a fast tempo are shorter than the 0.5 s templates of some blocks; drum_step_pattern crashed on 0.34 s).
+# FR : chaque brique doit rendre un signal fini de la bonne longueur sur des fenetres courtes.
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from zrmd.audio import bank  # noqa: E402
+
+WINDOWS_S = (0.05, 0.1, 0.34, 0.5, 1.0)
+
+
+def run() -> int:
+    bad = []
+    for bid in bank.list_blocks():
+        for w in WINDOWS_S:
+            try:
+                y = bank.render_block(bid, None, seconds=w)
+                if len(y) != int(round(w * 48000)) and abs(len(y) - w * 48000) > 2 or not np.isfinite(y).all():
+                    bad.append((bid, w, f"length {len(y)} or non finite"))
+            except Exception as exc:  # noqa: BLE001
+                bad.append((bid, w, str(exc)[:80]))
+    for b in bad:
+        print("FAIL", *b)
+    print(f"{len(bad)} failures over {len(bank.list_blocks())} blocks x {len(WINDOWS_S)} windows")
+    return 1 if bad else 0
+
+
+def test_short_windows():
+    assert run() == 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

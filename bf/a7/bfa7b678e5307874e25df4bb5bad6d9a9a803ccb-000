@@ -1,0 +1,1093 @@
+# 12 October 2026: task M2, resynthesis of a transcribed score (score.json of M1) with the procedural sound bank.
+# Rule of 12 October 2026 (Matthieu): everything, music included, is first reproduced 1:1 at 99 percent, procedurally,
+# as a measurement benchmark; variations are then derived by changing parameters. No reference sample ever enters a
+# render: the score gives notes and hits, the bank blocks give timbres fitted by dfit on isolated notes of each Demucs
+# stem, and every other number (equaliser, stereo width, compressor, loudness) is a measured parameter.
+# Pipeline (one version V_NNN per run, never overwritten, private):
+#   1. roles: one per drum class and per tonal voice of score.json; candidates = ready bank blocks (index.json re-read
+#      every run, filtered by role tags and ids) plus the M2 instruments (datasets/music-instruments, same contract).
+#   2. exemplars: the K least overlapped louder notes of each role, cut from the role's stem (mid channel).
+#   3. fits: dfit on each (candidate, exemplar), pitch and onset narrowed around the transcription; 16 processes.
+#   4. choice: each fitted timbre is cross-rendered on the role's other exemplars; the best mean ploss score wins.
+#   5. render (pure function of params.json and score.json): every note, role buses with their effects, per-section
+#      third-octave equaliser, gain riding toward the score's automation lanes, decorrelated stereo, mix bus.
+#   6. scores: ploss (full song and per bar), verify.report (mix and music), onset F, chroma, envelope correlation,
+#      per-section spectral envelope, per stem and for the mix.
+# 12 October 2026: a role whose spec carries engine "sms" is rendered by the measured timbre models of sms.py instead
+# of a bank block; stems get a stochastic residual bed; score_stable adds plossEvents, plossBarNoOnset and tfBands.
+# Parameters: datasets/resynth-params.json (HDA interface), --set a.b=json, ZRMD_RESYNTH_OVERRIDES.
+# FR : resynthese de la partition M1 avec la banque son ; timbres ajustes par dfit, rendu pur depuis params.json.
+from __future__ import annotations
+
+import copy
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import subprocess
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from . import bank, config, dfit, loudness, ploss
+
+ROOT = Path(__file__).resolve().parents[2]
+PARAMS_FILE = ROOT / "datasets" / "resynth-params.json"
+OVERRIDES_ENV = "ZRMD_RESYNTH_OVERRIDES"
+STEMS = ["drums", "bass", "other", "vocals"]
+TONAL = ["bass", "otherLow", "otherMid", "otherHigh", "vocals"]  # 13 October 2026: + vocals (sung melody)
+
+
+# ---------------------------------------------------------------- parameters (12 October 2026)
+
+def merge(base: dict, over: dict) -> dict:
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def params(over: dict | None = None) -> dict:
+    """File values, then ZRMD_RESYNTH_OVERRIDES (JSON, seen by worker processes), then `over`."""
+    data = json.loads(PARAMS_FILE.read_text(encoding="utf-8"))
+    env = os.environ.get(OVERRIDES_ENV)
+    if env:
+        merge(data, json.loads(env))
+    return merge(data, copy.deepcopy(over or {}))
+
+
+# ---------------------------------------------------------------- block registry (12 October 2026)
+# The M2 instruments and the narrowed fit classes are served through bank.block_class, patched in this process only
+# (bank.py itself is not edited): a registered id resolves here, any other id goes to the bank as before.
+# FR : registre en memoire ; bank.py n'est pas modifie, la recherche est seulement redirigee dans ce processus.
+
+REGISTRY: dict = {}
+_ORIG = bank.block_class
+
+
+def _lookup(block_id: str):
+    if block_id in REGISTRY:
+        return REGISTRY[block_id]
+    return _ORIG(block_id)
+
+
+def install(P: dict | None = None) -> list[str]:
+    P = P or params()
+    if bank.block_class is not _lookup:
+        bank.block_class = _lookup
+    d = ROOT / "datasets" / P["paths"]["instruments"]
+    ids = []
+    for f in sorted(d.glob("*/block.py")):
+        bid = f.parent.name
+        if bid not in REGISTRY:
+            spec = importlib.util.spec_from_file_location(f"zrmd_m2_{bid}", f)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            cls = mod.BLOCK
+            if cls.ID != bid:
+                raise ValueError(f"{f} must define BLOCK with ID == '{bid}'")
+            cls.META = getattr(mod, "META", {})
+            cls.NOTE_PARAMS = getattr(mod, "NOTE_PARAMS", None)
+            REGISTRY[bid] = cls
+        ids.append(bid)
+    return ids
+
+
+def narrowed(base_id: str, bounds: dict) -> str:
+    """A subclass of a block whose listed parameters get new (min, max, default); registered under base~hash."""
+    cls = _lookup(base_id)
+    key = hashlib.sha1(json.dumps(bounds, sort_keys=True).encode()).hexdigest()[:10]
+    bid = f"{base_id}~{key}"
+    if bid in REGISTRY:
+        return bid
+    newp = []
+    for p in cls.PARAMS:
+        q = dict(p)
+        if p["name"] in bounds:
+            lo, hi, de = bounds[p["name"]]
+            lo, hi = max(lo, p["min"]), min(hi, p["max"])
+            if hi <= lo:
+                raise ValueError(f"{base_id}.{p['name']}: empty range [{lo}, {hi}]")
+            q.update(min=float(lo), max=float(hi), default=float(min(max(de, lo), hi)))
+        newp.append(q)
+    sub = type(f"Narrow_{base_id}_{key}", (cls,), {"ID": bid, "PARAMS": newp})
+    sub.META = getattr(cls, "META", {})
+    REGISTRY[bid] = sub
+    return bid
+
+
+def bank_ready() -> dict:
+    """index.json rows of the bank whose block imports now (re-read at every call: the bank grows in parallel)."""
+    idx = json.loads((bank.bank_dir() / "index.json").read_text(encoding="utf-8"))
+    ready, failed = {}, {}
+    for r in idx.get("blocks", []):
+        try:
+            _ORIG(r["id"])
+            ready[r["id"]] = r
+        except Exception as exc:  # a block being written by another agent: skipped, named
+            failed[r["id"]] = f"{type(exc).__name__}: {exc}"
+    return {"ready": ready, "pending": idx.get("pending", []), "failed": failed, "count": idx.get("count")}
+
+
+def pitch_param(cls, P: dict) -> str | None:
+    names = [p["name"] for p in cls.PARAMS]
+    return next((n for n in P["pitchParams"] if n in names), None)
+
+
+def note_params(cls, P: dict, kind: str) -> list[str]:
+    names = [p["name"] for p in cls.PARAMS]
+    if getattr(cls, "NOTE_PARAMS", None):
+        return [n for n in cls.NOTE_PARAMS if n in names]
+    out = [n for n in ("amp_db", "onset_s") if n in names]
+    pp = pitch_param(cls, P) if kind == "tonal" else None
+    return out + ([pp] if pp else [])
+
+
+def candidates(role: str, P: dict, ready: dict, use_bank: bool = True, use_own: bool = True) -> list[str]:
+    R = P["roles"][role]
+    out = []
+    if use_bank:
+        for bid in R["bankIds"]:
+            if bid in ready and bid not in out:
+                out.append(bid)
+        for bid, r in sorted(ready.items()):
+            if r.get("kind", "source") == "source" and set(r.get("tags", [])) & set(R["bankTags"]) and bid not in out:
+                out.append(bid)
+        if R["kind"] == "tonal":
+            out = [b for b in out if pitch_param(_lookup(b), P)]
+        out = out[: P["fit"]["maxCandidatesPerRole"]]
+    if use_own:
+        out += [b for b in R["own"] if b not in out]
+    return out
+
+
+# ---------------------------------------------------------------- reference and score (12 October 2026)
+
+def _read(path: Path, sr: int) -> np.ndarray:
+    import soundfile as sf
+    x, s = sf.read(str(path), dtype="float32", always_2d=True)
+    if s != sr:
+        import librosa
+        x = librosa.resample(x.T, orig_sr=s, target_sr=sr).T
+    if x.shape[1] == 1:
+        x = np.repeat(x, 2, axis=1)
+    return np.ascontiguousarray(x[:, :2], dtype=np.float32)
+
+
+def load_reference(P: dict) -> dict:
+    """Reference stems and mix, stereo float32 at P.sampleRate (measurement only, never written to a version)."""
+    sr = P["sampleRate"]
+    stems = {k: _read(Path(P["paths"]["stems"]) / f"{k}.wav", sr) for k in STEMS}
+    n = len(stems["drums"])
+    cache = Path(P["paths"]["cache"])
+    cache.mkdir(parents=True, exist_ok=True)
+    mpath = cache / f"mix-{sr}.wav"
+    if not mpath.exists():
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", P["paths"]["referenceVideo"], "-vn", "-ac", "2", "-ar", str(sr),
+                        "-acodec", "pcm_f32le", str(mpath)], check=True)
+    mix = _read(mpath, sr)
+    mix = np.pad(mix, ((0, max(0, n - len(mix))), (0, 0)))[:n]
+    return {"sr": sr, "stems": stems, "mix": mix, "n": n}
+
+
+def mono(x: np.ndarray) -> np.ndarray:
+    return x.mean(axis=1) if x.ndim == 2 else x
+
+
+def role_events(score: dict) -> dict:
+    out: dict = {}
+    for h in score["drums"]:
+        out.setdefault(h["class"], []).append({"t": h["t"], "levelDb": h["levelDb"], "dur": 0.0, **({"dev": h["dev"]} if h.get("dev") else {})})  # 12 October 2026 (M3): per-hit deviation travels with the hit
+    for v in TONAL:
+        out[v] = [dict(n) for n in score["voices"].get(v, {}).get("notes", [])]
+    return out
+
+
+def roles(P: dict) -> dict:
+    """12 October 2026: the role table without its _doc entry. FR : table des roles sans la cle _doc."""
+    return {k: v for k, v in P["roles"].items() if not k.startswith("_")}
+
+
+def role_stem(role: str, P: dict) -> str:
+    return P["roles"][role]["stem"]
+
+
+def event_span(ev: dict, role: str, P: dict) -> tuple[float, float]:
+    R = P["roles"][role]
+    if R["kind"] == "drum":
+        return ev["t"], ev["t"] + R["windowS"]
+    return ev["t"], ev["t"] + min(R["windowS"], ev["dur"] + R["tailS"])
+
+
+def pick_exemplars(role: str, events: dict, P: dict) -> list[dict]:
+    """The K least overlapped events among the louder fraction of a role (overlap = summed amplitude of every other
+    event of the same stem whose span touches the window, relative to the event's own amplitude)."""
+    E = P["exemplars"]
+    own = events.get(role, [])
+    if not own:
+        return []
+    thr = np.quantile([e["levelDb"] for e in own], 1.0 - E["loudFraction"])
+    stem = role_stem(role, P)
+    others = [(r, e) for r, evs in events.items() if r in roles(P) and role_stem(r, P) == stem for e in evs]
+    rows = []
+    for i, e in enumerate(own):
+        if e["levelDb"] < thr:
+            continue
+        a, b = e["t"] - E["preS"], event_span(e, role, P)[1]
+        ov = 0.0
+        for r, o in others:
+            if o is e:
+                continue
+            oa, ob = event_span(o, r, P)
+            if oa < b and ob > a - E["overlapGuardS"]:
+                ov += 10 ** (o["levelDb"] / 20.0)
+        rows.append((ov / 10 ** (e["levelDb"] / 20.0), i, a, b))
+    rows.sort()
+    return [{**own[i], "index": i, "overlap": round(o, 4), "start": round(a, 5), "end": round(b, 5)} for o, i, a, b in rows[: E["count"]]]
+
+
+def cut(x: np.ndarray, sr: int, a: float, b: float) -> np.ndarray:
+    i, j = max(0, int(round(a * sr))), int(round(b * sr))
+    y = x[i:j]
+    return np.pad(y, (0, max(0, j - i - len(y)))).astype(np.float32)
+
+
+def midi_hz(m: float) -> float:
+    return 440.0 * 2 ** ((m - 69.0) / 12.0)
+
+
+# ---------------------------------------------------------------- fitting (12 October 2026)
+
+def fit_bounds(cls, ev: dict, kind: str, target: np.ndarray, P: dict) -> dict:
+    E = P["exemplars"]
+    names = [p["name"] for p in cls.PARAMS]
+    peak = float(20 * np.log10(np.abs(target).max() + 1e-9))
+    b = {}
+    if "onset_s" in names:
+        # 12 October 2026: the attack may sit a little before or after the transcribed onset, never at the window
+        # edge, where the loss cannot see the rise (V_003 fits hid their attack there). FR : jamais au bord.
+        b["onset_s"] = (E["preS"] - E["onsetEarlyS"], E["preS"] + E["onsetLateS"], E["preS"])
+    if "amp_db" in names:
+        b["amp_db"] = (-60.0, 0.0, min(max(peak, -59.0), -0.5))
+    if kind == "tonal":
+        pp = pitch_param(cls, P)
+        hz = midi_hz(ev["midi"] + ev.get("cents", 0.0) / 100.0)
+        s = 2 ** (E["pitchSpreadSemi"] / 12.0)
+        spec = next(q for q in cls.PARAMS if q["name"] == pp)
+        if not (spec["min"] <= hz <= spec["max"]):
+            raise ValueError(f"{cls.ID}.{pp} cannot reach {hz:.1f} Hz")
+        b[pp] = (hz / s, hz * s, hz)
+        if "gate_s" in names:
+            b["gate_s"] = (ev["dur"] * 0.8, ev["dur"] * 1.25, ev["dur"])
+        if "glide_st" in names:
+            g = (ev["glide"]["fromMidi"] - ev["midi"]) if ev.get("glide") else 0.0
+            b["glide_st"] = (g - 0.5, g + 0.5, g)
+    return b
+
+
+def fit_job(job: dict) -> dict:
+    """One dfit run (worker process, one thread): narrowed block (+ optional reverb) on one exemplar window."""
+    torch.set_num_threads(1)
+    P = job["P"]
+    install(P)
+    target = np.asarray(job["target"], np.float32)
+    sr = P["sampleRate"]
+    base = _lookup(job["block"])
+    try:
+        bounds = fit_bounds(base, job["event"], job["kind"], target, P)
+    except ValueError as exc:
+        return {**{k: job[k] for k in ("role", "block", "ex")}, "skipped": str(exc)}
+    bid = narrowed(job["block"], bounds)
+    chain = {"sr": sr, "seconds": len(target) / sr,
+             "blocks": [{"block": bid, "params": {}, "gainDb": 0.0, "offsetS": 0.0, "seed": job["seed"]}]}
+    if job.get("reverb"):
+        chain["blocks"].append({"block": job["reverb"], "params": {}, "gainDb": 0.0})
+    res = dfit.fit(target, chain, sr=sr, device="cpu", overrides=P["fit"]["dfit"])
+    return {"role": job["role"], "block": job["block"], "ex": job["ex"], "reverb": job.get("reverb"),
+            "params": res["params"], "score": res["score"], "E": res["E"], "errors": res["errors"],
+            "b1": (res.get("b1") or {}).get("score"), "seconds": res["seconds"], "startsRun": res["startsRun"]}
+
+
+def spec_from_fit(fit: dict, ex: dict, kind: str, P: dict) -> dict:
+    """Voice spec (the params.json entry of a role) from one fit: timbre = every non-note parameter."""
+    cls = _lookup(fit["block"])
+    vals = fit["params"][0]
+    notes = note_params(cls, P, kind)
+    pp = pitch_param(cls, P) if kind == "tonal" else None
+    # 12 October 2026: leadS = how far before the transcribed onset the fit window began (exemplars.preS); a note
+    # renders from t - leadS, so the fitted onset offset (onset_s - leadS, the attack measured against the score) is
+    # kept. FR : decalage d'attaque mesure conserve.
+    exemplar = {"levelDb": ex["levelDb"], "ampDb": vals.get("amp_db", 0.0), "onsetS": vals.get("onset_s", 0.0),
+                "leadS": round(ex["t"] - ex["start"], 6) if "start" in ex else P["exemplars"]["preS"]}
+    if pp:
+        exemplar.update(midi=ex["midi"] + ex.get("cents", 0.0) / 100.0, pitchValue=vals[pp])
+    if "gate_s" in vals and ex.get("dur"):
+        exemplar["gateRatio"] = vals["gate_s"] / ex["dur"]
+    effects = []
+    if fit.get("reverb"):
+        effects.append({"block": fit["reverb"], "params": fit["params"][1], "gainDb": 0.0})
+    return {"block": fit["block"], "kind": kind, "pitchParam": pp, "noteParams": notes,
+            "timbre": {k: round(v, 6) for k, v in vals.items() if k not in notes}, "exemplar": exemplar,
+            "effects": effects, "gainDb": 0.0, "mute": False,
+            "fit": {"score": fit["score"], "b1": fit["b1"], "exemplarT": ex["t"]}}
+
+
+# ---------------------------------------------------------------- rendering (12 October 2026)
+
+def _bounds(cls) -> dict:
+    return {p["name"]: (p["min"], p["max"]) for p in cls.PARAMS}
+
+
+def event_params(spec: dict, ev: dict, transpose: float = 0.0) -> tuple[dict, float]:
+    """Block values for one event, and the extra gain (dB) beyond the amp_db bounds."""
+    cls = _lookup(spec["block"])
+    bd = _bounds(cls)
+    ex = spec["exemplar"]
+    p = dict(spec["timbre"])
+    pp = spec.get("pitchParam")
+    if pp:
+        m = ev["midi"] + ev.get("cents", 0.0) / 100.0 + transpose
+        p[pp] = ex["pitchValue"] * 2 ** ((m - ex["midi"]) / 12.0)
+    if "onset_s" in bd:
+        p["onset_s"] = ex["onsetS"]
+    if "gate_s" in bd:
+        p["gate_s"] = max(0.02, ev.get("dur", 0.1) * ex.get("gateRatio", 1.0))
+    if "glide_st" in bd:
+        p["glide_st"] = (ev["glide"]["fromMidi"] - ev["midi"]) if ev.get("glide") else 0.0
+    want = ex["ampDb"] + (ev["levelDb"] - ex["levelDb"]) + spec.get("gainDb", 0.0)
+    extra = 0.0
+    if "amp_db" in bd:
+        lo, hi = bd["amp_db"]
+        p["amp_db"] = min(max(want, lo), hi)
+        extra = want - p["amp_db"]
+    else:
+        extra = want - ex["ampDb"]
+    for k, (lo, hi) in bd.items():
+        if k in p:
+            p[k] = float(min(max(p[k], lo), hi))
+    return p, extra
+
+
+def tail_of(p: dict, P: dict) -> float:
+    R = P["render"]
+    t = [v for k, v in p.items() if ("t60" in k or k in ("decay_s", "release_s")) and isinstance(v, (int, float))]
+    return float(min(max(max(t) if t else R["minTailS"], R["minTailS"]), R["maxTailS"]))
+
+
+def render_role_job(job: dict) -> tuple[str, np.ndarray]:
+    """Every event of one role into a mono buffer of the song length, then the role's effects (worker process)."""
+    torch.set_num_threads(1)
+    P = job["P"]
+    sr, n, spec = P["sampleRate"], job["n"], job["spec"]
+    if spec.get("engine") == "sms":  # 12 October 2026: measured timbre model (zrmd/audio/sms.py)
+        from . import sms
+        return job["role"], sms.render_role(spec, job["events"], P, n, P["render"]["seedBase"] + job.get("seedOffset", 0), job.get("transpose", 0.0))
+    install(P)
+    buf = np.zeros(n, np.float32)
+    for i, ev in enumerate(job["events"]):
+        p, extra = event_params(spec, ev, job.get("transpose", 0.0))
+        length = p.get("onset_s", 0.0) + (p.get("gate_s", 0.0)) + tail_of(p, P)
+        m = int(math.ceil(length * sr))
+        with torch.no_grad():
+            y = bank.make(spec["block"], p, P["render"]["seedBase"] + i)(m, sr).numpy().astype(np.float32)
+        y *= 10 ** (extra / 20.0)
+        at = int(round((ev["t"] - spec["exemplar"].get("leadS", p.get("onset_s", 0.0))) * sr))
+        if at < 0:
+            y, at = y[-at:], 0
+        k = min(len(y), n - at)
+        if k > 0:
+            buf[at:at + k] += y[:k]
+    for fx in spec.get("effects", []):
+        with torch.no_grad():
+            mod = bank.make(fx["block"], fx["params"], 0)
+            buf = (mod.process(torch.as_tensor(buf), n, sr) * 10 ** (fx.get("gainDb", 0.0) / 20.0)).numpy().astype(np.float32)
+    return job["role"], buf
+
+
+def render_texture(voice: dict, hop_s: float, n: int, sr: int, seed: int) -> np.ndarray:
+    """Vocals texture: band-limited fixed-seed noise following the score's four band envelopes."""
+    from scipy import signal
+    out = np.zeros(n)
+    if voice.get("kind") != "texture" or not voice.get("bands"):
+        return out.astype(np.float32)
+    rng = np.random.default_rng(seed)
+    for band, curve in voice["bands"].items():
+        lo, hi = (float(v) for v in band.split("-"))
+        sos = signal.butter(4, [lo, min(hi, 0.45 * sr)], btype="bandpass", fs=sr, output="sos")
+        nz = signal.sosfilt(sos, rng.standard_normal(n))
+        nz /= np.sqrt(np.mean(nz ** 2)) + 1e-12
+        g = np.interp(np.arange(n) / sr, np.arange(len(curve)) * hop_s, 10 ** (np.asarray(curve) / 20.0))
+        out += nz * g
+    return out.astype(np.float32)
+
+
+# ---------------------------------------------------------------- equaliser, automation, stereo (12 October 2026)
+
+def band_centres(P: dict, sr: int) -> np.ndarray:
+    e = P["eq"]
+    k = np.arange(0, int(e["bandsPerOct"] * math.log2(0.45 * sr / e["fMin"])) + 1)
+    return e["fMin"] * 2 ** (k / e["bandsPerOct"])
+
+
+def _band_weights(freqs: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """Triangular weights on log2 frequency, one row per band (partition of unity between the extreme centres)."""
+    lf = np.log2(np.maximum(freqs, 1.0))
+    lc = np.log2(centres)
+    W = np.zeros((len(centres), len(freqs)))
+    for i in range(len(centres)):
+        lo = lc[i - 1] if i else lc[0] - (lc[1] - lc[0])
+        hi = lc[i + 1] if i + 1 < len(lc) else lc[-1] + (lc[-1] - lc[-2])
+        up = (lf - lo) / (lc[i] - lo)
+        dn = (hi - lf) / (hi - lc[i])
+        W[i] = np.clip(np.minimum(up, dn), 0.0, 1.0)
+    return W
+
+
+def _stft(x: np.ndarray, P: dict):
+    import librosa
+    e = P["eq"]
+    return librosa.stft(np.asarray(x, np.float32), n_fft=e["nFft"], hop_length=e["hop"])
+
+
+def _istft(S, n: int, P: dict) -> np.ndarray:
+    import librosa
+    e = P["eq"]
+    return librosa.istft(S, hop_length=e["hop"], n_fft=e["nFft"], length=n).astype(np.float32)
+
+
+def section_spans(score: dict) -> list[tuple[float, float]]:
+    return [(s["start"], s["end"]) for s in score["sections"]]
+
+
+def fx_spans(score: dict, P: dict) -> list[tuple[float, float]]:
+    """12 October 2026: the time spans of the fitted equaliser and residual: sections (default) or bars (eq.span = bar,
+    a finer mixing automation, one third-octave curve per bar). FR : sections ou mesures pour l'egaliseur mesure."""
+    if P["eq"].get("span") != "bar":
+        return section_spans(score)
+    bars = [(b["start"], b["end"]) for b in score["tempo"]["bars"]]
+    out = ([(0.0, bars[0][0])] if bars and bars[0][0] > 0.05 else []) + bars
+    if bars and score["tempo"]["duration"] - bars[-1][1] > 0.05:
+        out.append((bars[-1][1], score["tempo"]["duration"]))
+    return out
+
+
+def measure_eq(ref: np.ndarray, ours: np.ndarray, spans: list, sr: int, P: dict) -> dict:
+    """dB ratio reference / ours per third-octave band and per section, smoothed and clipped."""
+    e = P["eq"]
+    c = band_centres(P, sr)
+    freqs = np.fft.rfftfreq(e["nFft"], 1.0 / sr)
+    W = _band_weights(freqs, c)
+    Pr, Po = np.abs(_stft(ref, P)) ** 2, np.abs(_stft(ours, P)) ** 2
+    times = np.arange(Pr.shape[1]) * e["hop"] / sr
+    top_r = 10 * np.log10(W @ Pr.mean(axis=1) + 1e-20).max()
+    rows = []
+    for a, b in spans:
+        f = (times >= a) & (times < b)
+        if not f.any():
+            rows.append({"start": a, "end": b, "gainsDb": [0.0] * len(c)})
+            continue
+        br = 10 * np.log10(W @ Pr[:, f].mean(axis=1) + 1e-20)
+        bo = 10 * np.log10(W @ Po[:, f].mean(axis=1) + 1e-20)
+        g = np.where((bo > top_r + e["silentDb"]) & (br > top_r + e["silentDb"]), br - bo, 0.0)
+        k = e["smoothBands"]
+        if k:
+            g = np.convolve(np.pad(g, k, mode="edge"), np.ones(2 * k + 1) / (2 * k + 1), mode="valid")
+        rows.append({"start": round(a, 4), "end": round(b, 4), "gainsDb": [round(float(v), 2) for v in np.clip(g, -e["maxDb"], e["maxDb"])]})
+    return {"centresHz": [round(float(v), 2) for v in c], "sections": rows}
+
+
+def apply_eq(x: np.ndarray, eq: dict, sr: int, P: dict, time_scale: float = 1.0, t0: float = 0.0) -> np.ndarray:
+    """Static gains per section, crossfaded over eq.rampS at section boundaries (times follow a tempo change)."""
+    e = P["eq"]
+    n = len(x)
+    S = _stft(x, P)
+    freqs = np.fft.rfftfreq(e["nFft"], 1.0 / sr)
+    lc, lf = np.log2(eq["centresHz"]), np.log2(np.maximum(freqs, 1.0))
+    G = np.stack([np.interp(lf, lc, s["gainsDb"]) for s in eq["sections"]])  # [sections, F]
+    times = np.arange(S.shape[1]) * e["hop"] / sr
+    mids = []
+    for s in eq["sections"]:
+        a = t0 + (s["start"] - t0) * time_scale
+        mids.append(a)
+    mids = np.asarray(mids[1:])
+    ramp = e["rampS"] * time_scale
+    # Weight of each section per frame: logistic steps at each boundary (smooth crossfade). FR : fondu entre sections.
+    w = np.zeros((len(eq["sections"]), len(times)))
+    step = [np.clip((times - m) / max(ramp, 1e-3) + 0.5, 0.0, 1.0) for m in mids]
+    for i in range(len(eq["sections"])):
+        left = step[i - 1] if i else np.ones_like(times)
+        right = (1.0 - step[i]) if i < len(step) else np.ones_like(times)
+        w[i] = left * right
+    w /= w.sum(axis=0, keepdims=True) + 1e-12
+    gain_db = G.T @ w  # [F, T]
+    return _istft(S * 10 ** (gain_db / 20.0), n, P)
+
+
+def apply_automation(x: np.ndarray, curve: list, hop_s: float, window_s: float, sr: int, P: dict) -> np.ndarray:
+    """Gain riding toward a lane (dB RMS every hop_s): target minus our own level, clipped, smoothed, interpolated."""
+    import librosa
+    A = P["automation"]
+    h, w = max(1, int(round(hop_s * sr))), max(2, int(round(window_s * sr)))
+    own = 20 * np.log10(librosa.feature.rms(y=x, frame_length=w, hop_length=h)[0] + 1e-9)
+    tgt = np.asarray(curve, np.float64)
+    m = min(len(own), len(tgt))
+    g = np.where(own[:m] > A["silentDb"], np.clip(tgt[:m] - own[:m], -A["maxDb"], A["maxDb"]), 0.0)
+    if A["smoothFrames"] > 1:
+        k = A["smoothFrames"]
+        g = np.convolve(np.pad(g, k, mode="edge"), np.ones(2 * k + 1) / (2 * k + 1), mode="valid")
+    gs = np.interp(np.arange(len(x)), np.arange(m) * h, g)
+    return (x * 10 ** (gs / 20.0)).astype(np.float32)
+
+
+def measure_stereo(ref_stereo: np.ndarray, sr: int, P: dict) -> dict:
+    c = band_centres(P, sr)
+    freqs = np.fft.rfftfreq(P["eq"]["nFft"], 1.0 / sr)
+    W = _band_weights(freqs, c)
+    M = (ref_stereo[:, 0] + ref_stereo[:, 1]) / 2
+    S = (ref_stereo[:, 0] - ref_stereo[:, 1]) / 2
+    em = W @ (np.abs(_stft(M, P)) ** 2).mean(axis=1)
+    es = W @ (np.abs(_stft(S, P)) ** 2).mean(axis=1)
+    r = np.clip(np.sqrt(es / (em + 1e-20)), 0.0, P["stereo"]["maxRatio"])
+    return {"centresHz": [round(float(v), 2) for v in c], "sideOverMid": [round(float(v), 4) for v in r]}
+
+
+def apply_stereo(x: np.ndarray, st: dict | None, sr: int, P: dict) -> np.ndarray:
+    """Mid = our mono render; side = fixed-seed velvet-noise decorrelation of it, magnitude set per band to the
+    measured side/mid ratio. L = M + S, R = M - S. FR : stereo par decorrelation, largeur mesuree par bande."""
+    if not st:
+        return np.stack([x, x], axis=1).astype(np.float32)
+    from scipy import signal
+    rng = np.random.default_rng(P["stereo"]["seed"])
+    L = int(P["stereo"]["decorrelatorMs"] * sr / 1000)
+    ir = np.zeros(L)
+    pos = rng.choice(L, size=max(4, L // 40), replace=False)
+    ir[pos] = rng.choice([-1.0, 1.0], size=len(pos)) * np.exp(-3.0 * pos / L)
+    ir /= np.sqrt((ir ** 2).sum())
+    d = signal.fftconvolve(x, ir)[: len(x)]
+    X, D = _stft(x, P), _stft(d, P)
+    freqs = np.fft.rfftfreq(P["eq"]["nFft"], 1.0 / sr)
+    g = np.interp(np.log2(np.maximum(freqs, 1.0)), np.log2(st["centresHz"]), st["sideOverMid"])
+    side = _istft(D * (np.abs(X) / (np.abs(D) + 1e-9)) * g[:, None], len(x), P)
+    return np.stack([x + side, x - side], axis=1).astype(np.float32)
+
+
+# ---------------------------------------------------------------- stochastic residual (12 October 2026)
+# The stochastic part of spectral modelling synthesis (Serra 1989) at the scale of a section: what the transcribed
+# notes do not explain (missed notes, pads, room, noise) is measured as the positive power difference reference minus
+# our dry render, per third-octave band and per section, and rebuilt as fixed-seed noise with that spectrum, whose
+# level follows the stem's automation lane of the score (followLane). A table of numbers, never a sample.
+# FR : residu stochastique par section ; ce que les notes n'expliquent pas devient un bruit mesure, jamais un echantillon.
+
+def measure_residual(ref: np.ndarray, ours: np.ndarray, spans: list, sr: int, P: dict, gate_db: float | None = None) -> dict:
+    """12 October 2026: gate_db (residual.sectionGateDb per stem): a section gets a bed only when our dry render is at
+    least gate_db under the reference there (a section the transcription left empty). FR : seulement les sections vides."""
+    R = P["residual"]
+    import librosa
+    c = band_centres(P, sr)
+    freqs = np.fft.rfftfreq(R["nFft"], 1.0 / sr)
+    W = _band_weights(freqs, c)
+    W = W / (W.sum(axis=1, keepdims=True) + 1e-12)
+    pr = np.abs(librosa.stft(np.asarray(ref, np.float32), n_fft=R["nFft"], hop_length=R["hop"])) ** 2
+    po = np.abs(librosa.stft(np.asarray(ours[: len(ref)], np.float32), n_fft=R["nFft"], hop_length=R["hop"])) ** 2
+    times = np.arange(pr.shape[1]) * R["hop"] / sr
+    rows = []
+    for a, b in spans:
+        f = (times >= a) & (times < b)
+        if not f.any():
+            continue
+        br, bo = W @ pr[:, f].mean(axis=1), W @ po[:, f].mean(axis=1)
+        if gate_db is not None and 10 * np.log10((br.sum() + 1e-30) / (bo.sum() + 1e-30)) < gate_db:
+            rows.append({"start": round(a, 4), "end": round(b, 4), "bandsDb": [-200.0] * len(c)})
+            continue
+        d = br - bo * 10 ** (R["marginDb"] / 10.0)
+        db = np.where(d > 0, 10 * np.log10(np.maximum(d, 1e-30)), -200.0)
+        rows.append({"start": round(a, 4), "end": round(b, 4), "bandsDb": [round(float(v), 2) for v in db]})
+    return {"centresHz": [round(float(v), 2) for v in c], "nFft": R["nFft"], "hop": R["hop"], "sections": rows}
+
+
+def render_residual(res: dict, n: int, sr: int, P: dict, lane: list | None, hop_s: float, seed: int,
+                    time_scale: float = 1.0, t0: float = 0.0) -> np.ndarray:
+    import librosa
+    R = P["residual"]
+    nf, hop = res["nFft"], res["hop"]
+    frames = n // hop + 1
+    freqs = np.fft.rfftfreq(nf, 1.0 / sr)
+    lc, lf = np.log2(res["centresHz"]), np.log2(np.maximum(freqs, 1.0))
+    times = np.arange(frames) * hop / sr
+    Pw = np.zeros((len(freqs), frames))
+    for sec in res["sections"]:
+        a, b = t0 + (sec["start"] - t0) * time_scale, t0 + (sec["end"] - t0) * time_scale
+        f = (times >= a) & (times < b)
+        if f.any():
+            Pw[:, f] = (10 ** (np.interp(lf, lc, sec["bandsDb"]) / 10.0))[:, None]
+    if lane is not None and R["followLane"]:
+        lv = np.asarray(lane, np.float64)
+        lt = np.arange(len(lv)) * hop_s
+        g = np.interp(times, lt, lv)
+        for sec in res["sections"]:
+            a, b = t0 + (sec["start"] - t0) * time_scale, t0 + (sec["end"] - t0) * time_scale
+            f = (times >= a) & (times < b)
+            if f.any():
+                lin = 10 ** (g[f] / 10.0)
+                Pw[:, f] *= (lin / (lin.mean() + 1e-30))[None, :]
+    rng = np.random.default_rng(seed)
+    ph = rng.standard_normal(Pw.shape) + 1j * rng.standard_normal(Pw.shape)
+    ph /= np.abs(ph) + 1e-12
+    # Mean band power of a Hann-windowed STFT cell maps back to magnitude (consistent with the measurement).
+    return librosa.istft(np.sqrt(Pw) * ph, hop_length=hop, n_fft=nf, length=n).astype(np.float32)
+
+
+# ---------------------------------------------------------------- mix bus (12 October 2026)
+
+def compress(x: np.ndarray, sr: int, thr_db: float, ratio: float, attack_ms: float, release_ms: float) -> np.ndarray:
+    """Feed-forward stereo-linked compressor on 1 ms blocks: RMS level in dB, attack and release smoothing of the gain
+    reduction, gain interpolated back to samples."""
+    blk = max(1, sr // 1000)
+    m = len(x) // blk
+    p = (x[: m * blk] ** 2).mean(axis=1).reshape(m, blk).mean(axis=1)
+    lvl = 10 * np.log10(p + 1e-12)
+    gr = np.maximum(lvl - thr_db, 0.0) * (1.0 - 1.0 / ratio)
+    a, r = math.exp(-1.0 / max(attack_ms, 0.1)), math.exp(-1.0 / max(release_ms, 0.1))
+    s, out = 0.0, np.empty(m)
+    for i in range(m):
+        c = a if gr[i] > s else r
+        s = c * s + (1 - c) * gr[i]
+        out[i] = s
+    g = np.interp(np.arange(len(x)), np.arange(m) * blk + blk / 2, -out)
+    return (x * 10 ** (g / 20.0)[:, None]).astype(np.float32)
+
+
+def apply_mix_bus(stems: dict, bus: dict | None, sr: int, P: dict, time_scale: float = 1.0, t0: float = 0.0) -> np.ndarray:
+    from . import mix as MX
+    gains = (bus or {}).get("stemGainsDb", {})
+    y = sum(stems[k] * 10 ** (gains.get(k, 0.0) / 20.0) for k in stems)
+    if not bus:
+        return y.astype(np.float32)
+    if bus.get("eq"):
+        y = np.stack([apply_eq(y[:, c], bus["eq"], sr, P, time_scale, t0) for c in range(2)], axis=1)
+    cp = bus.get("compressor")
+    if cp and cp["ratio"] > 1.0:
+        y = compress(y, sr, cp["thresholdDb"], cp["ratio"], cp["attackMs"], cp["releaseMs"])
+    y = y * 10 ** (bus.get("gainDb", 0.0) / 20.0)
+    if bus.get("ceilingDbtp") is not None:
+        y = MX.limiter(y, sr, bus["ceilingDbtp"], config.cfg())
+        # 12 October 2026: a time-varying gain can overshoot between samples (V_023 measured -0.94 dBTP under a -1.05
+        # ceiling); a static trim of the measured excess closes it. FR : correction statique du depassement mesure.
+        tp = loudness.true_peak_db(y, sr, config.cfg()["mix"]["oversample"])
+        if tp > bus["ceilingDbtp"]:
+            y = y * 10 ** ((bus["ceilingDbtp"] - tp) / 20.0)
+    return y.astype(np.float32)
+
+
+# ---------------------------------------------------------------- the render, a pure function of params (12 October 2026)
+
+def retime(score: dict, bpm: float) -> tuple[dict, float]:
+    """Every time of the score scaled around tempo.t0 for a new tempo (notes, hits, sections, lanes)."""
+    s = copy.deepcopy(score)
+    ref = score["tempo"]["bpm"]
+    k = ref / float(bpm)
+    if abs(k - 1.0) < 1e-12:
+        return s, 1.0
+    t0 = score["tempo"]["t0"]
+    f = lambda t: t0 + (t - t0) * k
+    for h in s["drums"]:
+        h["t"] = f(h["t"])
+    for v in s["voices"].values():
+        for n_ in v.get("notes", []):
+            n_["t"] = f(n_["t"])
+            n_["dur"] = n_["dur"] * k
+            if n_.get("glide"):
+                n_["glide"]["ms"] = n_["glide"]["ms"] * k
+    for sec in s["sections"]:
+        sec["start"], sec["end"] = max(0.0, f(sec["start"])), f(sec["end"])
+    s["automation"]["hopS"] *= k
+    s["automation"]["windowS"] *= k
+    s["tempo"]["bpm"] = float(bpm)
+    s["tempo"]["period"] *= k
+    s["tempo"]["duration"] = f(score["tempo"]["duration"])
+    return s, k
+
+
+def apply_edits(score: dict, edits: list) -> dict:
+    """Pattern edits: mute, gainDb, transpose, dropBars, addDrumSteps (roles: drum classes or tonal voice names)."""
+    s = copy.deepcopy(score)
+    tp = s["tempo"]
+    step_s = tp["period"] / tp["stepsPerBeat"]
+
+    def bar_of(t):
+        return math.floor((t - tp["firstKick"]) / (tp["period"] * tp["beatsPerBar"])) + 1
+
+    for e in edits or []:
+        op, role = e["op"], e.get("role", "*")
+        if op == "addDrumSteps":
+            a, b = e["bars"]
+            for bar in range(a, b + 1):
+                for st in e["stepsInBar"]:
+                    t = tp["firstKick"] + (bar - 1) * tp["period"] * tp["beatsPerBar"] + (st - 1) * step_s
+                    s["drums"].append({"t": t, "class": role, "levelDb": e.get("levelDb", -30.0), "added": True})
+            continue
+        pick_d = lambda h: role == "*" or h["class"] == role
+        if op in ("mute", "dropBars", "gainDb"):
+            keep = []
+            for h in s["drums"]:
+                if pick_d(h):
+                    if op == "mute" or (op == "dropBars" and e["bars"][0] <= bar_of(h["t"]) <= e["bars"][1]):
+                        continue
+                    if op == "gainDb":
+                        h["levelDb"] += e["db"]
+                keep.append(h)
+            s["drums"] = keep
+        for name, v in s["voices"].items():
+            if name not in TONAL or not (role == "*" or role == name):
+                continue
+            notes = []
+            for n_ in v.get("notes", []):
+                if op == "mute" or (op == "dropBars" and e["bars"][0] <= bar_of(n_["t"]) <= e["bars"][1]):
+                    continue
+                if op == "gainDb":
+                    n_["levelDb"] += e["db"]
+                if op == "transpose":
+                    n_["midi"] += e["semitones"]
+                    if n_.get("glide"):
+                        n_["glide"]["fromMidi"] += e["semitones"]
+                notes.append(n_)
+            v["notes"] = notes
+    s["drums"].sort(key=lambda h: h["t"])
+    return s
+
+
+def render(prm: dict, score: dict, P: dict, workers: int | None = None, stages: dict | None = None) -> dict:
+    """params.json + score.json -> stereo stems and mix. `stages` can switch fx off for measurement renders."""
+    from concurrent.futures import ProcessPoolExecutor
+    st = {"eq": True, "automation": True, "stereo": True, "mixBus": True, "residual": True, **(stages or {})}
+    sr = P["sampleRate"]
+    sc, k = retime(score, prm["tempo"]["bpm"])
+    sc = apply_edits(sc, prm.get("patternEdits", []))
+    n = int(math.ceil((sc["tempo"]["duration"] + 0.05) * sr)) if k != 1.0 else prm["lengthSamples"]
+    events = role_events(sc)
+    jobs = []
+    for role, spec in prm["voices"].items():
+        if spec.get("mute") or not events.get(role):
+            continue
+        tr = prm.get("transposeSemitones", 0.0) if spec["kind"] == "tonal" else 0.0
+        jobs.append({"role": role, "spec": spec, "events": events[role], "n": n, "P": P, "transpose": tr,
+                     "seedOffset": sorted(prm["voices"]).index(role)})
+    jobs.sort(key=lambda j: -len(j["events"]))
+    with ProcessPoolExecutor(max_workers=min(workers or P["workers"], max(1, len(jobs)))) as ex:
+        roles = dict(ex.map(render_role_job, jobs))
+    dry = {s_: np.zeros(n, np.float32) for s_ in STEMS}
+    for role, buf in roles.items():
+        dry[P["roles"][role]["stem"]] += buf
+    au = sc["automation"]
+    # 13 October 2026: a texture vocals voice (OneKey) is rendered as band noise; a sung melody is a tonal role (already in dry).
+    if sc["voices"].get("vocals", {}).get("kind", "texture") != "melody":
+        dry["vocals"] = render_texture(sc["voices"].get("vocals", {}), au["hopS"], n, sr, P["render"]["seedBase"])
+    t0 = score["tempo"]["t0"]
+    out = {}
+    for s_ in STEMS:
+        fx = prm.get("stemFx", {}).get(s_, {})
+        x = dry[s_] * 10 ** (prm.get("stemGainsDb", {}).get(s_, 0.0) / 20.0)
+        if st["residual"] and fx.get("residual"):  # 12 October 2026: stochastic residual bed, before the equaliser
+            lane = au["stems"].get(s_) if au.get("stems") else None
+            x = x + render_residual(fx["residual"], n, sr, P, lane, au["hopS"], P["render"]["seedBase"] + 500 + STEMS.index(s_), k, t0)
+        if st["eq"] and fx.get("eq"):
+            x = apply_eq(x, fx["eq"], sr, P, k, t0)
+        if st["automation"] and fx.get("automation") and au["stems"].get(s_):
+            x = apply_automation(x, au["stems"][s_], au["hopS"], au["windowS"], sr, P)
+        out[s_] = apply_stereo(x, fx.get("stereo") if st["stereo"] else None, sr, P)
+    mixed = apply_mix_bus(out, prm.get("mixBus") if st["mixBus"] else None, sr, P, k, t0)
+    return {"stems": out, "mix": mixed, "sr": sr, "dry": dry, "score": sc}
+
+
+# ---------------------------------------------------------------- scoring (12 October 2026)
+
+def section_envelope(ref: np.ndarray, ours: np.ndarray, spans: list, sr: int, P: dict) -> list[dict]:
+    """Per section: 64 mel bands mean power, weighted mean |dB difference| / JND, score 100 * 0.99 ** E^2."""
+    import librosa
+    S = P["score"]
+    base = config.get("score.base")
+    mb = librosa.filters.mel(sr=sr, n_fft=2048, n_mels=S["melBands"], fmin=30.0)
+    pr = mb @ (np.abs(librosa.stft(ref, n_fft=2048, hop_length=512)) ** 2)
+    po = mb @ (np.abs(librosa.stft(ours[: len(ref)], n_fft=2048, hop_length=512)) ** 2)
+    k = min(pr.shape[1], po.shape[1])
+    times = np.arange(k) * 512 / sr
+    rows = []
+    for a, b in spans:
+        f = (times >= a) & (times < b)
+        if not f.any():
+            continue
+        r = 10 * np.log10(pr[:, :k][:, f].mean(axis=1) + 1e-20)
+        o = 10 * np.log10(po[:, :k][:, f].mean(axis=1) + 1e-20)
+        fl = r.max() - S["sectionFloorDb"]
+        r2, o2 = np.maximum(r, fl), np.maximum(o, fl)
+        w = np.maximum(r2, o2) - fl
+        E = float((w * np.abs(r2 - o2)).sum() / (w.sum() + 1e-9) / S["sectionJndDb"])
+        rows.append({"start": round(a, 3), "end": round(b, 3), "E": round(E, 3), "score": round(100 * base ** (E * E), 3),
+                     "levelDiffDb": round(float(10 * np.log10((10 ** (o / 10)).sum() / (10 ** (r / 10)).sum())), 2)})
+    return rows
+
+
+def ploss_bars(ref: np.ndarray, ours: np.ndarray, score: dict, sr: int, P: dict) -> dict:
+    bars = score["tempo"].get("bars") or []
+    rows = []
+    for b in bars[: P["score"]["barPlossMaxBars"]]:
+        a, e = b.get("start", b.get("t")), b.get("end")
+        if a is None or e is None or e - a < 0.2:
+            continue
+        x, y = cut(ref, sr, a, e), cut(ours, sr, a, e)
+        if np.abs(x).max() < 1e-5:
+            continue
+        rows.append(round(ploss.score(y, x, sr)["score"], 3))
+    return {"median": round(float(np.median(rows)), 3) if rows else None, "mean": round(float(np.mean(rows)), 3) if rows else None,
+            "min": min(rows) if rows else None, "max": max(rows) if rows else None, "bars": rows}
+
+
+def _ploss_job(args):
+    torch.set_num_threads(2)
+    name, ref, ours, score, sr, P = args
+    full = ploss.score(ours[: len(ref)], ref, sr)
+    return name, {"full": {"score": round(full["score"], 4), "E": round(full["E"], 3), "errors": full["errors"]},
+                  "perBar": ploss_bars(ref, ours, score, sr, P)}
+
+
+def music_analysis(stems_mono: dict, sr: int) -> dict:
+    from . import music
+    return music.analyze({k: np.asarray(stems_mono[k], np.float64) for k in ("drums", "bass", "other")}, sr)
+
+
+def score_all(ref: dict, out: dict, score: dict, P: dict, ref_analysis: dict | None = None) -> dict:
+    """Every measure per stem and for the mix (mono mid for ploss and the waveform-free measures)."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    import librosa
+
+    from . import transcribe as T
+    from . import verify as VF
+    sr = ref["sr"]
+    spans = section_spans(score)
+    pairs = {k: (mono(ref["stems"][k]), mono(out["stems"][k])) for k in STEMS}
+    pairs["mix"] = (mono(ref["mix"]), mono(out["mix"]))
+    with ProcessPoolExecutor(max_workers=min(P["workers"], 5)) as ex:
+        pl = dict(ex.map(_ploss_job, [(k, a, b, score, sr, P) for k, (a, b) in pairs.items()]))
+    asr = P["score"]["analysisSr"]
+    TP = T.params()
+    rs = {k: librosa.resample(a, orig_sr=sr, target_sr=asr) for k, (a, _) in pairs.items()}
+    os_ = {k: librosa.resample(b, orig_sr=sr, target_sr=asr) for k, (_, b) in pairs.items()}
+    wf = T.evaluate({k: os_[k] for k in STEMS}, {k: rs[k] for k in STEMS}, asr, TP)
+    wf["mix"] = {"onset": T.match_f(T.onset_times(rs["mix"], asr, TP["verify"]["onsetDelta"]), T.onset_times(os_["mix"], asr, TP["verify"]["onsetDelta"]), TP["verify"]["onsetToleranceS"]),
+                 "chroma": T.chroma_similarity(rs["mix"], os_["mix"], asr, TP), "envelopeCorr": T.envelope_corr(rs["mix"], os_["mix"], asr, TP)}
+    rows = {}
+    for k in pairs:
+        se = section_envelope(pairs[k][0], pairs[k][1], spans, sr, P)
+        rows[k] = {"ploss": pl[k], "onsetF": wf[k]["onset"]["f"], "chroma": wf[k]["chroma"], "envelopeCorr": wf[k]["envelopeCorr"],
+                   "sectionEnvelope": {"mean": round(float(np.mean([s["score"] for s in se])), 3) if se else None, "sections": se}}
+    ra = ref_analysis or music_analysis({k: mono(ref["stems"][k]) for k in STEMS}, sr)
+    ga = music_analysis({k: mono(out["stems"][k]) for k in STEMS}, sr)
+    rep = VF.report({"mix": ref["mix"], "events": [], "music": ra}, {"mix": out["mix"], "sfx": np.zeros(len(out["mix"])), "events": {}, "music": ga}, sr)
+    rows["mix"]["verify"] = {"scores": rep["scores"], "mix": rep["mix"], "music": {k: rep["music"][k] for k in ("score", "parts", "tempoErrorPct", "keyRef", "keyGen")}}
+    for k, v in score_stable(ref, out, score, P).items():  # 12 October 2026: stable scores beside the official ones
+        rows[k]["stable"] = v
+    return rows
+
+
+def headline(rows: dict) -> dict:
+    """The few numbers compared between versions (12 October 2026: plus the stable event, onset-free bar and
+    time-frequency band scores of score_stable when present)."""
+    out = {}
+    for k, v in rows.items():
+        h = {"plossFull": v["ploss"]["full"]["score"], "plossBarMedian": v["ploss"]["perBar"]["median"], "onsetF": v["onsetF"],
+             "chroma": v["chroma"], "envCorr": v["envelopeCorr"], "sectionEnv": v["sectionEnvelope"]["mean"]}
+        if v.get("stable"):
+            h.update({kk: v["stable"][kk] for kk in ("plossEvents", "plossBarNoOnset", "tfBands")})
+        out[k] = h
+    return out
+
+
+# ---------------------------------------------------------------- stable scores (12 October 2026)
+# Measured on the reference itself (docs/build/M2-resynthesis.md, section ceilings): the official ploss on a whole bar
+# is not a usable target for music, because its onset term is the soft-argmax of the strongest rise in the window,
+# which jumps between near-equal hits: the reference shifted by 1 ms scores 0 to 98 per bar, and a perfect STFT
+# magnitude with random phase scores 0 to 50. Three complementary measures are therefore reported beside it, each
+# proven both ways in Scripts/VerifyResynth.py:
+#   plossEvents     : the official ploss (onset term included) on windows around single transcribed events, the
+#                     situation it was designed for (median over a fixed, evenly spaced subset of events per stem);
+#   plossBarNoOnset : the official ploss per bar with the onset weight set to 0 (spectral and envelope terms only);
+#   tfBands         : third-octave band levels on 46 ms frames, weighted mean |dB difference| / 2 dB, the same score
+#                     formula 100 * 0.99 ** E^2; phase-free, so a resynthesis with its own noise can reach it.
+# FR : trois mesures stables a cote du ploss officiel par mesure, dont le terme d'attaque saute d'une frappe a l'autre.
+
+def stem_events(score: dict, stem: str) -> list[float]:
+    if stem == "drums":
+        return [h["t"] for h in score["drums"]]
+    if stem == "bass":
+        return [n_["t"] for n_ in score["voices"].get("bass", {}).get("notes", [])]
+    if stem == "other":
+        return sorted(n_["t"] for v in ("otherLow", "otherMid", "otherHigh") for n_ in score["voices"].get(v, {}).get("notes", []))
+    if stem == "mix":
+        return [h["t"] for h in score["drums"] if h["class"] == "kick"]
+    return []
+
+
+def tf_bands_score(ref: np.ndarray, ours: np.ndarray, sr: int, P: dict) -> float:
+    S = P["score"]["stable"]
+    import librosa
+    n = min(len(ref), len(ours))
+    c = S["tfFMin"] * 2 ** (np.arange(0, int(3 * math.log2(S["tfFMax"] / S["tfFMin"])) + 1) / 3.0)
+    freqs = np.fft.rfftfreq(S["tfNFft"], 1.0 / sr)
+    W = _band_weights(freqs, c)
+    pr = W @ (np.abs(librosa.stft(ref[:n], n_fft=S["tfNFft"], hop_length=S["tfHop"])) ** 2)
+    po = W @ (np.abs(librosa.stft(ours[:n], n_fft=S["tfNFft"], hop_length=S["tfHop"])) ** 2)
+    r, o = 10 * np.log10(pr + 1e-20), 10 * np.log10(po + 1e-20)
+    fl = r.max() - S["tfFloorDb"]
+    r2, o2 = np.maximum(r, fl), np.maximum(o, fl)
+    w = np.maximum(r2, o2) - fl
+    E = float((w * np.abs(r2 - o2)).sum() / (w.sum() + 1e-9) / S["tfJndDb"])
+    return round(100 * config.get("score.base") ** (E * E), 3)
+
+
+def _stable_job(args):
+    torch.set_num_threads(1)
+    name, ref, ours, score, sr, P = args
+    S = P["score"]["stable"]
+    cfg0 = config.cfg()
+    cfg_no = copy.deepcopy(cfg0)
+    cfg_no["ploss"]["weights"]["onset"] = 0.0
+    ts = stem_events(score, name)
+    if len(ts) > S["maxEvents"]:
+        ts = [ts[int(i)] for i in np.linspace(0, len(ts) - 1, S["maxEvents"])]
+    ev = []
+    for t in ts:
+        a, b = int((t - S["eventPreS"]) * sr), int((t + S["eventPostS"]) * sr)
+        if a < 0 or b > len(ref) or np.abs(ref[a:b]).max() < 1e-5:
+            continue
+        ev.append(ploss.score(ours[a:b], ref[a:b], sr, cfg0)["score"])
+    bars = []
+    for bb in score["tempo"].get("bars") or []:
+        a, e = bb.get("start"), bb.get("end")
+        if a is None or e is None or e - a < 0.2:
+            continue
+        x = cut(ref, sr, a, e)
+        if np.abs(x).max() < 1e-5:
+            continue
+        bars.append(ploss.score(cut(ours, sr, a, e), x, sr, cfg_no)["score"])
+    return name, {"plossEvents": round(float(np.median(ev)), 3) if ev else None, "eventCount": len(ev),
+                  "plossBarNoOnset": round(float(np.median(bars)), 3) if bars else None,
+                  "tfBands": tf_bands_score(ref, ours, sr, P)}
+
+
+def score_stable(ref: dict, out: dict, score: dict, P: dict) -> dict:
+    from concurrent.futures import ProcessPoolExecutor
+    sr = ref["sr"]
+    pairs = {k: (mono(ref["stems"][k]), mono(out["stems"][k])) for k in STEMS}
+    pairs["mix"] = (mono(ref["mix"]), mono(out["mix"]))
+    with ProcessPoolExecutor(max_workers=min(P["workers"], 5)) as ex:
+        return dict(ex.map(_stable_job, [(k, a, b[: len(a)] if len(b) >= len(a) else np.pad(b, (0, len(a) - len(b))), score, sr, P) for k, (a, b) in pairs.items()]))
+
+
+def write_stereo(path: Path, x: np.ndarray, sr: int) -> None:
+    import soundfile as sf
+    sf.write(str(path), np.asarray(x, np.float32), sr, subtype="FLOAT")
+
+
+# ---------------------------------------------------------------- phrase refinement (12 October 2026)
+# The exemplar fits see one note, cut from a stem where other notes overlap. The phrase pass refines the timbres
+# jointly on whole bars: every role of a stem is one shared module, every note of the bars is rendered by it with the
+# score's pitch, length and level, the role effects follow, and Adam lowers the ploss of the stem window (summed over
+# phrase.windows). Note parameters stay fixed by the score; timbre, effect parameters and one gain per role move.
+# FR : affinage par phrases ; les timbres de toutes les voix d'une piste s'ajustent ensemble sur des mesures entieres.
+
+def _note_values(mod, spec: dict, p: dict) -> dict:
+    vals = {}
+    for q in mod.PARAMS:
+        k = q["name"]
+        if k in spec["timbre"] and k not in spec.get("noteParams", []):
+            vals[k] = mod.value(k)
+        else:
+            vals[k] = torch.tensor(float(p[k]))
+    return vals
+
+
+def render_window_torch(mods: dict, fxmods: dict, gains: dict, specs: dict, events: dict, a: float, n: int, sr: int, P: dict):
+    out = torch.zeros(n)
+    for role, spec in specs.items():
+        bus = torch.zeros(n)
+        mod = mods[role]
+        for ev in events.get(role, []):
+            p, extra = event_params(spec, ev)
+            m = int(math.ceil((p.get("onset_s", 0.0) + p.get("gate_s", 0.0) + tail_of(p, P)) * sr))
+            at = int(round((ev["t"] - spec["exemplar"].get("leadS", p.get("onset_s", 0.0)) - a) * sr))
+            if at >= n or at + m <= 0:
+                continue
+            t = torch.arange(m, dtype=torch.float32) / sr
+            y = mod.synth(_note_values(mod, spec, p), t, sr) * (10 ** (extra / 20.0))
+            lo, hi = max(0, -at), min(m, n - at)
+            bus = bus + torch.nn.functional.pad(y[lo:hi], (at + lo, n - (at + hi)))
+        for fm in fxmods.get(role, []):
+            bus = fm.process(bus, n, sr)
+        out = out + bus * torch.pow(10.0, gains[role] / 20.0)
+    return out
+
+
+def phrase_job(job: dict) -> dict:
+    torch.set_num_threads(job.get("threads", 1))
+    P = job["P"]
+    install(P)
+    sr = P["sampleRate"]
+    Ph = P["phrase"]
+    specs = job["specs"]
+    mods = {r: bank.make(s["block"], {**s["timbre"]}, P["render"]["seedBase"]) for r, s in specs.items()}
+    fxmods = {r: [bank.make(f["block"], f["params"], 0) for f in s.get("effects", [])] for r, s in specs.items()}
+    gains = {r: torch.nn.Parameter(torch.zeros(())) for r in specs}
+    tparams = [mods[r].raw[k] for r, s in specs.items() for k in s["timbre"] if k not in s.get("noteParams", [])]
+    tparams += [p for fl in fxmods.values() for fm in fl for p in fm.raw.values()] + list(gains.values())
+    targets = [ploss.Target(np.asarray(w["target"], np.float32), sr, "cpu") for w in job["windows"]]
+
+    def total():
+        e2s = []
+        for w, tg in zip(job["windows"], targets):
+            y = render_window_torch(mods, fxmods, gains, specs, w["events"], w["a"], len(w["target"]), sr, P)
+            e2s.append(ploss.loss(y, tg)[0])
+        return torch.stack(e2s).mean()
+
+    opt = torch.optim.Adam(tparams, lr=Ph["lr"])
+    curve = []
+    best, snap = float("inf"), None
+    for step in range(Ph["steps"]):
+        opt.zero_grad()
+        e2 = total()
+        v = float(e2.detach())
+        curve.append(round(v, 4))
+        if v < best:
+            best = v
+            snap = ([{k: x.detach().clone() for k, x in m.raw.items()} for m in mods.values()],
+                    [{k: x.detach().clone() for k, x in fm.raw.items()} for fl in fxmods.values() for fm in fl],
+                    {r: float(g.detach()) for r, g in gains.items()})
+        if not math.isfinite(v):
+            break
+        e2.backward()
+        for prm in tparams:
+            if prm.grad is not None:
+                prm.grad.nan_to_num_(0.0)
+        opt.step()
+    with torch.no_grad():
+        for m, s in zip(mods.values(), snap[0]):
+            for k, x in s.items():
+                m.raw[k].copy_(x)
+        for fm, s in zip([fm for fl in fxmods.values() for fm in fl], snap[1]):
+            for k, x in s.items():
+                fm.raw[k].copy_(x)
+    new = {}
+    for r, s in specs.items():
+        vals = mods[r].values()
+        ns = copy.deepcopy(s)
+        ns["timbre"] = {k: round(vals[k], 6) for k in s["timbre"]}
+        ns["exemplar"]["ampDb"] = s["exemplar"]["ampDb"] + snap[2][r]
+        ns["effects"] = [{**f, "params": {k: round(v, 6) for k, v in fm.values().items()}} for f, fm in zip(s.get("effects", []), fxmods[r])]
+        ns.setdefault("fit", {})["phrase"] = {"startE2": curve[0], "bestE2": round(best, 4), "startScore": round(ploss.score_from_e2(curve[0]), 4),
+                                              "bestScore": round(ploss.score_from_e2(best), 4), "steps": len(curve)}
+        new[r] = ns
+    return {"stem": job["stem"], "specs": new, "curve": curve}

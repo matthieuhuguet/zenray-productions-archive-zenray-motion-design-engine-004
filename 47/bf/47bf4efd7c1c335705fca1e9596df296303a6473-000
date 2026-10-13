@@ -1,0 +1,246 @@
+# 12 October 2026: perceptual loss of the differentiable sound bank (task A0), in torch.
+# Four terms, each expressed in JND units like describe.compare (R03 section 7):
+#   stft     : multi-resolution STFT log magnitude, weighted mean |dB difference| / ploss.stftJndDb
+#   mel      : log-mel spectrogram, weighted mean |dB difference| / ploss.melJndDb (same 2 dB as jnd.melShapeDb)
+#   envelope : short-term RMS loudness envelope, weighted mean |dB difference| / ploss.envJndDb (same 1 dB as jnd.levelDb)
+#   onset    : soft-argmax time of the strongest rise of the envelope, error in ms / jnd.anchorMs
+# Weighted mean: each time-frequency cell weighs (max(ref, ours) - floor), the floor sitting ploss.floorDb under the
+# loudest reference cell, so silent cells neither dominate nor hide a missing sound (same rule as describe.compare).
+# Relation to verify.py: loss = E2 = sum_k w_k e_k^2, score = 100 * score.base ** E2. This is exactly the formula of
+# describe.compare and of every per-event score in verify.py, so loss 0 is score 100, E = 1 JND is score 99, and
+# score >= 99 holds exactly when E <= 1. The cues differ (spectrogram cells here, summary descriptors there), so the
+# two scores are not identical numbers: dfit reports both, ploss as the objective and describe.compare as the B1 check.
+# FR : perte perceptive différentiable, en seuils différentiels ; score = 100 * 0,99 ** E2 comme verify.py.
+from __future__ import annotations
+
+import math
+from functools import lru_cache
+
+import numpy as np
+import torch
+
+from . import config
+
+
+@lru_cache(maxsize=8)
+def _mel_np(sr: int, n_fft: int, bands: int, fmin: float):
+    import librosa
+    return librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=bands, fmin=fmin, fmax=sr / 2).astype(np.float32)
+
+
+def _db(power):
+    return 10.0 * torch.log10(power + 1e-20)
+
+
+def _sabs(d, delta):
+    return torch.sqrt(d * d + delta * delta) - delta
+
+
+def _weighted_db_error(ref_db, our_db, floor_db, delta, tol=0.0, sharp=4.0):
+    r = torch.clamp(ref_db, min=floor_db)
+    o = torch.clamp(our_db, min=floor_db)
+    w = torch.maximum(r, o) - floor_db
+    d = _sabs(r - o, delta)
+    if tol > 0:  # 12 October 2026 (A3): soft dead zone of tol dB (stochastic variant only). FR : zone morte douce.
+        d = torch.nn.functional.softplus((d - tol) * sharp) / sharp
+    return (w * d).sum() / (w.sum() + 1e-9)
+
+
+def _power_stft(x, n_fft, hop):
+    win = torch.hann_window(n_fft, device=x.device)
+    S = torch.stft(x, n_fft, hop, window=win, return_complex=True, center=True)
+    return S.real ** 2 + S.imag ** 2
+
+
+def _envelope_db(x, sr, win_ms, hop_ms):
+    win = max(1, int(round(sr * win_ms / 1000.0)))
+    hop = max(1, int(round(sr * hop_ms / 1000.0)))
+    p = torch.nn.functional.avg_pool1d((x * x)[None, None, :], win, hop, padding=win // 2, count_include_pad=True)[0, 0]
+    return _db(p), hop / sr
+
+
+class Target:
+    """Precomputed features of a target window (no gradient), reused at every step of a fit."""
+
+    def __init__(self, x: np.ndarray, sr: int, device="cpu", cfg: dict | None = None):
+        self.cfg = cfg or config.cfg()
+        self.sr, self.device = sr, device
+        self.x = torch.as_tensor(np.asarray(x, np.float32), device=device)
+        with torch.no_grad():
+            self.feat = features(self.x, sr, self.cfg)
+        self.floor = {k: (v.max() - self.cfg["ploss"]["floorDb"]) for k, v in self.feat.items() if torch.is_tensor(v)}
+
+
+def stochastic(cfg: dict) -> dict | None:
+    """12 October 2026 (A3): the seed-invariant variant of the loss, or None when ploss.stochastic.enabled is false
+    (the default, so A0, A1 and A2 keep the official loss bit for bit). Measured reason: the same noise block rendered
+    with two seeds scores 84 to 90 under the official loss (stft term 3.0 JND, the Rayleigh spread of a single STFT cell)
+    and 0 for stationary noise (the onset of a flat envelope is a random rise), so no noisy real sound can ever reach 99.
+    The variant compares expected spectra: power smoothed along log frequency (sigma per STFT size) and in time, a dB
+    dead zone of tolDb on the spectral terms and envTolDb on the envelope, and an onset term weighted by the confidence
+    of the target attack. FR : variante invariante à la graine du bruit, désactivée par défaut."""
+    s = cfg["ploss"].get("stochastic")
+    return s if s and s.get("enabled") else None
+
+
+def _smooth_time(p: torch.Tensor, ms: float, hop: int, sr: int) -> torch.Tensor:
+    k = max(1, int(round(ms / 1000.0 * sr / hop)))
+    k += (k % 2 == 0)
+    return p if k <= 1 else torch.nn.functional.avg_pool1d(p[None], k, 1, padding=k // 2, count_include_pad=False)[0]
+
+
+def features(x: torch.Tensor, sr: int, cfg: dict) -> dict:
+    pl = cfg["ploss"]
+    st = stochastic(cfg)
+    out = {}
+    for n in pl["stftSizes"]:
+        hop = max(1, int(n * pl["hopFraction"]))
+        if st:
+            m = torch.as_tensor(_blur_matrix_np(sr, n, round(float(st["sigmaOct"][str(n)]), 4), st["binsPerOct"], pl["melFMin"]), device=x.device)
+            out[f"stft{n}"] = _db(_smooth_time(m @ _power_stft(x, n, hop), st["timeSmoothMs"], hop, sr))
+        else:
+            out[f"stft{n}"] = _db(_power_stft(x, n, hop))
+    p = _power_stft(x, pl["melFft"], int(pl["melFft"] * pl["hopFraction"]))
+    mel = torch.as_tensor(_mel_np(sr, pl["melFft"], pl["melBands"], pl["melFMin"]), device=x.device)
+    mp = mel @ p
+    if st:
+        mp = _smooth_time(mp, st["timeSmoothMs"], int(pl["melFft"] * pl["hopFraction"]), sr)
+    out["mel"] = _db(mp)
+    env, hop_s = _envelope_db(x, sr, st["envWindowMs"] if st else pl["envWindowMs"], pl["envHopMs"])
+    out["env"] = env
+    out["envHopS"] = hop_s
+    return out
+
+
+def onset_time(env_db: torch.Tensor, hop_s: float, temperature_db: float) -> torch.Tensor:
+    """Soft-argmax of the positive envelope rise (dB per frame): a differentiable onset instant in seconds."""
+    rise = torch.clamp(env_db[1:] - env_db[:-1], min=0.0)
+    w = torch.softmax(rise / temperature_db, dim=0)
+    times = (torch.arange(rise.shape[0], device=env_db.device, dtype=torch.float32) + 1.0) * hop_s
+    return (w * times).sum()
+
+
+def errors(ours: torch.Tensor, target: Target) -> dict:
+    """Per-term errors in JND units (torch scalars, differentiable)."""
+    cfg, pl = target.cfg, target.cfg["ploss"]
+    f = features(ours, target.sr, cfg)
+    t = target.feat
+    delta = pl["absSmoothDb"]
+    st = stochastic(cfg)
+    tol, etol, sharp = (st["tolDb"], st["envTolDb"], st["tolSharpness"]) if st else (0.0, 0.0, 4.0)
+    stft = torch.stack([_weighted_db_error(t[f"stft{n}"], f[f"stft{n}"], target.floor[f"stft{n}"], delta, tol, sharp)
+                        for n in pl["stftSizes"]]).mean() / pl["stftJndDb"]
+    mel = _weighted_db_error(t["mel"], f["mel"], target.floor["mel"], delta, tol, sharp) / pl["melJndDb"]
+    envelope = _weighted_db_error(t["env"], f["env"], target.floor["env"], delta, etol, sharp) / pl["envJndDb"]
+    floor = target.floor["env"]
+    te = torch.clamp(t["env"], min=floor)
+    oe = torch.clamp(f["env"], min=floor)
+    win_ms = float(pl.get("onsetWindowMs", 0.0) or 0.0)
+    if win_ms > 0 and te.numel() > 2 and oe.numel() == te.numel():
+        # 12 October 2026 (A2 resume): local onset. The global soft-argmax mixes every rise of a multi-note sound (two
+        # tones 313 ms apart: a 0.2 ms shift gave 4 JND, a 1 dB change of the second note 3.9 JND), so the onset term
+        # explodes on notifications and arpeggios. With onsetWindowMs > 0 both soft-argmaxes only see the frames within
+        # that window around the target's strongest rise (a constant index, no gradient). 0 keeps the global form.
+        # FR : attaque locale autour de l'attaque principale de la cible ; 0 garde la forme globale.
+        k = max(1, int(round(win_ms / 1000.0 / t["envHopS"])))
+        i0 = int(torch.argmax(te[1:] - te[:-1]))
+        lo, hi = max(0, i0 - k), min(te.numel() - 1, i0 + k + 1)
+        tr = onset_time(te[lo:hi + 1], t["envHopS"], pl["onsetTemperatureDb"]) + lo * t["envHopS"]
+        to = onset_time(oe[lo:hi + 1], f["envHopS"], pl["onsetTemperatureDb"]) + lo * f["envHopS"]
+    else:
+        tr = onset_time(te, t["envHopS"], pl["onsetTemperatureDb"])
+        to = onset_time(oe, f["envHopS"], pl["onsetTemperatureDb"])
+    onset = (to - tr) * 1000.0 / cfg["jnd"]["anchorMs"]
+    if st:
+        # 12 October 2026 (A3): a target without a clear attack (largest rise under onsetMinRiseDb per frame) has no
+        # onset to align; the weight ramps from 0 there to 1 at twice that rise. FR : poids de l'attaque selon sa netteté.
+        rise = float(torch.clamp(te[1:] - te[:-1], min=0.0).max()) if te.numel() > 1 else 0.0
+        onset = onset * min(max((rise - st["onsetMinRiseDb"]) / st["onsetMinRiseDb"], 0.0), 1.0)
+    return {"stft": stft, "mel": mel, "envelope": envelope, "onset": onset}
+
+
+def loss(ours: torch.Tensor, target: Target) -> tuple[torch.Tensor, dict]:
+    """E2 = sum_k w_k e_k^2 (the objective) and the per-term errors."""
+    e = errors(ours, target)
+    w = target.cfg["ploss"]["weights"]
+    return sum(w[k] * e[k] ** 2 for k in e), e
+
+
+def score_from_e2(e2: float, cfg: dict | None = None) -> float:
+    cfg = cfg or config.cfg()
+    return 100.0 * cfg["score"]["base"] ** float(e2)
+
+
+def score(ours: np.ndarray, target_x: np.ndarray, sr: int, cfg: dict | None = None) -> dict:
+    """0..100 score of a rendered window against a target window (numpy in, numpy out)."""
+    cfg = cfg or config.cfg()
+    tgt = Target(target_x, sr, "cpu", cfg)
+    with torch.no_grad():
+        e2, e = loss(torch.as_tensor(np.asarray(ours, np.float32)), tgt)
+    return {"score": score_from_e2(float(e2), cfg), "E": math.sqrt(float(e2)), "errors": {k: round(float(v), 4) for k, v in e.items()}}
+
+
+# 12 October 2026: annealed log-frequency blur, a fitting guide only (never part of the score).
+# An oscillator frequency seen through a sharp spectrum has a loss landscape full of local minima: a partial that
+# misses the target partial by more than one bin gets no gradient toward it. Blurring the STFT along log frequency by
+# a Gaussian of sigma octaves widens every basin to about sigma; dfit shrinks sigma from dfit.blurStartOct to
+# dfit.blurEndOct during the first dfit.blurFraction of the steps, then fits on the official E2 alone.
+# FR : flou en fréquence logarithmique qui élargit les bassins d'attraction ; guide d'ajustement, jamais dans le score.
+@lru_cache(maxsize=64)
+def _blur_matrix_np(sr: int, n_fft: int, sigma_oct: float, bins_per_oct: int, fmin: float):
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    lf = np.log2(np.maximum(freqs, 1.0))
+    centres = np.arange(np.log2(fmin), np.log2(sr / 2), 1.0 / bins_per_oct)
+    m = np.exp(-0.5 * ((lf[None, :] - centres[:, None]) / sigma_oct) ** 2)
+    m[:, freqs < fmin * 0.5] = 0.0
+    return (m / (m.sum(axis=1, keepdims=True) + 1e-12)).astype(np.float32)
+
+
+def blur_error(ours: torch.Tensor, target: Target, sigma_oct: float) -> torch.Tensor:
+    pl = target.cfg["ploss"]
+    n = max(pl["stftSizes"])
+    hop = int(n * pl["hopFraction"])
+    m = torch.as_tensor(_blur_matrix_np(target.sr, n, round(float(sigma_oct), 4), pl["blurBinsPerOct"], pl["melFMin"]), device=ours.device)
+    key = ("blur", round(float(sigma_oct), 4))
+    if key not in target.feat:
+        with torch.no_grad():
+            target.feat[key] = _db(m @ _power_stft(target.x, n, hop))
+            target.floor[key] = target.feat[key].max() - pl["floorDb"]
+    ob = _db(m @ _power_stft(ours, n, hop))
+    return _weighted_db_error(target.feat[key], ob, target.floor[key], pl["absSmoothDb"]) / pl["stftJndDb"]
+
+
+def time_blur_error(ours: torch.Tensor, target: Target, sigma_ms: float) -> torch.Tensor:
+    """12 October 2026 (A1): envelope term on a power envelope smoothed in time by a Gaussian of sigma_ms. A train of
+    strokes (typing, shaker, grains) seen through a sharp 10 ms envelope has one narrow basin per stroke in its rate and
+    onset; the smoothed envelope turns the train into a hump whose position and length give a gradient from far away.
+    Guide only, never part of the score. FR : enveloppe floutée dans le temps, élargit les bassins des motifs rythmés."""
+    pl = target.cfg["ploss"]
+    win = max(1, int(round(target.sr * pl["envWindowMs"] / 1000.0)))
+    hop = max(1, int(round(target.sr * pl["envHopMs"] / 1000.0)))
+    sig = max(float(sigma_ms) / pl["envHopMs"], 0.5)
+    half = int(math.ceil(3.0 * sig))
+    k = torch.exp(-0.5 * (torch.arange(-half, half + 1, device=ours.device, dtype=torch.float32) / sig) ** 2)
+    k = (k / k.sum())[None, None, :]
+
+    def env(x):
+        p = torch.nn.functional.avg_pool1d((x * x)[None, None, :], win, hop, padding=win // 2, count_include_pad=True)
+        return _db(torch.nn.functional.conv1d(p, k, padding=half)[0, 0])
+
+    key = ("tblur", round(float(sigma_ms), 3))
+    if key not in target.feat:
+        with torch.no_grad():
+            target.feat[key] = env(target.x)
+            target.floor[key] = target.feat[key].max() - pl["floorDb"]
+    return _weighted_db_error(target.feat[key], env(ours), target.floor[key], pl["absSmoothDb"]) / pl["envJndDb"]
+
+
+def guide_loss(ours: torch.Tensor, target: Target, sigma_oct: float, sigma_ms: float = 0.0) -> torch.Tensor:
+    """12 October 2026: objective of the blur phase: the blurred spectrum replaces the sharp stft and mel terms (their
+    narrow basins would dominate), the envelope and onset terms stay. FR : objectif de la phase floue.
+    12 October 2026 (A1): with sigma_ms > 0 the envelope term is also blurred in time (time_blur_error); 0 keeps the
+    A0 behaviour exactly. FR : avec sigma_ms, l'enveloppe est aussi floutée dans le temps."""
+    e = errors(ours, target)
+    w = target.cfg["ploss"]["weights"]
+    env = time_blur_error(ours, target, sigma_ms) if sigma_ms and sigma_ms > 0 else e["envelope"]
+    return blur_error(ours, target, sigma_oct) ** 2 + w["envelope"] * env ** 2 + w["onset"] * e["onset"] ** 2

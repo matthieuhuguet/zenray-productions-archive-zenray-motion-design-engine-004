@@ -1,0 +1,85 @@
+# 12 October 2026, 12:40 CEST: build a listening comparison (reference vs recreated) for one sound version.
+# Output goes to the reference cache (never archived): per SFX event, the reference window, the reference stem
+# the detector used, our SFX track and our full mix, plus an A/B file (reference, beep gap, ours) and an HTML page.
+# Parameters: --slug, --version, --pad (seconds around each event), --gap (silence between A and B), --music-bench
+# (12 October 2026, M3: adds a full-song stem-by-stem A/B section; read from version.json musicBench when absent).
+import argparse, json, subprocess, html
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--slug", default="onekey-pro-2"); ap.add_argument("--version", default="V_017")
+ap.add_argument("--pad", type=float, default=1.5); ap.add_argument("--gap", type=float, default=0.7)
+ap.add_argument("--music-bench", default=None, help="12 October 2026 (M3): music-bench version for the stem A/B section")
+a = ap.parse_args()
+W = Path("/Users/zenray/.claude/tmp/tmp-zenray-motion-design"); C = Path("/Users/zenray/.claude/tmp/tmp-zenray-motion-design-refcache") / a.slug
+V = W / "sound" / a.slug / a.version
+ref = next(C.glob("*.mp4")); stems = C / "stems/out/htdemucs/mix"
+out = C / f"compare-{a.version}"; out.mkdir(exist_ok=True)
+ev = json.loads((V / "events.json").read_text())["events"]
+fid = {e["id"]: e for e in json.loads((V / "sound-fidelity.json").read_text())["reports"]["full"]["perEvent"]}
+
+def cut(src, t0, dur, dst):
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t0:.3f}", "-t", f"{dur:.3f}", "-i", str(src), "-ac", "2", "-ar", "48000", str(dst)], check=True)
+
+def ab(a_, b_, dst):
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(a_), "-f", "lavfi", "-t", f"{a.gap}", "-i", "anullsrc=r=48000:cl=stereo",
+                    "-i", str(b_), "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1", str(dst)], check=True)
+
+jobs, rows = [], []
+for e in ev:
+    t0, dur, n = max(0, e["t"] - a.pad), 2 * a.pad, e["id"]
+    stem = stems / f"{e['stem']}.wav"
+    files = {"ref": out / f"{n}-1-reference.wav", "stem": out / f"{n}-2-reference-{e['stem']}-stem.wav",
+             "sfx": out / f"{n}-3-ours-sfx.wav", "mix": out / f"{n}-4-ours-mix.wav"}
+    jobs += [(ref, t0, dur, files["ref"]), (stem, t0, dur, files["stem"]), (V / "sfx.wav", t0, dur, files["sfx"]), (V / "mix.wav", t0, dur, files["mix"])]
+    rows.append((e, files, fid.get(n, {})))
+full = {"ref": out / "00-reference-full.wav", "mix": out / "00-ours-mix-full.wav"}
+jobs += [(ref, 0, 9999, full["ref"]), (V / "mix.wav", 0, 9999, full["mix"])]
+with ThreadPoolExecutor(16) as ex:
+    list(ex.map(lambda j: cut(*j), jobs))
+with ThreadPoolExecutor(16) as ex:
+    list(ex.map(lambda r: (ab(r[1]["ref"], r[1]["mix"], out / f"{r[0]['id']}-5-AB-reference-then-ours.wav"),
+                           ab(r[1]["stem"], r[1]["sfx"], out / f"{r[0]['id']}-6-AB-stem-then-ours-sfx.wav")), rows))
+
+def player(p): return f'<div><code>{html.escape(p.name)}</code><br><audio controls preload="none" src="{html.escape(p.name)}"></audio></div>'
+body = [f"<h1>{a.slug} {a.version}, comparaison à l'écoute (12 October 2026)</h1>",
+        "<p>Pour chaque événement : écoute A/B, puis note ton verdict (SFX réel à garder, son de la chanson à laisser à la musique, ou SFX à refaire).</p>",
+        "<h2>Film entier</h2>", player(full["ref"]), player(full["mix"])]
+for e, f, s in rows:
+    body.append(f"<h2>{e['id']} à {e['t']:.2f} s, classé {s.get('kind', e['kind'])}, score {s.get('score','?')} (plafond {s.get('ceiling','?')})</h2>")
+    body += [player(out / f"{e['id']}-5-AB-reference-then-ours.wav"), player(out / f"{e['id']}-6-AB-stem-then-ours-sfx.wav")] + [player(p) for p in f.values()]
+# 12 October 2026 (task M3): full-song stem-by-stem A/B when the version is a soundtrack benchmark (version.json names
+# its music-bench version, or --music-bench): reference Demucs stem, a silence, our stem; then the full mixes.
+# FR : comparaison piste par piste sur tout le morceau, reference puis la notre.
+vj = json.loads((V / "version.json").read_text()) if (V / "version.json").exists() else {}
+mb_name = a.music_bench or vj.get("musicBench")
+if mb_name:
+    MB = W / "sound" / a.slug / "music-bench" / mb_name
+    sc = {}
+    if (MB / "scores.json").exists():
+        sc = json.loads((MB / "scores.json").read_text()).get("headline", {})
+    crit = W / "docs" / "build" / "M3-logs" / f"critic-{mb_name}.json"
+    ci = json.loads(crit.read_text()).get("tfBandsIndependent", {}) if crit.exists() else {}
+    sjobs, srows = [], []
+    for k in ("drums", "bass", "other", "vocals"):
+        fr, fo, fab = out / f"00-stem-{k}-1-reference.wav", out / f"00-stem-{k}-2-ours-{mb_name}.wav", out / f"00-stem-{k}-3-AB-reference-then-ours.wav"
+        sjobs.append((stems / f"{k}.wav", 0, 9999, fr))
+        sjobs.append((MB / "stems" / f"{k}.wav", 0, 9999, fo))
+        srows.append((k, fr, fo, fab))
+    with ThreadPoolExecutor(16) as ex:
+        list(ex.map(lambda j: cut(*j), sjobs))
+    with ThreadPoolExecutor(16) as ex:
+        list(ex.map(lambda r: ab(r[1], r[2], r[3]), srows))
+    fm = out / "00-full-AB-reference-then-ours.wav"
+    ab(full["ref"], full["mix"], fm)
+    body.append(f"<h2>Morceau entier, piste par piste (musique {html.escape(mb_name)} du banc, référence puis la nôtre)</h2>")
+    body.append("<p>Chaque fichier A/B joue la piste Demucs de la référence sur tout le morceau, un silence, puis notre piste rebuilt par le code. tfBands : bandes de tiers d'octave sur trames de 46 ms, 99 visé.</p>")
+    for k, fr, fo, fab in srows:
+        t = sc.get(k, {}).get("tfBands")
+        body.append(f"<h3>{k} : tfBands {t if t is not None else '?'}" + (f" (critique indépendante {ci[k]})" if k in ci else "") + "</h3>")
+        body += [player(fab), player(fr), player(fo)]
+    body.append(f"<h3>Mixage complet, référence puis la nôtre (musique et SFX) : tfBands musique seule {sc.get('mix', {}).get('tfBands', '?')}</h3>")
+    body.append(player(fm))
+(out / "index.html").write_text("<!doctype html><meta charset='utf-8'><title>Sound compare</title><style>body{font-family:InterVariable,system-ui;max-width:760px;margin:24px auto;padding:0 16px}h1,h2{font-family:AnthropicSerif,serif;font-weight:350}audio{width:100%}div{margin:8px 0}</style>" + "\n".join(body))
+print(out)

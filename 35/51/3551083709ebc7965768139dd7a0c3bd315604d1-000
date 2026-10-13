@@ -1,0 +1,458 @@
+# 12 October 2026: task MI-drums. Procedural refinement of the drums stem of the music bench, on top of a rendered
+# version (V_034 by default), measured by the M3 critic's own third-octave score (Scripts/MusicCritic.py compare).
+# Nothing of the reference audio enters a render: the reference only yields numbers (per-hit block parameters fitted
+# by CMA-ES from zrmd.audio.dfit, per-class gain tables), and the render is our own stem plus synthesized blocks.
+#   1. KickBody block: pitched sine with exponential pitch and amplitude envelopes plus a band-passed noise click.
+#   2. Tom block: two membrane modes (1 and 1.59 times f) with a pitch glide and an exponential decay.
+#   Both are fitted per hit (kick and tom hits of score.json) against the critic error in the hit window, greedily in
+#   time order, each fit seeing the render with every earlier block; a block is kept only when the global E drops.
+#   3. ClassTables: per-class [third-octave band x time node] dB gain tables (hats, snare, clap, and optionally kick/tom)
+#      applied as an STFT mask on our render around the hits of that class, refined by a measure and correct loop.
+# FR : affinage de la piste batterie : corps de grosse caisse et toms synthetises et ajustes coup par coup, puis
+#      tables de gain par classe ; la reference ne donne que des nombres.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import scipy.signal as ss
+
+from .. import dfit
+
+# 12 October 2026: the interface (HDA parameters). Ranges map the unit cube of CMA-ES to physical values.
+CFG = {
+    "nFft": 4096, "hop": 2048, "fMin": 30.0, "fMax": 16000.0, "bandsPerOct": 3, "jndDb": 2.0, "floorDb": 60.0,
+    "kick": {"f1Hz": [28.0, 140.0], "ratio": [1.0, 6.0], "tauMs": [3.0, 150.0], "ampDb": [-60.0, -6.0],
+             "t60Ms": [60.0, 1600.0], "clickDb": [-80.0, -18.0], "clickMs": [1.0, 25.0], "clickHz": [800.0, 9000.0],
+             "dtMs": [-20.0, 20.0]},
+    "tom": {"f1Hz": [45.0, 420.0], "ratio": [1.0, 2.2], "tauMs": [5.0, 250.0], "ampDb": [-60.0, -6.0],
+            "t60Ms": [60.0, 1600.0], "mode2Db": [-40.0, 0.0], "dtMs": [-20.0, 20.0]},
+    "maxLenS": 1.4, "attackMs": 1.0, "preS": 0.03,
+    "cma": {"lam": 12, "iters": 40, "sigma": 0.3, "starts": 2},
+    "tables": {"nodesS": [0.0, 0.04, 0.09, 0.16, 0.28, 0.5], "maxDb": 18.0, "step": 0.8, "iters": 4, "stftN": 2048, "stftHop": 512},
+}
+LOG = {"f1Hz", "ratio", "tauMs", "t60Ms", "clickMs", "clickHz"}
+
+
+def unit_to(kind: str, u) -> dict:
+    """Unit cube point -> physical block parameters (log scale where declared). FR : cube unite vers valeurs."""
+    out = {}
+    for (k, (a, b)), x in zip(CFG[kind].items(), u):
+        x = float(np.clip(x, 0.0, 1.0))
+        out[k] = a * (b / a) ** x if k in LOG else a + (b - a) * x
+    return out
+
+
+def to_unit(kind: str, v: dict) -> np.ndarray:
+    u = []
+    for k, (a, b) in CFG[kind].items():
+        x = v[k]
+        u.append(math.log(x / a) / math.log(b / a) if k in LOG else (x - a) / (b - a))
+    return np.clip(np.array(u), 0.001, 0.999)
+
+
+# ---------------------------------------------------------------- blocks (12 October 2026)
+
+def _glide_phase(t, f1, ratio, tau_s, sr):
+    # f(t) = f1 + (f0 - f1) exp(-t / tau), phase = 2 pi integral of f. FR : phase d'une hauteur glissante.
+    f0 = f1 * ratio
+    return 2 * np.pi * (f1 * t + (f0 - f1) * tau_s * (1.0 - np.exp(-t / tau_s)))
+
+
+def _env(t, t60_s, sr):
+    a = np.minimum(1.0, t / max(CFG["attackMs"] * 1e-3, 1.0 / sr))
+    return a * np.exp(-6.907755 * t / t60_s)
+
+
+def kick_body(v: dict, sr: int, seed: int = 0) -> np.ndarray:
+    """Pitched sine with pitch and amplitude envelopes plus a noise click (mono). FR : corps de grosse caisse."""
+    n = int(min(CFG["maxLenS"], 1.2 * v["t60Ms"] * 1e-3 + 0.01) * sr)
+    t = np.arange(n) / sr
+    y = 10 ** (v["ampDb"] / 20) * _env(t, v["t60Ms"] * 1e-3, sr) * np.sin(_glide_phase(t, v["f1Hz"], v["ratio"], v["tauMs"] * 1e-3, sr))
+    m = int(min(n, 6 * v["clickMs"] * 1e-3 * sr + 8))
+    if m > 8 and v["clickDb"] > -79:
+        rng = np.random.default_rng(seed)
+        c = rng.standard_normal(m + 64)
+        lo, hi = v["clickHz"] / 1.6, min(v["clickHz"] * 1.6, 0.45 * sr)
+        sos = ss.butter(2, [lo, hi], btype="bandpass", fs=sr, output="sos")
+        c = ss.sosfilt(sos, c)[64:] * np.exp(-t[:m] / (v["clickMs"] * 1e-3))
+        c *= 10 ** (v["clickDb"] / 20) / (np.sqrt(np.mean(c[: max(8, int(v["clickMs"] * 1e-3 * sr))] ** 2)) + 1e-12)
+        y[:m] += c
+    return y
+
+
+def tom(v: dict, sr: int, seed: int = 0) -> np.ndarray:
+    """Two membrane modes (1 and 1.59) with a pitch glide and an exponential decay (mono). FR : tom a deux modes."""
+    n = int(min(CFG["maxLenS"], 1.2 * v["t60Ms"] * 1e-3 + 0.01) * sr)
+    t = np.arange(n) / sr
+    e = _env(t, v["t60Ms"] * 1e-3, sr)
+    p = _glide_phase(t, v["f1Hz"], v["ratio"], v["tauMs"] * 1e-3, sr)
+    y = np.sin(p) + 10 ** (v["mode2Db"] / 20) * np.sin(1.59 * p) * np.exp(-6.907755 * t / (0.5 * v["t60Ms"] * 1e-3))
+    return 10 ** (v["ampDb"] / 20) * e * y
+
+
+CFG["burst"] = {"centreHz": [150.0, 12000.0], "octaves": [0.3, 4.0], "ampDb": [-70.0, -10.0], "t60Ms": [10.0, 900.0],
+                "dtMs": [-30.0, 30.0]}
+LOG |= {"centreHz", "octaves"}
+
+
+def burst(v: dict, sr: int, seed: int = 0) -> np.ndarray:
+    """12 October 2026: band-passed seeded noise burst with an exponential decay, for hits the score misses (snare,
+    hat or clap like). FR : rafale de bruit filtre, pour les coups absents de la partition."""
+    n = int(min(CFG["maxLenS"], 1.2 * v["t60Ms"] * 1e-3 + 0.01) * sr)
+    t = np.arange(n) / sr
+    rng = np.random.default_rng(seed)
+    lo = max(20.0, v["centreHz"] * 2 ** (-v["octaves"] / 2))
+    hi = min(0.45 * sr, v["centreHz"] * 2 ** (v["octaves"] / 2))
+    if hi <= lo * 1.05:
+        hi = lo * 1.05
+    y = ss.sosfilt(ss.butter(2, [lo, hi], btype="bandpass", fs=sr, output="sos"), rng.standard_normal(n + 256))[256:]
+    y /= np.sqrt(np.mean(y ** 2)) + 1e-12
+    return 10 ** (v["ampDb"] / 20) * _env(t, v["t60Ms"] * 1e-3, sr) * y
+
+
+BLOCKS = {"kick": kick_body, "tom": tom, "burst": burst}
+
+
+def gap_times(grid: "Grid", hits_t, min_gap_s=0.09, near_s=0.06, top=60):
+    """12 October 2026: frames where the reference has energy our render misses (weighted positive deficit summed over
+    bands), local peaks away from any transcribed hit. FR : trames ou il manque de l'energie, loin des coups connus."""
+    deficit = (grid.w * np.maximum(grid.r2 - grid.o2, 0)).sum(0)
+    times = np.arange(grid.m) * grid.h / grid.sr
+    ht = np.array(sorted(hits_t))
+    order = np.argsort(-deficit)
+    out = []
+    for i in order:
+        t = times[i]
+        if len(ht) and np.min(np.abs(ht - t)) < near_s:
+            continue
+        if any(abs(t - q) < min_gap_s for q in out):
+            continue
+        out.append(float(t))
+        if len(out) >= top:
+            break
+    return sorted(out)
+
+
+# ---------------------------------------------------------------- critic grid (12 October 2026)
+
+class Grid:
+    """The M3 critic's frames and third-octave bands, with the reference band levels precomputed; evaluates the
+    global error E when a mono block is added to the current render, touching only the frames it overlaps.
+    FR : la grille du critique ; E global quand un bloc s'ajoute, en ne recalculant que les trames touchees."""
+
+    def __init__(self, ref_mono: np.ndarray, ours_mono: np.ndarray, sr: int):
+        self.sr, self.n, self.h = sr, CFG["nFft"], CFG["hop"]
+        c = CFG["fMin"] * 2 ** (np.arange(0, int(CFG["bandsPerOct"] * math.log2(CFG["fMax"] / CFG["fMin"])) + 1) / CFG["bandsPerOct"])
+        f = np.fft.rfftfreq(self.n, 1.0 / sr)
+        self.c = c
+        self.W = np.maximum(0.0, 1.0 - np.abs(np.log2(np.maximum(f, 1e-6))[None, :] - np.log2(c)[:, None]) * CFG["bandsPerOct"])
+        self.win = np.hanning(self.n + 1)[:-1]
+        self.len = min(len(ref_mono), len(ours_mono))
+        self.m = 1 + self.len // self.h
+        self.r = self._bands_full(ref_mono[: self.len])
+        self.fl = self.r.max() - CFG["floorDb"]
+        self.r2 = np.maximum(self.r, self.fl)
+        self.set_ours(ours_mono)
+
+    def _pad(self, x):
+        return np.pad(np.asarray(x[: self.len], np.float64), (self.n // 2, self.n // 2), mode="reflect")
+
+    def _frames(self, xp, ids):
+        idx = np.arange(self.n)[None, :] + self.h * np.asarray(ids)[:, None]
+        S = np.abs(np.fft.rfft(xp[idx] * self.win, axis=1)) ** 2
+        return 10 * np.log10(S @ self.W.T + 1e-20).T
+
+    def _bands_full(self, x):
+        return self._frames(self._pad(x), np.arange(self.m))
+
+    def set_ours(self, ours_mono):
+        self.op = self._pad(ours_mono)
+        self.o2 = np.maximum(self._frames(self.op, np.arange(self.m)), self.fl)
+        self.w = np.maximum(self.r2, self.o2) - self.fl
+        self.S, self.Wsum = float((self.w * np.abs(self.o2 - self.r2)).sum()), float(self.w.sum())
+
+    def E(self):
+        return self.S / (self.Wsum + 1e-9) / CFG["jndDb"]
+
+    def score(self, E=None):
+        E = self.E() if E is None else E
+        return 100 * 0.99 ** (E * E)
+
+    def span(self, a, L):
+        # frames whose window [m h - n/2, m h + n/2) overlaps samples [a, a + L). FR : trames touchees.
+        lo = max(0, int(math.floor((a - self.n / 2) / self.h)) + 1)
+        hi = min(self.m - 1, int(math.ceil((a + L + self.n / 2) / self.h)) - 1)
+        return np.arange(lo, hi + 1)
+
+    def E_with(self, y, a):
+        """Global E if mono block y is added at sample a (a may be negative). FR : E global avec le bloc."""
+        ids = self.span(a, len(y))
+        if len(ids) == 0:
+            return self.E(), ids, None
+        seg0, seg1 = ids[0] * self.h, ids[-1] * self.h + self.n
+        xp = self.op[seg0:seg1].copy()
+        s = a + self.n // 2 - seg0
+        i0, i1 = max(0, s), min(len(xp), s + len(y))
+        if i1 > i0:
+            xp[i0:i1] += y[i0 - s: i1 - s]
+        o2 = np.maximum(self._frames(xp, ids - ids[0]), self.fl)
+        r2 = self.r2[:, ids]
+        w = np.maximum(r2, o2) - self.fl
+        S = self.S - float((self.w[:, ids] * np.abs(self.o2[:, ids] - r2)).sum()) + float((w * np.abs(o2 - r2)).sum())
+        Ws = self.Wsum - float(self.w[:, ids].sum()) + float(w.sum())
+        return S / (Ws + 1e-9) / CFG["jndDb"], ids, (o2, w)
+
+    def commit(self, y, a, ours_mono):
+        """Add y to ours_mono in place and refresh the grid on the touched frames. FR : valide le bloc."""
+        i0, i1 = max(0, a), min(len(ours_mono), a + len(y))
+        if i1 > i0:
+            ours_mono[i0:i1] += y[i0 - a: i1 - a]
+        self.set_ours(ours_mono)
+
+
+def fit_hit(grid: Grid, kind: str, t: float, sr: int, seed: int, x0=None) -> tuple[float, dict]:
+    """CMA-ES (dfit.cma_es) on the block parameters of one hit, minimising the global critic E.
+    FR : ajustement d'un coup par CMA-ES, en minimisant E global du critique."""
+    base = grid.E()
+    keys = list(CFG[kind])
+
+    def place(v):
+        a = int(round((t + v["dtMs"] * 1e-3) * sr))
+        return BLOCKS[kind](v, sr, seed), a
+
+    def f(u):
+        v = unit_to(kind, u)
+        y, a = place(v)
+        return grid.E_with(y, a)[0]
+
+    best = (base, None)
+    starts = [x0] if x0 is not None else []
+    rng = np.random.default_rng(seed)
+    while len(starts) < CFG["cma"]["starts"]:
+        u = rng.uniform(0.2, 0.8, len(keys))
+        starts.append(u)
+    for i, u0 in enumerate(starts):
+        val, u = dfit.cma_es(f, u0, CFG["cma"]["sigma"], CFG["cma"]["iters"], CFG["cma"]["lam"], seed + 97 * i)
+        if val < best[0] - 1e-9:
+            best = (val, unit_to(kind, u))
+    return best
+
+
+def default_start(kind: str, hit: dict) -> np.ndarray:
+    # Start near the measured pitch of the hit (retag), mid level, medium decay. FR : depart sur la hauteur mesuree.
+    f = float(hit.get("pitchHz") or (60.0 if kind == "kick" else 110.0))
+    v = {k: (a * b) ** 0.5 if k in LOG else 0.5 * (a + b) for k, (a, b) in CFG[kind].items()}
+    v["f1Hz"] = float(np.clip(f, *CFG[kind]["f1Hz"]))
+    v["ampDb"] = float(np.clip(hit.get("levelDb", -30.0) + 6.0, *CFG[kind]["ampDb"]))
+    v["dtMs"] = 0.0
+    return to_unit(kind, v)
+
+
+# ---------------------------------------------------------------- class tables (12 October 2026)
+
+def _third_octave_map(freqs, centres):
+    lf = np.log2(np.maximum(freqs, 1e-6))
+    return np.clip(np.interp(lf, np.log2(centres), np.arange(len(centres))), 0, len(centres) - 1)
+
+
+def class_mask_db(tables: dict, hits: list, times: np.ndarray, freqs: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """dB mask [freq, frame]: for every frame, the table of the class of the most recent hit, at the node of the time
+    since that hit (linear interpolation in band and node). FR : masque en dB selon la classe du dernier coup."""
+    nodes = np.array(CFG["tables"]["nodesS"])
+    hs = sorted(hits, key=lambda h: h["t"])
+    ht = np.array([h["t"] for h in hs])
+    j = np.searchsorted(ht, times, side="right") - 1
+    bi = _third_octave_map(freqs, centres)
+    M = np.zeros((len(freqs), len(times)))
+    for k, tab in tables.items():
+        T = np.asarray(tab, float)  # [bands, nodes]
+        sel = np.where((j >= 0) & np.array([hs[jj]["class"] == k if jj >= 0 else False for jj in j]))[0]
+        if len(sel) == 0:
+            continue
+        dt = np.clip(times[sel] - ht[j[sel]], 0, nodes[-1])
+        ni = np.interp(dt, nodes, np.arange(len(nodes)))
+        n0 = np.floor(ni).astype(int)
+        n1 = np.minimum(n0 + 1, len(nodes) - 1)
+        fn = ni - n0
+        b0 = np.floor(bi).astype(int)
+        b1 = np.minimum(b0 + 1, len(centres) - 1)
+        fb = (bi - b0)[:, None]
+        col = lambda nn: (1 - fb) * T[b0][:, nn] + fb * T[b1][:, nn]  # noqa: E731
+        M[:, sel] = col(n0) * (1 - fn) + col(n1) * fn
+    return M
+
+
+def apply_tables(x: np.ndarray, tables: dict, hits: list, sr: int, centres: np.ndarray) -> np.ndarray:
+    """STFT mask on our stem (stereo or mono), own framing; returns the same shape. FR : applique les tables."""
+    N, H = CFG["tables"]["stftN"], CFG["tables"]["stftHop"]
+    st = x.ndim == 2
+    X = x if st else x[:, None]
+    out = np.zeros_like(X, dtype=np.float64)
+    for ch in range(X.shape[1]):
+        f, tt, Z = ss.stft(X[:, ch], fs=sr, nperseg=N, noverlap=N - H, boundary="even", padded=True)
+        M = class_mask_db(tables, hits, tt, f, centres)
+        _, y = ss.istft(Z * 10 ** (M / 20), fs=sr, nperseg=N, noverlap=N - H, boundary=True)
+        out[:, ch] = y[: len(X)]
+    return out if st else out[:, 0]
+
+
+def table_residual(grid: Grid, hits: list, classes: list) -> dict:
+    """Mean weighted signed error (ref - ours, dB) per class, band and node, on the critic frames whose most recent
+    hit is of that class. FR : erreur moyenne par classe, bande et noeud, sur les trames du critique."""
+    nodes = np.array(CFG["tables"]["nodesS"])
+    times = np.arange(grid.m) * grid.h / grid.sr
+    hs = sorted(hits, key=lambda h: h["t"])
+    ht = np.array([h["t"] for h in hs])
+    j = np.searchsorted(ht, times, side="right") - 1
+    d = grid.r2 - grid.o2
+    out = {}
+    for k in classes:
+        sel = np.where((j >= 0) & np.array([jj >= 0 and hs[jj]["class"] == k for jj in j]))[0]
+        R = np.zeros((len(grid.c), len(nodes)))
+        if len(sel):
+            dt = np.clip(times[sel] - ht[j[sel]], 0, nodes[-1])
+            ni = np.clip(np.rint(np.interp(dt, nodes, np.arange(len(nodes)))).astype(int), 0, len(nodes) - 1)
+            for q in range(len(nodes)):
+                s = sel[ni == q]
+                if len(s):
+                    w = grid.w[:, s]
+                    R[:, q] = (w * d[:, s]).sum(1) / (w.sum(1) + 1e-9)
+        out[k] = R
+    return out
+
+
+# ---------------------------------------------------------------- low bed (12 October 2026)
+# Measured on V_034 (docs/build/MI-drums.md): the reference drums stem carries a continuous bed of 20 to 30 dB in every
+# third-octave band from 30 to 500 Hz in every frame, between the hits as much as on them, while our render is empty
+# there; per-hit bodies cannot fill it. The bed is a seeded noise shaped in the STFT domain by a [band x segment] dB
+# table (segments = bars or beats of score.json), the table fitted by measure and correct on the critic frames.
+# FR : nappe basse ; bruit a graine fixe faconne par une table [bande x segment], ajustee par mesure et correction.
+CFG["bed"] = {"stftN": 4096, "stftHop": 1024, "maxHz": 16000.0, "iters": 6, "step": 0.8, "minDb": -140.0, "seed": 11,
+              "segment": "beats", "tonalHz": 0.0}
+# 12 October 2026: tonalHz > 0 replaces the noise of the bed below that frequency by one steady sine per third-octave
+# band centre (fixed random phase), whose amplitude follows the same table: a sine has no frame to frame magnitude
+# variance, while a noise in a band of one or two FFT bins varies by several dB per frame. FR : sous tonalHz, une
+# sinusoide stable par bande remplace le bruit (pas de variance d'une trame a l'autre).
+
+
+def bed(table_db: np.ndarray, edges_s: np.ndarray, centres: np.ndarray, n: int, sr: int, seed: int) -> np.ndarray:
+    """Noise whose third-octave power follows table_db [bands, segments] (dB of the critic's band power), linear
+    interpolation between segment centres, zero above CFG.bed.maxHz. FR : bruit faconne par la table."""
+    N, H = CFG["bed"]["stftN"], CFG["bed"]["stftHop"]
+    rng = np.random.default_rng(seed)
+    f, tt, Z = ss.stft(rng.standard_normal(n), fs=sr, nperseg=N, noverlap=N - H, boundary="even", padded=True)
+    Z /= np.abs(Z) + 1e-12  # unit magnitude, random phase. FR : module unite, phase aleatoire.
+    mid = 0.5 * (edges_s[:-1] + edges_s[1:])
+    T = np.asarray(table_db, float)
+    Tt = np.array([np.interp(tt, mid, T[b]) for b in range(T.shape[0])])  # [bands, frames]
+    lf = np.log2(np.maximum(f, 1e-6))
+    G = np.array([np.interp(lf, np.log2(centres), Tt[:, j]) for j in range(Tt.shape[1])]).T  # [freqs, frames] dB
+    G[f > CFG["bed"]["maxHz"]] = -200.0
+    G[f < 0.7 * centres[0]] = -200.0
+    th = CFG["bed"]["tonalHz"]
+    tonal = [b for b in range(len(centres)) if centres[b] < th]
+    if tonal:
+        G[f < centres[tonal[-1]] * 2 ** (1 / 6)] = -200.0
+    _, y = ss.istft(Z * 10 ** (G / 20), fs=sr, nperseg=N, noverlap=N - H, boundary=True)
+    y = y[:n]
+    if tonal:
+        t = np.arange(n) / sr
+        ph = rng.uniform(0, 2 * np.pi, len(centres))
+        for b in tonal:
+            # Same dB scale as the noise: one sine of amplitude sqrt(2) * 10^(T/20) * k_b; k_b calibrated by fit_bed.
+            amp = np.interp(t, mid, 10 ** (T[b] / 20))
+            y += amp * np.sqrt(2.0) * np.sin(2 * np.pi * centres[b] * t + ph[b])
+    return y
+
+
+def segment_cells(grid: "Grid", edges_s: np.ndarray) -> np.ndarray:
+    """Segment index of every critic frame (-1 outside). FR : segment de chaque trame."""
+    times = np.arange(grid.m) * grid.h / grid.sr
+    j = np.searchsorted(edges_s, times, side="right") - 1
+    j[(times < edges_s[0]) | (times >= edges_s[-1])] = -1
+    return j
+
+
+def fit_bed(ref_mono, ours_mono, sr, edges_s, log=print):
+    """Measure and correct: start from the median missing power per cell, then move each cell by the weighted mean
+    signed error (ref - ours+bed). Returns (table, bed signal, best E). FR : ajustement de la nappe."""
+    g = Grid(ref_mono, ours_mono, sr)
+    seg = segment_cells(g, edges_s)
+    S = len(edges_s) - 1
+    R, O = 10 ** (g.r2 / 10), 10 ** (g.o2 / 10)
+    T = np.full((len(g.c), S), CFG["bed"]["minDb"])
+    for s in range(S):
+        f = seg == s
+        if f.any():
+            T[:, s] = 10 * np.log10(np.median(np.maximum(R[:, f] - O[:, f], 0), axis=1) + 1e-14)
+    T = np.maximum(T, CFG["bed"]["minDb"])
+    # Calibration of the noise itself: render a flat 0 dB table and read its band level. FR : calibration du bruit.
+    flat = bed(np.zeros((len(g.c), S)), edges_s, g.c, len(ours_mono), sr, CFG["bed"]["seed"])
+    gc = Grid(ref_mono, flat, sr)
+    cal = np.median(gc.o2[:, seg >= 0], axis=1, keepdims=True)  # dB produced per 0 dB of table, per band. FR : gain du bruit par bande.
+    best = (g.E(), T.copy(), np.zeros_like(ours_mono))
+    log(f"bed start score {g.score():.3f}")
+    for it in range(CFG["bed"]["iters"]):
+        y = bed(T - cal, edges_s, g.c, len(ours_mono), sr, CFG["bed"]["seed"])
+        g.set_ours(ours_mono + y)
+        log(f"  bed iter {it} score {g.score():.3f}")
+        if g.E() < best[0]:
+            best = (g.E(), T.copy(), y)
+        d = g.r2 - g.o2
+        for s in range(S):
+            f = seg == s
+            if f.any():
+                w = g.w[:, f]
+                T[:, s] += CFG["bed"]["step"] * (w * d[:, f]).sum(1) / (w.sum(1) + 1e-9)
+        T = np.clip(T, CFG["bed"]["minDb"], 120.0)
+    return best[1] - cal, best[2], best[0]
+
+
+# ---------------------------------------------------------------- segment EQ (12 October 2026)
+# After the bodies, gap blocks and bed, the remaining error of the drums stem is mostly EXTRA energy (V_014: 26 percent
+# of the error, 120 to 500 Hz +1.1 dB). A dynamic EQ with one [band x segment] dB table (eighth notes by default),
+# mostly cuts, applied as an STFT mask to our render, fitted by the same measure and correct loop as the bed.
+# FR : egaliseur par segment (surtout des coupes), pour l'energie en trop qui reste apres les ajouts.
+CFG["segeq"] = {"stftN": 2048, "stftHop": 512, "minDb": -24.0, "maxDb": 3.0, "step": 0.7, "iters": 5}
+
+
+def apply_segeq(x: np.ndarray, table_db: np.ndarray, edges_s: np.ndarray, centres: np.ndarray, sr: int) -> np.ndarray:
+    N, H = CFG["segeq"]["stftN"], CFG["segeq"]["stftHop"]
+    st = x.ndim == 2
+    X = x if st else x[:, None]
+    mid = 0.5 * (edges_s[:-1] + edges_s[1:])
+    out = np.zeros_like(X, dtype=np.float64)
+    for ch in range(X.shape[1]):
+        f, tt, Z = ss.stft(X[:, ch], fs=sr, nperseg=N, noverlap=N - H, boundary="even", padded=True)
+        T = np.asarray(table_db, float)
+        Tt = np.array([np.interp(tt, mid, T[b]) for b in range(T.shape[0])])
+        lf = np.log2(np.maximum(f, 1e-6))
+        G = np.array([np.interp(lf, np.log2(centres), Tt[:, j]) for j in range(Tt.shape[1])]).T
+        _, y = ss.istft(Z * 10 ** (G / 20), fs=sr, nperseg=N, noverlap=N - H, boundary=True)
+        out[:, ch] = y[: len(X)]
+    return out if st else out[:, 0]
+
+
+def fit_segeq(ref_mono, x, sr, edges_s, log=print):
+    from ..resynth import mono
+    g = Grid(ref_mono, mono(x), sr)
+    seg = segment_cells(g, edges_s)
+    S = len(edges_s) - 1
+    T = np.zeros((len(g.c), S))
+    best = (g.E(), T.copy(), x)
+    log(f"segeq start score {g.score():.3f}")
+    for it in range(CFG["segeq"]["iters"]):
+        d = g.r2 - g.o2
+        for s in range(S):
+            f = seg == s
+            if f.any():
+                w = g.w[:, f]
+                T[:, s] += CFG["segeq"]["step"] * (w * d[:, f]).sum(1) / (w.sum(1) + 1e-9)
+        T = np.clip(T, CFG["segeq"]["minDb"], CFG["segeq"]["maxDb"])
+        y = apply_segeq(x, T, edges_s, g.c, sr)
+        g.set_ours(mono(y))
+        log(f"  segeq iter {it} score {g.score():.3f}")
+        if g.E() < best[0]:
+            best = (g.E(), T.copy(), y)
+    return best[1], best[2], best[0]

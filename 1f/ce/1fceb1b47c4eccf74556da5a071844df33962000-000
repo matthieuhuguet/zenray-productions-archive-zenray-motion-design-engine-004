@@ -1,0 +1,77 @@
+# 12 October 2026: two-way validation of zrmd.shaders.compose. Green: for every blend mode, with and without a
+# mask, the numpy evaluation and the emitted GLSL (rendered through HyperFrames, one browser run) agree within
+# settings.json shaders.verify_mean_max levels. Red: a composition evaluated with a wrong blend in numpy must be
+# far from the GLSL render, and malformed layers (unknown blend, unknown param, wrong size) must raise.
+# Runs under pytest, or directly: python -I tests/test_shader_compose.py (prints JSON, exit code 0 when all pass).
+# FR : validation dans les deux sens de la composition ; numpy contre GLSL, et cas rouges qui doivent échouer.
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from zrmd import settings  # noqa: E402
+from zrmd.shaders import bank, compose  # noqa: E402
+
+SIZE = 160
+RAMP_A = {"angle": 90.0}
+RAMP_B = {"angle": 20.0, "c0": [0.9, 0.2, 0.1], "c1": [0.2, 0.8, 0.3], "c2": [0.1, 0.3, 0.9], "c3": [1.0, 1.0, 0.2],
+          "s1": 0.3, "s2": 0.6}
+MASK = {"block": "sdf_rounded_rect", "params": {"half_size": [0.32, 0.22], "radius": 0.08, "soft": 0.03}}
+
+
+def compositions() -> dict:
+    comps = {}
+    for mode in compose.BLENDS:
+        comps[f"{mode}"] = [{"block": "linear_ramp4", "params": RAMP_A},
+                            {"block": "linear_ramp4", "params": RAMP_B, "blend": mode}]
+        comps[f"{mode}_masked"] = [{"block": "linear_ramp4", "params": RAMP_A},
+                                   {"block": "linear_ramp4", "params": RAMP_B, "blend": mode, "mask": MASK}]
+    comps["mask_alone"] = [("sdf_rounded_rect", MASK["params"])]
+    comps["three_layers"] = comps["screen_masked"] + [{"block": "sdf_rounded_rect", "params": {"center": [0.3, 0.7],
+                                                       "half_size": [0.1, 0.1], "soft": 0.01}, "blend": "add"}]
+    return comps
+
+
+def run() -> dict:
+    limit = float(settings.get("shaders.verify_mean_max"))
+    comps = compositions()
+    imgs = bank.render_glsl_batch(list(comps.values()), SIZE, SIZE)
+    results = []
+    for (name, layers), img in zip(comps.items(), imgs):
+        d = np.abs(img.astype(float) - compose.evaluate(layers, SIZE, SIZE))
+        results.append({"test": f"green_{name}", "mean_abs": round(float(d.mean()), 4), "max_abs": round(float(d.max()), 3),
+                        "pass": float(d.mean()) <= limit})
+    # Red: the GLSL of a screen composition must NOT match a numpy evaluation that uses multiply instead.
+    wrong = [dict(layer) for layer in comps["screen"]]
+    wrong[1]["blend"] = "multiply"
+    d = np.abs(imgs[list(comps).index("screen")].astype(float) - compose.evaluate(wrong, SIZE, SIZE))
+    results.append({"test": "red_wrong_blend_detected", "mean_abs": round(float(d.mean()), 4), "pass": float(d.mean()) > limit})
+    for label, bad in (("red_unknown_blend", [{"block": "linear_ramp4", "blend": "overlay"}]),
+                       ("red_unknown_param", [{"block": "linear_ramp4", "params": {"angel": 3}}]),
+                       ("red_wrong_size", [{"block": "linear_ramp4", "params": {"c0": [1, 0]}}]),
+                       ("red_unknown_block", [{"block": "no_such_block"}])):
+        try:
+            compose.normalise(bad)
+            results.append({"test": label, "pass": False})
+        except (ValueError, KeyError, FileNotFoundError) as e:
+            results.append({"test": label, "pass": True, "error": str(e)[:120]})
+    src, uniforms = compose.emit_glsl(comps["three_layers"])
+    results.append({"test": "glsl_inlines_each_block_once", "pass": src.count("vec4 linear_ramp4(") == 1
+                    and src.count("vec4 sdf_rounded_rect(") == 1 and len(uniforms) == 7 + 7 + 5 + 5})
+    return {"date": "12 October 2026", "size": SIZE, "limit": limit, "all_pass": all(r["pass"] for r in results),
+            "results": results}
+
+
+def test_shader_compose():
+    report = run()
+    assert report["all_pass"], json.dumps(report, indent=2)
+
+
+if __name__ == "__main__":
+    report = run()
+    print(json.dumps(report, indent=2))
+    sys.exit(0 if report["all_pass"] else 1)

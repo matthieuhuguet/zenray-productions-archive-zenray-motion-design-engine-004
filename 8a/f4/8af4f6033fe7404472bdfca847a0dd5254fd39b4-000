@@ -1,0 +1,72 @@
+// 12 October 2026, 12:25 CEST: end to end through HTTP with the REAL engine on a throwaway workshop: an iteration
+// request in params mode produces V_002 with the new value (green); a value outside its bounds is refused by the
+// engine with its cause (red); a format request renders a 9:16 montage; an instruction waits for an agent.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
+import { createEngine } from '../lib/engine.mjs'
+import { createJobQueue } from '../lib/jobs.mjs'
+import { createMedia } from '../lib/media.mjs'
+import { createActions } from '../lib/actions.mjs'
+import { createServer } from '../lib/server.mjs'
+import { listen, post, tempWorkshop, testConfig, waitJob } from './helpers.mjs'
+
+test('iteration and format requests end to end', { timeout: 600000 }, async (t) => {
+  const ws = tempWorkshop()
+  const config = testConfig(ws)
+  const engine = createEngine(config.engine)
+  const jobs = createJobQueue({ stateFile: config.jobs.stateFile })
+  const media = createMedia({ bridge: config.bridge, engine: config.engine })
+  const assets = { load: async () => { throw new Error('not in test') }, unload: async () => { throw new Error('not in test') } }
+  let base
+  const actions = createActions({ config, engine, jobs, media, assets, origin: () => base })
+  const server = createServer({ config, actions, media })
+  base = await listen(server)
+  t.after(() => server.close())
+
+  const motion = await (await post(base, config, { action: 'motion', motionId: 'selftest' })).json()
+  assert.equal(motion.motion.version, 'V_001')
+  assert.ok(motion.motion.exposed.categories.layout.length > 0)
+
+  const sent = await (await post(base, config, { action: 'request', mode: 'params', motionId: 'selftest', overrides: { 'layers.@caption.font.size': 100, 'layers.@bg.color': '#102030' } })).json()
+  const done = await waitJob(base, config, sent.job.id)
+  assert.equal(done.state, 'done', done.error)
+  assert.equal(done.result.version, 'V_002')
+  const params = JSON.parse(readFileSync(path.join(ws.workshop, 'motions', 'selftest', 'V_002', 'params.json'), 'utf8'))
+  assert.equal(params.layers.find((l) => l.id === 'caption').font.size, 100)
+  assert.equal(params.layers.find((l) => l.id === 'bg').color, '#102030')
+  assert.ok(existsSync(path.join(ws.workshop, 'motions', 'selftest', 'V_002', 'render.mp4')))
+  assert.ok(existsSync(path.join(ws.workshop, 'catalog.json')))
+
+  const tooBig = await (await post(base, config, { action: 'request', mode: 'params', motionId: 'selftest', overrides: { 'layers.@caption.font.size': 5000 } })).json()
+  const refused = await waitJob(base, config, tooBig.job.id)
+  assert.equal(refused.state, 'refused')
+  assert.match(refused.error, /outside/)
+  assert.ok(!existsSync(path.join(ws.workshop, 'motions', 'selftest', 'V_003')))
+
+  const unexposed = await (await post(base, config, { action: 'request', mode: 'params', motionId: 'selftest', overrides: { 'canvas.fps': 30 } })).json()
+  assert.equal((await waitJob(base, config, unexposed.job.id)).state, 'refused')
+
+  const fmt = await (await post(base, config, { action: 'request', mode: 'format', motionId: 'selftest', formats: ['9x16'], fit: 'cover' })).json()
+  const fdone = await waitJob(base, config, fmt.job.id)
+  assert.equal(fdone.state, 'done', fdone.error)
+  const out = fdone.result.outputs[0]
+  assert.equal(out.format, '9x16')
+  assert.ok(existsSync(out.render))
+  assert.equal((await fetch(out.url)).status, 200)
+
+  const refcache = await post(base, config, { action: 'montage', spec: { id: 'bad', clips: [{ kind: 'file', path: '/Users/zenray/.claude/tmp/tmp-zenray-motion-design-refcache/x.mp4' }] } })
+  assert.equal(refcache.status, 400)
+
+  const instr = await (await post(base, config, { action: 'request', mode: 'instruction', motionId: 'selftest', instructions: 'plus lent' })).json()
+  assert.equal(instr.job.state, 'waiting-agent')
+
+  const unknownMotion = await post(base, config, { action: 'request', mode: 'params', motionId: 'ghost', overrides: { k: 1 } })
+  assert.equal(unknownMotion.status, 400)
+
+  const tl = await (await post(base, config, { action: 'timeline', motionId: 'selftest' })).json()
+  assert.equal(tl.timeline.canvas.frames, 81)
+  const cat = await (await post(base, config, { action: 'catalogue' })).json()
+  assert.ok(cat.catalog.motions.some((m) => m.id === 'selftest' && m.posterUrl))
+})

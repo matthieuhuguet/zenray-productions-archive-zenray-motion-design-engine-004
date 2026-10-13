@@ -1,0 +1,33 @@
+// 12 October 2026, 12:05 CEST: the single queue runs one job at a time, cancels a queued job, records refusals, and
+// marks a job cut by a restart as interrupted.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createJobQueue, newRequestId } from '../lib/jobs.mjs'
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+test('one job at a time, cancel, restart', async () => {
+  const stateFile = path.join(mkdtempSync(path.join(tmpdir(), 'zrmd-jobs-')), 'jobs.json')
+  const q = createJobQueue({ stateFile })
+  let concurrent = 0, peak = 0
+  const work = async ({ step }) => { concurrent++; peak = Math.max(peak, concurrent); step('working'); await sleep(40); concurrent--; return { result: { ok: 1 } } }
+  const a = q.enqueue({ kind: 't' }, work), b = q.enqueue({ kind: 't' }, work), c = q.enqueue({ kind: 't' }, work)
+  assert.equal(q.cancel(c.id).state, 'cancelled')
+  await sleep(200)
+  assert.equal(peak, 1)
+  assert.equal(q.get(a.id).state, 'done')
+  assert.equal(q.get(b.id).steps[0].name, 'working')
+  assert.equal(q.get(c.id).state, 'cancelled')
+  const failing = q.enqueue({ kind: 't' }, async () => { throw Object.assign(new Error('hors bornes'), { code: 'refused' }) })
+  await sleep(20)
+  assert.equal(q.get(failing.id).state, 'refused')
+  assert.equal(q.get(failing.id).error, 'hors bornes')
+  q.enqueue({ kind: 'slow' }, () => sleep(10000))
+  await sleep(10)
+  const reborn = createJobQueue({ stateFile })
+  assert.ok(reborn.list().some((j) => j.kind === 'slow' && j.state === 'interrupted'))
+  assert.match(newRequestId(new Date('2026-10-12T10:15:00Z')), /^req-20261012-101500-[a-z0-9]{6}$/)
+})

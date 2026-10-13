@@ -1,0 +1,141 @@
+# 12 October 2026, 03:05 CEST: media helpers of the ZenRay Motion Design engine.
+# Every decode goes through ffmpeg/ffprobe subprocesses; Python only reads raw bytes, so untrusted media never
+# reaches a Python parser. Callers run the engine with `python -I`.
+from __future__ import annotations
+
+import json
+import subprocess
+from fractions import Fraction
+from pathlib import Path
+from typing import Iterator
+
+import numpy as np
+
+
+def _run_json(command: list[str]) -> dict:
+    out = subprocess.run(command, capture_output=True, text=True, check=True).stdout
+    return json.loads(out or "{}")
+
+
+def probe(path: str | Path) -> dict:
+    """Exact stream facts of a media file: duration, rational fps, size, frame count, audio layout."""
+    data = _run_json(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)])
+    video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
+    audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
+    fmt = data.get("format", {})
+    result: dict = {"path": str(path), "duration": float(fmt.get("duration") or 0.0), "bytes": int(fmt.get("size") or 0)}
+    if video:
+        rate = Fraction(video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1")
+        if rate == 0:
+            rate = Fraction(video.get("r_frame_rate") or "30/1")
+        result.update({
+            "width": int(video["width"]), "height": int(video["height"]),
+            "fps": float(rate), "fps_rational": f"{rate.numerator}/{rate.denominator}",
+            "video_codec": video.get("codec_name"), "pix_fmt": video.get("pix_fmt"),
+            "nb_frames": int(video["nb_frames"]) if str(video.get("nb_frames", "")).isdigit() else None,
+            "video_duration": float(video.get("duration") or result["duration"]),
+        })
+        if result["nb_frames"] is None:
+            result["nb_frames"] = int(round(result["video_duration"] * result["fps"]))
+    result["has_audio"] = audio is not None
+    if audio:
+        result.update({
+            "audio_codec": audio.get("codec_name"), "sample_rate": int(audio.get("sample_rate") or 0),
+            "channels": int(audio.get("channels") or 0), "audio_duration": float(audio.get("duration") or result["duration"]),
+        })
+    return result
+
+
+def iter_frames(path: str | Path, width: int, height: int, *, fps: float | None = None, gray: bool = False,
+                start: float | None = None, duration: float | None = None, threads: int = 16) -> Iterator[np.ndarray]:
+    """Decode frames scaled to width x height. fps=None keeps every source frame (exact frame grid)."""
+    filters = []
+    if fps:
+        filters.append(f"fps={fps}")
+    filters.append(f"scale={width}:{height}:flags=area")
+    filters.append("format=gray" if gray else "format=rgb24")
+    command = ["ffmpeg", "-v", "error", "-threads", str(threads)]
+    if start is not None:
+        command += ["-ss", f"{start:.6f}"]
+    command += ["-i", str(path)]
+    if duration is not None:
+        command += ["-t", f"{duration:.6f}"]
+    command += ["-vf", ",".join(filters), "-f", "rawvideo", "-pix_fmt", "gray" if gray else "rgb24", "-"]
+    channels = 1 if gray else 3
+    size = width * height * channels
+    process = subprocess.Popen(command, stdout=subprocess.PIPE)
+    try:
+        while True:
+            chunk = process.stdout.read(size)
+            if len(chunk) < size:
+                break
+            frame = np.frombuffer(chunk, dtype=np.uint8)
+            yield frame.reshape((height, width)) if gray else frame.reshape((height, width, 3))
+    finally:
+        process.stdout.close()
+        code = process.wait()
+    if code not in (0, None):
+        raise RuntimeError(f"ffmpeg exited with code {code} while decoding {path}")
+
+
+def read_frames(path: str | Path, width: int, height: int, **kwargs) -> np.ndarray:
+    """All frames at once, shape (n, h, w[, 3]), uint8."""
+    frames = list(iter_frames(path, width, height, **kwargs))
+    if not frames:
+        raise RuntimeError(f"no frame decoded from {path}")
+    return np.stack(frames)
+
+
+def frame_at(path: str | Path, t: float, width: int, height: int) -> np.ndarray:
+    """One RGB frame at time t (accurate seek after the input)."""
+    command = ["ffmpeg", "-v", "error", "-i", str(path), "-ss", f"{t:.6f}", "-frames:v", "1",
+               "-vf", f"scale={width}:{height}:flags=lanczos,format=rgb24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    raw = subprocess.run(command, capture_output=True, check=True).stdout
+    if len(raw) < width * height * 3:
+        raise RuntimeError(f"no frame at {t:.3f}s in {path}")
+    return np.frombuffer(raw[: width * height * 3], dtype=np.uint8).reshape((height, width, 3))
+
+
+def extract_audio(path: str | Path, out_wav: str | Path, sample_rate: int = 48000, channels: int = 2) -> Path:
+    """Decode the first audio stream to PCM 16-bit WAV."""
+    out_wav = Path(out_wav)
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-vn", "-ac", str(channels), "-ar", str(sample_rate),
+                    "-c:a", "pcm_s16le", str(out_wav)], check=True)
+    return out_wav
+
+
+def load_audio(path: str | Path, sample_rate: int = 48000, mono: bool = False) -> tuple[np.ndarray, int]:
+    """Float32 samples in [-1, 1], shape (n,) when mono else (n, channels), decoded by ffmpeg."""
+    channels = 1 if mono else 2
+    command = ["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", str(channels), "-ar", str(sample_rate),
+               "-f", "f32le", "-"]
+    raw = subprocess.run(command, capture_output=True, check=True).stdout
+    samples = np.frombuffer(raw, dtype="<f4").astype(np.float32)
+    if not mono:
+        samples = samples.reshape((-1, channels))
+    return samples, sample_rate
+
+
+def write_wav(path: str | Path, samples: np.ndarray, sample_rate: int = 48000) -> Path:
+    """Write float samples as 24-bit PCM WAV through ffmpeg (no clipping beyond [-1, 1])."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    channels = 1 if data.ndim == 1 else data.shape[1]
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(sample_rate), "-ac", str(channels), "-i", "-",
+                    "-c:a", "pcm_s24le", str(path)], input=data.astype("<f4").tobytes(), check=True)
+    return path
+
+
+def sha256(path: str | Path, chunk: int = 1 << 20) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()

@@ -1,0 +1,113 @@
+// 12 October 2026, 11:10 CEST: schema checks of everything the page (or the cloud queue) may ask. A refusal names its
+// cause; no path, no shell text and no unbounded value reaches the engine. The engine re-checks the exposed
+// parameters itself (zrmd.cli iterate --strict), so the bounds live in one place: params/exposed.json.
+// FR : verification de tout ce que la page peut demander ; un refus nomme sa cause.
+import { realpathSync, statSync } from 'node:fs'
+import path from 'node:path'
+
+export class Refusal extends Error {
+  constructor(message) { super(message); this.code = 'refused'; this.status = 400 }
+}
+
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v)
+const KEY_RE = /^[A-Za-z0-9_@.-]{1,120}$/
+
+export function checkMotionId(id, rules) {
+  if (typeof id !== 'string' || !new RegExp(rules.motionIdPattern).test(id) || id.includes('..')) throw new Refusal('motionId invalide')
+  return id
+}
+
+export function checkVersion(v, rules, { optional = true } = {}) {
+  if (v === undefined || v === null || v === '') { if (optional) return null; throw new Refusal('version requise') }
+  if (typeof v !== 'string' || !new RegExp(rules.versionPattern).test(v)) throw new Refusal('version invalide (V_001 à V_999)')
+  return v
+}
+
+function checkFormats(formats, rules) {
+  const list = formats === undefined ? ['16x9'] : formats
+  if (!Array.isArray(list) || !list.length || list.some((f) => !rules.formats.includes(f))) throw new Refusal(`formats attendus parmi ${rules.formats.join(', ')}`)
+  return [...new Set(list)]
+}
+
+/** An iteration request from the page or the cloud queue -> normalized request. */
+export function validateRequest(body, rules) {
+  if (!isPlainObject(body)) throw new Refusal('demande invalide')
+  const mode = body.mode
+  if (!rules.modes.includes(mode)) throw new Refusal(`mode attendu parmi ${rules.modes.join(', ')}`)
+  const out = { mode, motionId: checkMotionId(body.motionId, rules), baseVersion: checkVersion(body.baseVersion, rules) }
+  if (body.id !== undefined) {
+    if (typeof body.id !== 'string' || !new RegExp(rules.requestIdPattern).test(body.id)) throw new Refusal('identifiant de demande invalide')
+    out.id = body.id
+  }
+  if (mode === 'params') {
+    if (!isPlainObject(body.overrides) || !Object.keys(body.overrides).length) throw new Refusal('au moins un paramètre à changer')
+    const entries = Object.entries(body.overrides)
+    if (entries.length > rules.maxOverrides) throw new Refusal(`au plus ${rules.maxOverrides} paramètres par demande`)
+    for (const [key, value] of entries) {
+      if (!KEY_RE.test(key) || key.includes('..')) throw new Refusal(`clé de paramètre invalide : ${key}`)
+      const ok = (typeof value === 'number' && Number.isFinite(value)) || (typeof value === 'string' && value.length <= 200)
+      if (!ok) throw new Refusal(`valeur invalide pour ${key}`)
+    }
+    out.overrides = body.overrides
+  }
+  if (mode === 'format') {
+    out.formats = checkFormats(body.formats, rules)
+    if (body.fit !== undefined && !rules.fits.includes(body.fit)) throw new Refusal(`cadrage attendu parmi ${rules.fits.join(', ')}`)
+    out.fit = body.fit || rules.fits[0]
+  }
+  if (mode === 'instruction') {
+    if (typeof body.instructions !== 'string' || !body.instructions.trim()) throw new Refusal('consigne vide')
+    if (body.instructions.length > rules.maxInstructionChars) throw new Refusal(`consigne limitée à ${rules.maxInstructionChars} caractères`)
+    out.instructions = body.instructions.trim()
+  }
+  if (body.note !== undefined) {
+    if (typeof body.note !== 'string' || body.note.length > 200) throw new Refusal('note invalide')
+    out.note = body.note
+  }
+  return out
+}
+
+const realOr = (p) => { try { return realpathSync(p) } catch { return p } }
+// Roots are compared by their real path too (/var is /private/var on macOS).
+const inside = (root, file) => { const r = realOr(root); return file === r || file.startsWith(r.endsWith(path.sep) ? r : r + path.sep) }
+
+/** A local clip path: absolute, real (no symlink escape), under an allowed root, never under a denied one. */
+export function checkClipPath(file, rules) {
+  if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Refusal('un clip local demande un chemin absolu')
+  if (!rules.fileClipExtensions.includes(path.extname(file).toLowerCase())) throw new Refusal(`extension refusée : ${path.extname(file)}`)
+  let real
+  try { real = realpathSync(file) } catch { throw new Refusal(`clip introuvable : ${file}`) }
+  if (!statSync(real).isFile()) throw new Refusal(`pas un fichier : ${file}`)
+  if ((rules.fileClipDeny || []).some((root) => inside(root, real))) throw new Refusal('les médias de référence ne rejoignent jamais un montage')
+  if (!rules.fileClipRoots.some((root) => inside(root, real))) throw new Refusal('clip hors des dossiers autorisés')
+  return real
+}
+
+/** A montage spec from the page -> normalized spec for zrmd.cli montage. */
+export function validateMontage(body, rules, montageIdPattern = '^[a-z0-9][a-z0-9-]{0,47}$') {
+  if (!isPlainObject(body)) throw new Refusal('montage invalide')
+  if (typeof body.id !== 'string' || !new RegExp(montageIdPattern).test(body.id)) throw new Refusal('identifiant de montage invalide (minuscules, chiffres, tirets)')
+  if (!Array.isArray(body.clips) || !body.clips.length || body.clips.length > rules.maxMontageClips) throw new Refusal(`1 à ${rules.maxMontageClips} clips`)
+  const formats = checkFormats(body.formats, rules)
+  if (body.fit !== undefined && !rules.fits.includes(body.fit)) throw new Refusal('cadrage invalide')
+  const clips = body.clips.map((clip, n) => {
+    if (!isPlainObject(clip)) throw new Refusal(`clip ${n + 1} invalide`)
+    const out = {}
+    if (clip.kind === 'motion') {
+      out.kind = 'motion'; out.motion = checkMotionId(clip.motion, rules)
+      const v = checkVersion(clip.version, rules); if (v) out.version = v
+    } else if (clip.kind === 'file') {
+      out.kind = 'file'; out.path = checkClipPath(clip.path, rules)
+    } else throw new Refusal(`clip ${n + 1} : type motion ou file`)
+    for (const key of ['in', 'out']) {
+      if (clip[key] !== undefined) {
+        if (typeof clip[key] !== 'number' || !Number.isFinite(clip[key]) || clip[key] < 0) throw new Refusal(`clip ${n + 1} : ${key} invalide`)
+        out[key] = clip[key]
+      }
+    }
+    if (clip.fit !== undefined) { if (!rules.fits.includes(clip.fit)) throw new Refusal(`clip ${n + 1} : cadrage invalide`); out.fit = clip.fit }
+    if (clip.mute !== undefined) out.mute = !!clip.mute
+    return out
+  })
+  return { id: body.id, formats, ...(body.fit ? { fit: body.fit } : {}), clips }
+}

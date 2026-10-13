@@ -1,0 +1,58 @@
+# 12 October 2026: tonal family (ding, shimmer). Modal and additive synthesis.
+# FR : famille tonale ; synthese modale (cloche) et additive (scintillement).
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from . import common as c
+
+
+def ding(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Sum of modes sin(2 pi f0 r_k t) exp(-t / tau_k), bell ratios from sfx-params; tau_k = decay / r_k ** (highDamp / 4)."""
+    bell = c.syn()["bellRatios"][: int(round(p["modes"]))]
+    T = p["decay"] * 4.0
+    t = c.axis(T, sr)
+    x = np.zeros(len(t))
+    for k, rb in enumerate(bell):
+        # 12 October 2026: inharm morphs harmonic partials (k + 1) into bell ratios; tiltDb sets the level step per
+        # partial (a pluck is harmonic and darker, a bell inharmonic). FR : de la corde pincee a la cloche.
+        r = (1.0 - p.get("inharm", 1.0)) * (k + 1) + p.get("inharm", 1.0) * rb
+        f = p["f0"] * r
+        if f >= 0.45 * sr:
+            break
+        tau = p["decay"] / r ** (p["highDamp"] / 4.0)
+        x += c.damped_mode(f, tau, t) * 10 ** (p.get("tiltDb", -6.0) * k / 20.0)
+    air = p.get("air", 0.0)
+    if air > 0:
+        # 12 October 2026: breath or air layer, high-passed noise under the same decay, mixed by energy.
+        rng = np.random.default_rng(seed)
+        nz = c.highpass(rng.standard_normal(len(t)), sr, p.get("airHp", 4000.0)) * np.exp(-t / max(p["decay"], 1e-3))
+        x = math.sqrt(1.0 - air) * c.unit_energy(x) + math.sqrt(air) * c.unit_energy(nz)
+    x *= np.clip(t / (p["strikeMs"] / 1000.0), 0.0, 1.0)
+    return c.out32(c.set_level(c.fade(x, sr), sr, p["gainDb"]))
+
+
+def shimmer(p: dict, seed: int, sr: int) -> np.ndarray:
+    """High partials with slow amplitude modulation (random phases by seed) + soft high noise, small delay network."""
+    s = c.syn()
+    T = p["duration"]
+    t = c.axis(T, sr)
+    rng = np.random.default_rng(seed)
+    count = int(round(p.get("partials", 8)))
+    x = np.zeros(len(t))
+    for k in range(count):
+        f = p["fCenter"] * 2.0 ** (p["spreadOct"] * (k / max(count - 1, 1) - 0.5))
+        if f >= 0.45 * sr:
+            continue
+        am = 0.5 + 0.5 * np.sin(2 * math.pi * p["rateHz"] * (0.7 + 0.6 * k / max(count, 1)) * t + rng.uniform(0, 2 * math.pi))
+        x += am * np.sin(2 * math.pi * f * t + rng.uniform(0, 2 * math.pi))
+    nz = c.highpass(rng.standard_normal(len(t)), sr, p["fCenter"] * 0.7)
+    x = math.sqrt(1 - p["noiseMix"]) * c.unit_energy(x) + math.sqrt(p["noiseMix"]) * c.unit_energy(nz)
+    wet = x.copy()
+    for d in s["shimmerDelaysMs"]:
+        k = int(d * sr / 1000.0)
+        wet[k:] += s["shimmerDelayGain"] * x[:-k]
+    env = c.rise_fall(t, T, 0.4, p["envCurve"])
+    return c.out32(c.set_level_long(c.fade(wet * env, sr), sr, p["gainDb"]))

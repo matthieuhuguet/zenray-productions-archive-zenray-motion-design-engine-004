@@ -1,0 +1,246 @@
+# 12 October 2026: differentiable procedural sound bank (task A0). Every block is a torch module whose parameters
+# live in an unconstrained space (sigmoid to [min, max], linear or log), so a gradient fitter can move them freely
+# while the rendered values always stay inside their declared bounds. A block renders a mono float32 tensor with a
+# fixed noise seed, which makes a render reproducible bit for bit on a given device.
+# Layout: datasets/sound-bank/<id>/block.py (subclass of Block, PARAMS), block.json, demo.wav, plus index.json.
+# Chain format (render_chain):
+#   {"sr": 48000, "seconds": 1.0, "masterGainDb": 0.0,
+#    "blocks": [{"block": "sine_env", "params": {...}, "gainDb": 0.0, "offsetS": 0.0, "seed": 0}, ...]}
+# FR : banque de sons procéduraux différentiables ; chaque bloc est un module torch borné, une chaîne est une somme
+# de blocs avec gains et décalages.
+from __future__ import annotations
+
+import importlib.util
+import json
+import math
+from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from . import config
+
+
+def bank_dir() -> Path:
+    return config.params_path().parent / config.get("bank.dir")
+
+
+def _logit(u: float) -> float:
+    u = min(max(u, 1e-4), 1.0 - 1e-4)
+    return math.log(u / (1.0 - u))
+
+
+class Block(torch.nn.Module):
+    """Base of every bank block. Subclasses set ID, PARAMS and synth(values, n, sr).
+    PARAMS: list of {name, unit, min, max, default, scale ('lin' or 'log'), description}."""
+
+    ID = "base"
+    PARAMS: list[dict] = []
+
+    def __init__(self, values: dict | None = None, seed: int = 0):
+        super().__init__()
+        self.seed = int(seed)
+        self.raw = torch.nn.ParameterDict({p["name"]: torch.nn.Parameter(torch.zeros(())) for p in self.PARAMS})
+        self.set_values({**{p["name"]: p["default"] for p in self.PARAMS}, **(values or {})})
+        self._noise: dict = {}
+
+    # 12 October 2026: unconstrained <-> bounded mapping. FR : passage de l'espace libre aux bornes déclarées.
+    def spec(self, name: str) -> dict:
+        for p in self.PARAMS:
+            if p["name"] == name:
+                return p
+        raise KeyError(f"block {self.ID} has no parameter '{name}'")
+
+    def to_unit(self, name: str, value: float) -> float:
+        p = self.spec(name)
+        if p.get("scale", "lin") == "log":
+            return (math.log(value) - math.log(p["min"])) / (math.log(p["max"]) - math.log(p["min"]))
+        return (value - p["min"]) / (p["max"] - p["min"])
+
+    def value(self, name: str) -> torch.Tensor:
+        p = self.spec(name)
+        u = torch.sigmoid(self.raw[name])
+        if p.get("scale", "lin") == "log":
+            return torch.exp(math.log(p["min"]) + u * (math.log(p["max"]) - math.log(p["min"])))
+        return p["min"] + u * (p["max"] - p["min"])
+
+    def set_values(self, values: dict) -> None:
+        with torch.no_grad():
+            for k, v in values.items():
+                self.raw[k].fill_(_logit(self.to_unit(k, float(v))))
+
+    def set_unit(self, units: dict) -> None:
+        with torch.no_grad():
+            for k, u in units.items():
+                self.raw[k].fill_(_logit(float(u)))
+
+    def values(self) -> dict:
+        return {p["name"]: float(self.value(p["name"]).detach().cpu()) for p in self.PARAMS}
+
+    def noise(self, n: int, device) -> torch.Tensor:
+        """White Gaussian noise drawn once per (seed, length) on the CPU generator, then moved: identical on any device."""
+        key = (n, str(device))
+        if key not in self._noise:
+            g = torch.Generator().manual_seed(self.seed)
+            self._noise[key] = torch.randn(n, generator=g).to(device)
+        return self._noise[key]
+
+    def forward(self, n: int, sr: int) -> torch.Tensor:
+        dev = next(iter(self.raw.values())).device
+        t = torch.arange(n, device=dev, dtype=torch.float32) / sr
+        return self.synth({p["name"]: self.value(p["name"]) for p in self.PARAMS}, t, sr)
+
+    def synth(self, v: dict, t: torch.Tensor, sr: int) -> torch.Tensor:  # pragma: no cover
+        raise NotImplementedError
+
+
+# 12 October 2026: shared differentiable DSP helpers. FR : briques DSP communes, différentiables.
+def envelope(t, onset, attack, decay_t60):
+    """Linear attack from onset, then an exponential fall of 60 dB over decay_t60 seconds; zero before onset."""
+    u = t - onset
+    rise = torch.clamp(u / attack, 0.0, 1.0)
+    fall = torch.pow(10.0, -3.0 * torch.clamp(u - attack, min=0.0) / decay_t60)
+    return rise * fall
+
+
+def db_to_amp(db):
+    return torch.pow(10.0, db / 20.0)
+
+
+def phase_from_freq(f, sr):
+    """Phase accumulation: cumulative sum of cycles per sample, wrapped to [0, 1) to keep float32 precision."""
+    cycles = torch.cumsum(f / sr, dim=0)
+    return 2.0 * math.pi * (cycles - torch.floor(cycles.detach()))
+
+
+def stft_filter(x, mask_fn, n_fft: int, hop: int, sr: int):
+    """Time-varying magnitude filter in the STFT domain (mask_fn(freqs[F,1], frame_times[1,T]) -> [F,T])."""
+    win = torch.hann_window(n_fft, device=x.device)
+    S = torch.stft(x, n_fft, hop, window=win, return_complex=True, center=True)
+    freqs = torch.fft.rfftfreq(n_fft, 1.0 / sr).to(x.device)[:, None]
+    times = (torch.arange(S.shape[1], device=x.device, dtype=torch.float32) * hop / sr)[None, :]
+    return torch.istft(S * mask_fn(freqs, times), n_fft, hop, window=win, length=x.shape[0], center=True)
+
+
+# 12 October 2026: loading and listing. FR : chargement et liste des blocs.
+@lru_cache(maxsize=None)
+def block_class(block_id: str):
+    path = bank_dir() / block_id / "block.py"
+    if not path.exists():
+        raise FileNotFoundError(f"sound bank has no block '{block_id}' ({path})")
+    spec = importlib.util.spec_from_file_location(f"zrmd_soundbank_{block_id}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cls = getattr(mod, "BLOCK", None)
+    if cls is None or cls.ID != block_id:
+        raise ValueError(f"{path} must define BLOCK with ID == '{block_id}'")
+    cls.META = getattr(mod, "META", {})
+    return cls
+
+
+def load(block_id: str) -> dict:
+    d = bank_dir() / block_id
+    return {"id": block_id, "path": d, "cls": block_class(block_id), "meta": json.loads((d / "block.json").read_text(encoding="utf-8"))}
+
+
+def list_blocks() -> list[str]:
+    return sorted(p.name for p in bank_dir().iterdir() if (p / "block.py").exists())
+
+
+def make(block_id: str, params: dict | None = None, seed: int = 0, device="cpu") -> Block:
+    return block_class(block_id)(params, seed).to(device)
+
+
+def render_block(block_id: str, params: dict | None = None, seconds: float | None = None, sr: int | None = None,
+                 seed: int = 0, device="cpu") -> np.ndarray:
+    sr = sr or config.get("bank.sampleRate")
+    seconds = seconds or config.get("bank.demoSeconds")
+    with torch.no_grad():
+        y = make(block_id, params, seed, device)(int(round(seconds * sr)), sr)
+    return y.detach().cpu().numpy().astype(np.float32)
+
+
+def chain_modules(chain: dict, device="cpu") -> list[Block]:
+    return [make(b["block"], b.get("params"), b.get("seed", config.get("bank.noiseSeedDefault")), device) for b in chain["blocks"]]
+
+
+def shift(y: torch.Tensor, k: int, n: int) -> torch.Tensor:
+    """Integer sample offset of a rendered block (positive delays it), length kept at n."""
+    if k > 0:
+        return torch.cat([torch.zeros(k, device=y.device), y[: n - k]])
+    if k < 0:
+        return torch.cat([y[-k:], torch.zeros(-k, device=y.device)])
+    return y
+
+
+def mix_modules(mods: list[Block], chain: dict, n: int, sr: int) -> torch.Tensor:
+    """Differentiable sum of the chain: each block rendered, gained, shifted by an integer sample offset.
+    12 October 2026 (A2): an entry whose block has KIND "effect" (zrmd/audio/fxdsp.EffectBlock) is an insert on the
+    bus: it processes the running sum of the entries before it (its gainDb is an output gain, offsetS is ignored).
+    FR : un effet traite la somme des entrées qui le précèdent."""
+    out = None
+    for m, b in zip(mods, chain["blocks"]):
+        g = 10.0 ** (b.get("gainDb", 0.0) / 20.0)
+        if getattr(m, "KIND", "source") == "effect":
+            # An effect first in the chain has no bus: it processes its fixed test exciter, exactly as render_block.
+            # FR : un effet en tête de chaîne traite son excitateur fixe.
+            out = (m(n, sr) if out is None else m.process(out, n, sr)) * g
+            continue
+        y = shift(m(n, sr) * g, int(round(b.get("offsetS", 0.0) * sr)), n)
+        out = y if out is None else out + y
+    return out * (10.0 ** (chain.get("masterGainDb", 0.0) / 20.0))
+
+
+def render_chain(chain: dict, device="cpu") -> np.ndarray:
+    sr = chain.get("sr") or config.get("bank.sampleRate")
+    n = int(round(chain.get("seconds", config.get("bank.demoSeconds")) * sr))
+    with torch.no_grad():
+        y = mix_modules(chain_modules(chain, device), chain, n, sr)
+    return y.detach().cpu().numpy().astype(np.float32)
+
+
+def write_wav(path: Path, x: np.ndarray, sr: int) -> None:
+    import soundfile as sf
+    sf.write(str(path), np.asarray(x, np.float32), sr, subtype="FLOAT")
+
+
+def build_index() -> dict:
+    """index.json: id, family, description, tags and parameter names of every block (regenerated, never hand-edited).
+    12 October 2026 (A2): several agents add blocks at once, so the rows are read and index.json is written under an
+    exclusive lock on sound-bank/.index.lock, through a temporary file and an atomic rename; a block whose block.json
+    is not built yet is listed under "pending" instead of failing. FR : lecture et écriture verrouillées, atomiques."""
+    import fcntl
+    import os
+    with open(bank_dir() / ".index.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        rows, pending = [], []
+        for bid in list_blocks():
+            j = bank_dir() / bid / "block.json"
+            if not j.exists():
+                pending.append(bid)
+                continue
+            m = json.loads(j.read_text(encoding="utf-8"))
+            rows.append({"id": bid, "family": m.get("family"), "kind": m.get("kind", "source"), "description": m.get("description"),
+                         "tags": m.get("tags", []), "params": [p["name"] for p in m.get("params", [])], "licence": m.get("licence")})
+        idx = {"date": "12 October 2026", "count": len(rows), "blocks": rows, "pending": pending}
+        tmp = bank_dir() / f".index.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(idx, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, bank_dir() / "index.json")
+    return idx
+
+
+def block_meta(block_id: str) -> dict:
+    """12 October 2026: block.json content, generated from block.py (META plus PARAMS): block.py is the single source,
+    block.json the readable copy the verifier compares against it. FR : block.json se génère depuis block.py."""
+    cls = block_class(block_id)
+    return {"id": block_id, **cls.META, "params": cls.PARAMS, "date": "12 October 2026"}
+
+
+def write_block_files(block_id: str) -> dict:
+    d = bank_dir() / block_id
+    meta = block_meta(block_id)
+    (d / "block.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    sr = config.get("bank.sampleRate")
+    write_wav(d / "demo.wav", render_block(block_id, seconds=config.get("bank.demoSeconds"), sr=sr), sr)
+    return meta

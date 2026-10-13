@@ -1,0 +1,163 @@
+# 12 October 2026: two-way validation of the audio engine (zrmd.audio). Every test has a green case (a correct
+# input must pass) and a red case (a known defect must fail), so no check can pass without looking at its input.
+# Runs under pytest, or directly: python -I tests/test_audio.py (prints JSON, exit code 0 when all pass).
+# FR : validation dans les deux sens du moteur son ; chaque test a un cas vert et un cas rouge.
+from __future__ import annotations
+
+import os
+
+for _k in ("OMP_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+import json
+import math
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from zrmd.audio import classify, config, fit, loudness, mix, music, segment  # noqa: E402
+from zrmd.audio import describe as D  # noqa: E402
+from zrmd.audio.ceilings import check  # noqa: E402
+from zrmd.audio.recipes import KINDS, REGISTRY, render_padded  # noqa: E402
+
+SR = config.cfg()["audio"]["sampleRate"]
+THR = config.cfg()["score"]["passThreshold"]
+
+
+def test_registry_18_deterministic():
+    assert len(KINDS) == 18, KINDS
+    for k in KINDS:
+        r = REGISTRY[k]
+        a = r.render(r.schema.defaults(), 5, SR)
+        b = r.render(r.schema.defaults(), 5, SR)
+        assert a.dtype == np.float32 and a.ndim == 1 and np.isfinite(a).all(), k
+        assert np.array_equal(a, b), f"{k} not reproducible with a fixed seed"  # green: same seed, same samples
+    w = REGISTRY["whoosh"]
+    assert not np.array_equal(w.render(w.schema.defaults(), 5, SR), w.render(w.schema.defaults(), 6, SR))  # red: seed matters
+
+
+def test_ceilings_both_directions():
+    with ProcessPoolExecutor(16) as pool:
+        rows = list(pool.map(check, [(k, 0) for k in KINDS]))
+    floors = config.cfg()["ceiling"]["floors"]
+    for r in rows:
+        floor = floors.get(r["kind"], floors["default"])
+        assert r["identity"] >= floor, f"{r['kind']} identity {r['identity']} < {floor}"  # green
+        for name, s in r["perturbed"].items():
+            assert s < THR, f"{r['kind']} perturbation {name} still scores {s}"  # red
+    return {r["kind"]: r["identity"] for r in rows}
+
+
+def test_fit_green_and_wrong_recipe_red():
+    truth = REGISTRY["click"].schema.to_physical(np.full(6, 0.45))
+    ref = D.describe(render_padded("click", truth, 101, SR, 12.0))
+    good = fit.run([{"id": "G", "kind": "click", "alternatives": []}], {"G": ref}, workers=8)[0]
+    assert good["score"] >= THR - 0.5, good["score"]  # green: a known click is found again
+    bad = fit.run([{"id": "B", "kind": "whoosh", "alternatives": []}], {"B": ref}, workers=8)[0]
+    assert bad["score"] < THR, bad["score"]  # red: the best whoosh cannot pass for a click
+    return {"click": good["score"], "whooshAsClick": bad["score"]}
+
+
+def _cls_job(a):
+    k, i = a
+    r = REGISTRY[k]
+    rng = np.random.default_rng(500 + i)
+    p = r.schema.defaults() if i == 0 else r.schema.to_physical(rng.uniform(0.15, 0.85, len(r.schema.fit_names)))
+    x = render_padded(k, p, 7, SR)
+    d = D.describe(x)
+    return k, classify.classify(d, D.extra(x, d))["kind"]
+
+
+def test_classifier_top3():
+    with ProcessPoolExecutor(16) as pool:
+        res = list(pool.map(_cls_job, [(k, i) for k in KINDS for i in range(4)]))
+    alt = config.cfg()["classify"]["alternatives"]
+    top1 = np.mean([k == g for k, g in res])
+    top3 = np.mean([k == g or k in alt.get(g, []) for k, g in res])
+    rng = np.random.default_rng(1)
+    shuffled = np.mean([k == g or k in alt.get(g, []) for k, g in zip([k for k, _ in res], rng.permutation([g for _, g in res]))])
+    assert top3 >= 0.85, top3  # green
+    assert shuffled < 0.4, shuffled  # red: a label that ignores the sound would not reach this
+    return {"top1": round(float(top1), 3), "top3": round(float(top3), 3), "shuffledTop3": round(float(shuffled), 3)}
+
+
+def _bed(seconds, bpm, rng):
+    t = np.arange(int(seconds * SR)) / SR
+    x = 0.05 * sum(np.sin(2 * math.pi * f * t) for f in (220.0, 277.18, 329.63))
+    beat = 60.0 / bpm
+    drums = np.zeros(len(t))
+    for k in range(int(seconds / beat)):
+        a = int(k * beat * SR)
+        n = int(0.25 * SR)
+        tt = np.arange(n) / SR
+        kick = np.sin(2 * math.pi * (50 + 100 * np.exp(-tt / 0.03)) * tt) * np.exp(-tt / 0.12)
+        drums[a:a + n] += 0.6 * kick[: len(t) - a]
+        h = a + int(beat / 2 * SR)
+        if h < len(t):
+            m = min(int(0.05 * SR), len(t) - h)
+            drums[h:h + m] += 0.08 * rng.standard_normal(m) * np.exp(-np.arange(m) / SR / 0.01)
+    return {"drums": drums, "bass": np.zeros(len(t)), "other": x}
+
+
+def test_segment_music_only_red_and_sfx_green():
+    rng = np.random.default_rng(3)
+    stems = _bed(16.0, 120.0, rng)
+    ana = music.analyze(stems, SR)
+    quiet = segment.detect(stems, SR, ana)["events"]
+    assert len(quiet) <= 1, len(quiet)  # red: a repeating music bed alone must give (almost) no SFX event
+    truth = []
+    for i, kind in enumerate(["click", "whoosh", "click", "whoosh"]):
+        t = 3.1 + 2.9 * i
+        p = REGISTRY[kind].schema.defaults()
+        p["gainDb"] = -14.0
+        body = REGISTRY[kind].render(p, 1000 + i, SR).astype(np.float64)
+        a = int(t * SR)
+        tgt = "drums" if kind == "click" else "other"
+        stems[tgt][a:a + len(body)] += body[: len(stems[tgt]) - a]
+        truth.append(t)
+    found = segment.detect(stems, SR, ana)["events"]
+    hits = sum(any(-0.1 <= e["t"] - t <= 0.35 for e in found) for t in truth)
+    assert hits >= 3, (hits, [e["t"] for e in found])  # green
+    return {"musicOnlyEvents": len(quiet), "sfxFound": hits, "sfxTotal": len(truth), "detected": len(found), "bpm": ana["bpm"]}
+
+
+def test_music_score_two_ways():
+    rng = np.random.default_rng(4)
+    stems = _bed(20.0, 100.0, rng)
+    ref = music.analyze(stems, SR)
+    gen = music.analyze(music.generate(ref, SR)["stems"], SR)
+    good = music.score(ref, gen)
+    assert good["parts"]["tempo"] >= THR, good  # green: same grid
+    wrong = dict(gen, bpm=gen["bpm"] * 1.05)
+    bad = music.score(ref, wrong)
+    assert bad["parts"]["tempo"] < THR, bad  # red: 5 percent off tempo
+    return {"good": good["score"], "goodTempo": good["parts"]["tempo"], "badTempo": bad["parts"]["tempo"]}
+
+
+def test_limiter_true_peak_two_ways():
+    cfg = config.cfg()
+    rng = np.random.default_rng(5)
+    x = np.clip(rng.standard_normal((SR * 3, 2)) * 0.5, -1.5, 1.5)
+    raw_tp = loudness.true_peak_db(x, SR, cfg["mix"]["oversample"])
+    assert raw_tp > cfg["mix"]["truePeakCeilingDbtp"], raw_tp  # red: unlimited noise breaks the ceiling
+    y = mix.limiter(x, SR, cfg["mix"]["truePeakCeilingDbtp"] - 0.1, cfg)
+    tp = loudness.true_peak_db(y, SR, cfg["mix"]["oversample"])
+    assert tp <= cfg["mix"]["truePeakCeilingDbtp"], tp  # green
+    return {"rawTruePeak": round(raw_tp, 2), "limitedTruePeak": round(tp, 2)}
+
+
+if __name__ == "__main__":
+    out, ok = {}, True
+    for name, fn in [(k, v) for k, v in dict(globals()).items() if k.startswith("test_") and callable(v)]:
+        t = time.time()
+        try:
+            res = fn()
+            out[name] = {"pass": True, "seconds": round(time.time() - t, 1), "result": res}
+        except AssertionError as exc:
+            ok = False
+            out[name] = {"pass": False, "seconds": round(time.time() - t, 1), "error": str(exc)}
+    print(json.dumps(out, indent=1))
+    sys.exit(0 if ok else 1)

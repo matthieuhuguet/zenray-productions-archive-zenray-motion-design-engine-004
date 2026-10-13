@@ -1,0 +1,139 @@
+# 12 October 2026: deterministic rule tree over the descriptors (R03 section 3). Every threshold lives in
+# sfx-params.json "classify". When two classes stay close the choice matters little: the fit sets the parameters.
+# Returns the class and the chain of rules that decided it, so a wrong decision can be read and corrected.
+# FR : arbre de regles lisible ; chaque seuil dans sfx-params.json ; la trace dit pourquoi.
+from __future__ import annotations
+
+from . import config
+
+
+def classify(desc: dict, ext: dict, cfg: dict | None = None) -> dict:
+    c = (cfg or config.cfg())["classify"]
+    attack_ms = desc["attackS"] * 1000.0
+    span = desc["spanS"]
+    tonal = desc["prominenceDb"] >= c["tonalDb"]
+    slope = ext["centroidSlopeOct"]
+    why = []
+
+    def done(kind):
+        return {"kind": kind, "why": why}
+
+    if ext["lowShare"] >= c["lowShare"]:
+        why.append(f"lowShare {ext['lowShare']:.2f} >= {c['lowShare']}")
+        if tonal and desc["flatness"] < c["subdropFlatMax"] and span >= c["subdropMinSeconds"] and slope < 0:
+            why.append("pure falling tone, long")
+            return done("subdrop" if span < c["boomMinSeconds"] or desc["prominenceDb"] > c["tonalDb"] + 10 else "boom")
+        if span >= c["boomMinSeconds"]:
+            why.append(f"span {span:.2f} >= {c['boomMinSeconds']}")
+            return done("boom")
+        return done("impact")
+    if ext["lowShare"] >= c["lowShareImpact"]:
+        why.append(f"lowShare {ext['lowShare']:.2f} >= {c['lowShareImpact']}")
+        if attack_ms >= c["swellAttackMs"] or ext["peakFraction"] >= c["triggerPeakFraction"] - 0.3:
+            why.append("slow build before the low hit")
+            return done("trigger")
+        return done("impact")
+    if ext["subAttacks"] >= c["seriesMinAttacks"]:
+        why.append(f"{ext['subAttacks']} sub-attacks")
+        if ext["attackCv"] < c["periodicCv"] and not (c["keyboardRateHz"][0] <= ext["attackRateHz"] <= c["keyboardRateHz"][1] and desc["flatness"] > 0.01):
+            return done("tick")
+        if c["keyboardRateHz"][0] <= ext["attackRateHz"] <= c["keyboardRateHz"][1]:
+            why.append(f"rate {ext['attackRateHz']:.1f} Hz in keyboard range")
+            return done("keyboard")
+        if ext["subAttacks"] >= c["glitchMinAttacks"]:
+            return done("glitch")
+    if attack_ms < c["transientAttackMs"]:
+        why.append(f"attack {attack_ms:.1f} ms < {c['transientAttackMs']}")
+        if span <= c["tickMaxSeconds"] and desc["peakHz"] >= c["tickMinHz"] and tonal:
+            return done("tick")
+        if tonal:
+            if span >= c["dingMinSeconds"]:
+                return done("ding")
+            if span <= c["popMaxSeconds"] and slope >= c["centroidSlopeUp"]:
+                return done("pop")
+            if span <= c["clickMaxSeconds"] and desc["flatness"] > 0.05:
+                return done("click")
+            return done("blip")
+        if span <= c["popMaxSeconds"] and slope >= c["centroidSlopeUp"] and desc["flatness"] < 0.01:
+            return done("pop")
+        return done("click")
+    if tonal and desc["centroidHz"] >= c["shimmerMinCentroidHz"] and span >= c["dingMinSeconds"]:
+        why.append("high tonal sustained")
+        return done("shimmer")
+    if tonal and attack_ms < c["swellAttackMs"] * 3 and span >= c["dingMinSeconds"] and slope <= 0:
+        why.append("tonal, fast strike, long decay")
+        return done("ding")
+    if span >= c["riserMinSeconds"] and slope <= c["centroidSlopeDown"] and ext["peakFraction"] < 0.5:
+        why.append(f"long, brightness falls {slope:.2f} oct")
+        return done("downlifter")
+    if ext["peakFraction"] >= c["reverseLatePeak"] or (span >= c["riserMinSeconds"] * 0.6 and ext["peakFraction"] >= 0.55):
+        why.append(f"late peak {ext['peakFraction']:.2f}")
+        if span >= c["riserMinSeconds"] and slope >= c["centroidSlopeUp"]:
+            return done("riser")
+        return done("reverse")
+    if span >= c["riserMinSeconds"] and slope >= c["centroidSlopeUp"]:
+        return done("riser")
+    why.append(f"swell-like, span {span:.2f}")
+    if span <= c["swipeMaxSeconds"]:
+        return done("swipe")
+    if span <= c["swooshMaxSeconds"]:
+        return done("swoosh")
+    return done("whoosh")
+
+
+def musical_note(desc: dict, stem: str, key: dict, cfg: dict | None = None) -> dict | None:
+    """12 October 2026: a tonal event from a pitched stem whose pitch sits on the measured key's scale is a note of
+    the music, not an SFX. It is routed to the music (re-composed originally), never fitted: copying its pitch would
+    copy the melody. Returns the reason, or None when the event stays an SFX.
+    FR : une note tonale d'une piste musicale, sur la gamme mesuree, appartient a la musique ; jamais copiee."""
+    c = (cfg or config.cfg())["classify"]
+    mn = c["musicalNote"]
+    if desc["prominenceDb"] < c["tonalDb"] or not any(s in stem for s in mn["stems"]):
+        return None
+    import math
+    midi = 69 + 12 * math.log2(max(desc["peakHz"], 1.0) / 440.0)
+    pc = (midi - key["tonic"]) % 12
+    for deg in mn["scales"][key["mode"]]:
+        cents = 100 * min(abs(pc - deg), 12 - abs(pc - deg))
+        if cents <= mn["centsTolerance"]:
+            return {"reason": "tonal note on the key scale", "peakHz": round(desc["peakHz"], 1), "degree": deg, "centsOff": round(cents, 1),
+                    "key": key.get("name")}
+    return None
+
+
+def notes_of(x, sr: int, cfg: dict | None = None) -> list[int]:
+    """12 October 2026: distinct stable MIDI notes of a window (pyin), each held for at least noteMinFrames frames.
+    Used only to tell a melody (two notes or more) from a one-shot; the notes are never written to an output."""
+    import librosa
+    import numpy as np
+    mn = (cfg or config.cfg())["classify"]["musicalNote"]
+    y = librosa.resample(np.asarray(x, dtype=np.float32), orig_sr=sr, target_sr=mn["pyinSr"])
+    if len(y) < mn["pyinFrame"]:
+        return []
+    f0, voiced, _ = librosa.pyin(y, fmin=mn["pyinFmin"], fmax=mn["pyinFmax"], sr=mn["pyinSr"], frame_length=mn["pyinFrame"], hop_length=mn["pyinHop"])
+    if not voiced.any():
+        return []
+    vals, counts = np.unique(np.round(librosa.hz_to_midi(f0[voiced])), return_counts=True)
+    return [int(v) for v, c in zip(vals, counts) if c >= mn["noteMinFrames"]]
+
+
+def route_musical(items: list[dict], key: dict, cfg: dict | None = None) -> list[dict | None]:
+    """items: [{'t', 'stem', 'desc', 'notes'}] in time order. A tonal on-scale event from a pitched stem is a note of
+    the music when it holds several distinct notes (a chord or a phrase) or has another tonal on-scale neighbour on
+    the same stem within phraseSeconds. An isolated single-note hit stays an SFX (its pitch is a sound-design value).
+    Returns, per item, the routing reason or None. FR : une note isolee reste un SFX ; une phrase va a la musique."""
+    mn = (cfg or config.cfg())["classify"]["musicalNote"]
+    flags = [musical_note(it["desc"], it["stem"], key, cfg) for it in items]
+    out = []
+    for i, (it, f) in enumerate(zip(items, flags)):
+        if not f:
+            out.append(None)
+            continue
+        many = len(it.get("notes", [])) >= mn["minDistinctNotes"]
+        near = [j for j, (o, g) in enumerate(zip(items, flags)) if j != i and g and o["stem"] == it["stem"] and abs(o["t"] - it["t"]) <= mn["phraseSeconds"]]
+        if many or near:
+            out.append(dict(f, distinctNotes=len(it.get("notes", [])), tonalNeighbours=len(near),
+                            reason="melodic: several notes" if many else "melodic: tonal neighbours in the same phrase"))
+        else:
+            out.append(None)
+    return out

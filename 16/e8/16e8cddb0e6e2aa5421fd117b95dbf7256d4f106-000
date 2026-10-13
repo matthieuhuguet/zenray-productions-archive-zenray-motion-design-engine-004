@@ -1,0 +1,111 @@
+# 12 October 2026, 10:40 CEST: two-way tests of the engine surface used by the site and the local service
+# (versions.set_path/get_path '@id' segments, zrmd.exposed, zrmd.emit.montage). Each check has a green case and a red
+# case, so a verifier that never turns red cannot pass. Runs directly: python -I tests/test_site_surface.py [--render]
+# FR : tests dans les deux sens de la surface du moteur utilisee par le site et le service local.
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from zrmd import exposed, versions  # noqa: E402
+from zrmd.emit import montage  # noqa: E402
+
+PARAMS = {"layers": [{"id": "bg", "type": "solid", "color": "#000000"},
+                     {"id": "caption", "type": "text", "text": "Hello", "color": "#cccccc", "x": 960, "y": 540,
+                      "font": {"size": 90, "tracking": 0.03}, "shine": {"base": "#cbcbcb", "highlight": "#ffffff"}}]}
+FAILURES: list[str] = []
+
+
+def check(name: str, condition: bool):
+    print(("ok   " if condition else "FAIL ") + name)
+    if not condition:
+        FAILURES.append(name)
+
+
+def raises(fn) -> bool:
+    try:
+        fn()
+    except (ValueError, KeyError, FileNotFoundError):
+        return True
+    return False
+
+
+def test_paths():
+    p = json.loads(json.dumps(PARAMS))
+    versions.set_path(p, "layers.@caption.font.size", 120)
+    check("set_path @id writes the caption", p["layers"][1]["font"]["size"] == 120)
+    check("get_path @id reads it back", versions.get_path(p, "layers.@caption.font.size") == 120)
+    check("set_path integer segment still works", versions.set_path(p, "layers.0.color", "#111111")["layers"][0]["color"] == "#111111")
+    check("get_path unknown id gives the default (red)", versions.get_path(p, "layers.@nope.x", "absent") == "absent")
+    check("set_path unknown id raises (red)", raises(lambda: versions.set_path(p, "layers.@nope.x", 1)))
+
+
+def test_exposed():
+    cats = exposed.exposed_for(PARAMS, "textcard")
+    check("exposed offers layout, colour, content", set(cats) == {"layout", "colour", "content"})
+    check("exposed respects 8 per category", all(len(v) <= exposed.definitions()["max_per_category"] for v in cats.values()))
+    check("exposed carries current values", cats["layout"][2]["value"] == 90)
+    good = exposed.validate(PARAMS, "textcard", {"layers.@caption.font.size": 100, "layers.@bg.color": "#ABCDEF"})
+    check("validate keeps a value in bounds and lowers a colour (green)", good == {"layers.@caption.font.size": 100, "layers.@bg.color": "#abcdef"})
+    check("validate refuses out of bounds (red)", raises(lambda: exposed.validate(PARAMS, "textcard", {"layers.@caption.font.size": 9999})))
+    check("validate refuses an unexposed key (red)", raises(lambda: exposed.validate(PARAMS, "textcard", {"canvas.fps": 30})))
+    check("validate refuses a bad colour (red)", raises(lambda: exposed.validate(PARAMS, "textcard", {"layers.@bg.color": "red"})))
+    check("validate refuses empty text (red)", raises(lambda: exposed.validate(PARAMS, "textcard", {"layers.@caption.text": "  "})))
+    check("unknown recipe exposes nothing", exposed.exposed_for(PARAMS, "unknown") == {})
+
+
+def fake_probe(path):
+    return {"duration": 2.0, "width": 1920, "height": 1080, "audio": False}
+
+
+def make_clip(folder: Path) -> Path:
+    clip = folder / "clip.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=60:duration=1",
+                    "-pix_fmt", "yuv420p", str(clip)], check=True)
+    return clip
+
+
+def test_montage(render: bool):
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        motions = tmp / "motions"
+        (motions / "m1" / "V_001").mkdir(parents=True)
+        clip = make_clip(tmp)
+        (motions / "m1" / "V_001" / "render.mp4").write_bytes(clip.read_bytes())
+        spec = {"id": "test-montage", "formats": ["16x9", "9x16", "1x1"], "fit": "cover",
+                "clips": [{"kind": "motion", "motion": "m1"}, {"kind": "file", "path": str(clip), "in": 0.25, "fit": "contain"}]}
+        plan = montage.plan(spec, motions)
+        check("plan is frame exact (60 + 45 frames)", plan["frames"] == 105 and plan["clips"][1]["start_frame"] == 60)
+        check("plan keeps per clip fit", plan["clips"][0]["fit"] == "cover" and plan["clips"][1]["fit"] == "contain")
+        check("plan refuses a bad id (red)", raises(lambda: montage.plan({**spec, "id": "Bad Id"}, motions)))
+        check("plan refuses a relative file (red)", raises(lambda: montage.plan({**spec, "clips": [{"kind": "file", "path": "clip.mp4"}]}, motions)))
+        check("plan refuses an unknown format (red)", raises(lambda: montage.plan({**spec, "formats": ["4x3"]}, motions)))
+        check("plan refuses a missing motion (red)", raises(lambda: montage.plan({**spec, "clips": [{"kind": "motion", "motion": "zz"}]}, motions)))
+        sizes = {}
+        for fmt in plan["formats"]:
+            project = montage.cook(plan, tmp / "out", fmt)
+            page = (project / "index.html").read_text()
+            sizes[fmt] = page.count(f'data-width="{montage.family()["formats"][fmt]["width"]}"')
+            check(f"cook {fmt}: two clips, both muted, envelope sections", page.count("<video") == 2 and page.count(" muted") == 2
+                  and page.count('class="clip env"') == 2)
+            check(f"cook {fmt}: timeline registered and media copied", 'window.__timelines["main"]' in page
+                  and (project / "assets" / "clips" / "clip-01.mp4").exists() and (project / "vendor" / "gsap.min.js").exists())
+        check("one canvas per format", all(v == 1 for v in sizes.values()))
+        if render:
+            from zrmd.render import render as hf_render
+            out = hf_render(tmp / "out" / "9x16", tmp / "9x16.mp4", fps=60)
+            info = montage.probe(out)
+            check(f"render 9x16 is portrait and lasts 1.75 s ({info})", info["width"] == 1080 and info["height"] == 1920
+                  and abs(info["duration"] - 1.75) < 0.05)
+
+
+if __name__ == "__main__":
+    test_paths()
+    test_exposed()
+    test_montage("--render" in sys.argv)
+    print(f"{len(FAILURES)} failure(s)")
+    sys.exit(1 if FAILURES else 0)

@@ -1,0 +1,64 @@
+# 12 October 2026, 10:35 CEST: the exposed parameters of a motion version, the short interface the site may change
+# (at most 8 per category, HDA law). Definitions live in params/exposed.json per recipe family; a key that does not
+# resolve in the version's params is simply not offered. validate() is the single gate used by the CLI before an
+# iteration, so a value outside its bounds never reaches a render.
+# FR : les parametres exposes d'une version, au plus 8 par categorie ; validate() est la porte unique avant une iteration.
+from __future__ import annotations
+
+import json
+import re
+
+from . import settings, versions
+
+FAMILY = settings.REPO / "params" / "exposed.json"
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def definitions() -> dict:
+    data = json.loads(FAMILY.read_text(encoding="utf-8"))
+    cap = data["max_per_category"]
+    for recipe, cats in data["recipes"].items():
+        for cat, items in cats.items():
+            if len(items) > cap:
+                raise ValueError(f"{recipe}.{cat} exposes {len(items)} parameters, above {cap}")
+    return data
+
+
+def exposed_for(params: dict, recipe: str | None) -> dict:
+    """{category: [{key, label, kind, min, max, step, unit, value}]} for the keys that resolve in params."""
+    cats = definitions()["recipes"].get(recipe or "", {})
+    result = {}
+    for cat, items in cats.items():
+        offered = []
+        for item in items:
+            value = versions.get_path(params, item["key"])
+            if value is None:
+                continue
+            offered.append({**item, "value": value})
+        if offered:
+            result[cat] = offered
+    return result
+
+
+def validate(params: dict, recipe: str | None, overrides: dict) -> dict:
+    """Return the overrides coerced to their kind, or raise ValueError naming the first refused key."""
+    allowed = {i["key"]: i for items in exposed_for(params, recipe).values() for i in items}
+    clean = {}
+    for key, value in overrides.items():
+        item = allowed.get(key)
+        if not item:
+            raise ValueError(f"parameter {key!r} is not exposed for recipe {recipe!r}")
+        if item["kind"] == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{key} expects a number")
+            if not item["min"] <= value <= item["max"]:
+                raise ValueError(f"{key}={value} outside [{item['min']}, {item['max']}]")
+        elif item["kind"] == "color":
+            if not isinstance(value, str) or not COLOR_RE.match(value):
+                raise ValueError(f"{key} expects a colour #rrggbb")
+            value = value.lower()
+        elif item["kind"] == "text":
+            if not isinstance(value, str) or not value.strip() or len(value) > item.get("maxLength", 80):
+                raise ValueError(f"{key} expects a non empty text of at most {item.get('maxLength', 80)} characters")
+        clean[key] = value
+    return clean

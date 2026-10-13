@@ -1,0 +1,50 @@
+# 12 October 2026: quick two-way tests of F1 (matcher and creator on a small pool; the full proof is
+# Scripts/VerifyFonts.py over the whole dataset).
+import json
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from zrmd.vector import fontcreate as FC  # noqa: E402
+from zrmd.vector import fontfit as FF  # noqa: E402
+from zrmd.vector import render as R  # noqa: E402
+
+FILES = REPO / "datasets" / "fonts" / "files"
+MONT = str(FILES / "Montserrat" / "Montserrat[wght].ttf")
+ALEX = str(FILES / "Alexandria" / "Alexandria[wght].ttf")
+TEXT = "Hamburg"
+
+
+def _ref():
+    return R.render_text_at(TEXT, MONT, 64.3, (12.4, 64.7), (300, 96), {"wght": 515}, 0.012)
+
+
+def test_matcher_finds_the_family_and_rejects_without_it():
+    ref = _ref()
+    green = FF.match_font(ref, TEXT, files=[MONT, ALEX], top_k=2, workers=2)
+    assert green["best"]["family"] == "Montserrat" and green["match"]
+    assert abs(green["best"]["params"]["axes"]["wght"] - 515) < 6
+    red = FF.match_font(ref, TEXT, files=[ALEX], top_k=1, workers=1)
+    assert not red["match"]
+
+
+def test_build_is_deterministic_and_a_parameter_is_a_variation(tmp_path):
+    base = FC.instance_base(MONT, {"wght": 480}, tmp_path / "b.ttf")
+    names, _, _ = FC.shape_names(str(base), TEXT)
+    P = {"schema": FC.SCHEMA, "date": "12 October 2026", "base": {"file": MONT, "axes": {"wght": 480}},
+         "global": {"weight_units": 0.0, "contrast_units": 0.0, "x_height_scale": 1.0, "overshoot_units": 0.0},
+         "glyphs": {n: {"scale_x": 1.0, "advance_units": 0.0, "offsets": None} for n in dict.fromkeys(names)},
+         "layout": {"text": TEXT, "size": 64.0, "origin": [12.0, 64.0], "tracking_em": 0.0, "deltas": None}}
+    a = FC.build_font(P, tmp_path / "a.ttf", "ZRMD Test")
+    b = FC.build_font(P, tmp_path / "b2.ttf", "ZRMD Test")
+    assert a["sha256"] == b["sha256"]
+    ident = FF.score(R.render_text_at(TEXT, MONT, 64.0, (12.0, 64.0), (300, 96), {"wght": 480}),
+                     FC.render_built(a["file"], P, (300, 96)))
+    assert ident["iou"] > 0.995          # identity parameters rebuild the base
+    V = json.loads(json.dumps(P))
+    V["global"]["weight_units"] = 20.0
+    v = FC.build_font(V, tmp_path / "v.ttf", "ZRMD Test")
+    var = FF.score(FC.render_built(a["file"], P, (300, 96)), FC.render_built(v["file"], V, (300, 96)))
+    assert var["iou"] < 0.95             # a parameter change is a visible variation

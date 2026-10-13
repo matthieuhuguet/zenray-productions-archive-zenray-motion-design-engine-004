@@ -1,0 +1,122 @@
+# 12 October 2026: task M3, per-event timbre deviation for the measured timbre models of sms.py.
+# M2 gives every role one table (the median over all its notes or hits), so the variations from one hit to the next,
+# a harder snare, a bass note whose second harmonic is weaker, a long note that dips, only pass through the level.
+# This module measures, for every event of the score, a small table of dB offsets on coarse bands (bandsPerOct per
+# octave) times a few time segments after the onset, by the same render, measure, correct loop as sms.analyse_stem:
+# each event is rendered alone, its share of our dry stem (Wiener style, band by band) attributes the reference
+# power, and the table moves by step * clip(10 log10(reference share / ours)). The result is numbers on the event in
+# score.json ("dev"); the render reads them in sms.tonal_note and sms.render_drum. No sample of the reference enters a
+# render. Information taken from the reference grows with it (bands x segments per event), counted in the report.
+# Settings: datasets/resynth-params.json, key "eventDev" (HDA interface).
+# FR : ecart de timbre par evenement, mesure par rendu, mesure, correction ; des nombres dans la partition.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from . import sms
+
+
+def _bands(E: dict) -> np.ndarray:
+    return sms.band_centres(E["fMin"], E["fMax"], E["bandsPerOct"])
+
+
+def _band_power(x: np.ndarray, E: dict, sr: int, centres: np.ndarray) -> np.ndarray:
+    W = sms._tri(np.fft.rfftfreq(E["nFft"], 1.0 / sr), centres)
+    return W @ (sms._stft_mag(x, E["nFft"], E["hop"]) ** 2)
+
+
+def segments(ev: dict, kind: str, E: dict) -> list[tuple[float, float]]:
+    """Segment edges after the onset: fixed for a hit; attack, body chunks, then tail after the gate for a note."""
+    if kind == "drum":
+        e = E["drumEdgesS"]
+        return list(zip(e[:-1], e[1:]))
+    g = max(ev.get("dur", 0.0), E["minGateS"])
+    e = [x for x in E["tonalAttackEdgesS"] if x < g]
+    x = e[-1] + E["bodyStepS"]
+    while x < g - 0.5 * E["bodyStepS"]:
+        e.append(x)
+        x += E["bodyStepS"]
+    e.append(g)
+    e += [g + d for d in E["tailEdgesS"]]
+    return list(zip(e[:-1], e[1:]))
+
+
+def render_event(ev: dict, spec: dict, kind: str, P: dict, sr: int, pre_s: float, length_s: float, seed: int) -> np.ndarray:
+    n = int(math.ceil((pre_s + length_s) * sr))
+    e2 = dict(ev, t=pre_s)
+    if kind == "drum":
+        D = {**P["sms"]["drum"], **spec.get("settings", {})}
+        return sms.render_drum([e2], spec["model"], spec["macros"], D, sr, n, seed)
+    T = {**P["sms"]["tonal"], **spec.get("settings", {})}
+    return sms.render_tonal([e2], spec["model"], spec["macros"], T, sr, n, seed)
+
+
+def fit_stem(job: dict) -> dict:
+    """job: stem, P, x (reference stem mono), events {role: [ev with 'i']}, specs {role: spec}, seeds {role: int}, n."""
+    P, x, roles_ev, specs, seeds, n = job["P"], job["x"], job["events"], job["specs"], job["seeds"], job["n"]
+    sr = P["sampleRate"]
+    E = {**P["eventDev"], **P["eventDev"].get("stemSettings", {}).get(job["stem"], {})}
+    c = _bands(E)
+    hop = E["hop"]
+    Bref = _band_power(x, E, sr, c)
+    F = Bref.shape[1]
+    kinds = {r: specs[r]["kind"] for r in roles_ev}
+    nxt = {}
+    for r, evs in roles_ev.items():
+        ts = [e["t"] for e in evs]
+        nxt[r] = [ts[j + 1] if j + 1 < len(ts) else 1e9 for j in range(len(ts))]
+        for e in evs:
+            if not (E.get("resume") and e.get("dev")):  # 12 October 2026 (M3 resume): resume keeps the base tables
+                e["dev"] = None
+    history = []
+    pre = E["preS"]
+    for rnd in range(E["rounds"]):
+        bufs = {r: sms.render_role(specs[r], roles_ev[r], P, n, seeds[r]) for r in roles_ev}
+        Btot = _band_power(sum(bufs.values()), E, sr, c) + 1e-20
+        moved = []
+        for r, evs in roles_ev.items():
+            kind = kinds[r]
+            for j, ev in enumerate(evs):
+                segs = segments(ev, kind, E)
+                L = min(segs[-1][1], max(nxt[r][j] - ev["t"], E["minSpanS"]) + E["capSlackS"]) if E["capAtNext"] else segs[-1][1]
+                j0 = int(math.floor((ev["t"] - pre) * sr / hop))
+                if j0 < 0:
+                    continue
+                pre_e = ev["t"] - j0 * hop / sr
+                y = render_event(ev, specs[r], kind, P, sr, pre_e, L + E["nFft"] / sr, seeds[r] + 7919 * (j + 1))
+                Be = _band_power(y, E, sr, c)
+                k = min(Be.shape[1], F - j0)
+                if k <= 0:
+                    continue
+                Be = Be[:, :k]
+                share = np.clip(Be / Btot[:, j0:j0 + k], 0.0, 1.0)
+                tc = (j0 + np.arange(k)) * hop / sr - ev["t"]  # frame centres after the onset
+                tab = np.asarray(ev["dev"]["db"]) if ev.get("dev") else np.zeros((len(c), len(segs)))
+                if tab.shape != (len(c), len(segs)):  # 12 October 2026 (M3 resume): bands or segments changed
+                    tab = np.zeros((len(c), len(segs)))
+                peak = Be.max() + 1e-30
+                for s_i, (a, b) in enumerate(segs):
+                    f = (tc >= a) & (tc < min(b, L))
+                    if not f.any():
+                        continue
+                    for bi in range(len(c)):
+                        den = float(Be[bi, f].sum())
+                        if den < peak * 10 ** (-E["minEventDb"] / 10.0):
+                            continue
+                        own = float((share[bi, f] * Be[bi, f]).sum()) / den  # power-weighted share of this event
+                        if own < E["shareMin"]:
+                            continue
+                        num = float((share[bi, f] * Bref[bi, j0:j0 + k][f]).sum())
+                        d = 10 * math.log10(max(num, 1e-30) / den)
+                        st = E["step"] * float(np.clip(d, -E["maxStepDb"], E["maxStepDb"]))
+                        tab[bi, s_i] = float(np.clip(tab[bi, s_i] + st, -E["maxTotalDb"], E["maxTotalDb"]))
+                        moved.append(abs(d))
+                cen = [round(0.5 * (a + b), 4) for a, b in segs]
+                ev["dev"] = {"bandsHz": [round(float(v), 2) for v in c], "segS": cen, "db": np.round(tab, 2).tolist()}
+                if kind != "drum":
+                    ev["dev"]["devDur"] = round(max(ev.get("dur", 0.0), E["minGateS"]), 4)
+        history.append({"round": rnd, "meanAbsDb": round(float(np.mean(moved)), 3) if moved else None, "cells": len(moved)})
+    out = {r: [{"i": e.get("i"), "dev": e.get("dev")} for e in evs] for r, evs in roles_ev.items()}
+    return {"stem": job["stem"], "history": history, "events": out}

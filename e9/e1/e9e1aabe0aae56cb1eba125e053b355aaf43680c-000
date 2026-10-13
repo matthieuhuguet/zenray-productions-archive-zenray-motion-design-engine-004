@@ -1,0 +1,816 @@
+{
+ "_doc": "12 October 2026: the single parameter interface of the engine (HDA). Every default lives here once; code reads it through zrmd.settings.get('a.b').",
+ "paths": {
+  "workshop": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design",
+  "refcache": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design-refcache",
+  "python": "/Users/zenray/.venvs/zenray-motion/bin/python",
+  "sfx_params": "{engine}/datasets/sfx-params.json",
+  "sound_out": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design/sound"
+ },
+ "analysis": {
+  "shots": {
+   "width": 160,
+   "height": 90,
+   "baseline_window_s": 1.0,
+   "baseline_floor": 0.004,
+   "ratio_cap": 40.0,
+   "mad_min": 0.015,
+   "chi_min": 0.02,
+   "score_min": 8.0,
+   "peak_radius_s": 0.05,
+   "flash_return_max": 0.05,
+   "flash_luma_jump": 0.15,
+   "dissolve_max_s": 0.5,
+   "dissolve_frame_min": 0.012,
+   "dissolve_total_min": 0.12,
+   "min_shot_s": 0.05,
+   "persist_s": 0.1,
+   "persist_min": 0.02,
+   "spread_grid": [
+    8,
+    6
+   ],
+   "spread_dark": 10.0,
+   "spread_change": 12.0,
+   "spread_min": 0.5,
+   "match_radius": 6,
+   "ecr_min": 0.58
+  },
+  "audio": {
+   "sample_rate": 48000,
+   "hop_ms": 5,
+   "n_fft": 2048,
+   "n_mels": 64,
+   "fmin": 30,
+   "hpss_margin": 2.0,
+   "onset_delta": 0.12,
+   "onset_wait_ms": 40,
+   "peak_search_ms": 80,
+   "decay_db": 30
+  },
+  "layers": {
+   "width": 960,
+   "height": 540,
+   "border_px": 6,
+   "fg_threshold": 18,
+   "min_ink_px": 12,
+   "merge_kernel": [
+    15,
+    5
+   ],
+   "track_iou": 0.3,
+   "track_gap": 3,
+   "min_track_frames": 3
+  },
+  "captions": {
+   "width": 480,
+   "height": 270,
+   "ink_level": 40,
+   "gap_frames": 3,
+   "change_similarity": 0.55,
+   "min_frames": 8
+  },
+  "easefit": {
+   "_doc": "12 October 2026: exact GSAP ease identification (R04 section 5, decisions 1 to 4).",
+   "library": "datasets/eases/eases-gsap-3.14.2.json",
+   "grid": 24,
+   "top_refine": 10,
+   "bic_tie": 2.0,
+   "bic_bezier_margin": 6.0,
+   "bic_back_margin": 2.0,
+   "with_bezier": false,
+   "window_margin_s": 0.25,
+   "snr_high": 30.0,
+   "min_amplitude_rel": 0.0,
+   "rest_ratio": 0.02,
+   "min_rest": 4,
+   "pad": 3,
+   "min_points": 6,
+   "report_max_rms_rel": 0.06,
+   "report_min_snr": 10.0,
+   "report_shaped_min_snr": 30.0
+  },
+  "camera": {
+   "_doc": "12 October 2026: global image motion by similarity (R04 section 3) and 3D probe (R04 section 10).",
+   "width": 480,
+   "max_corners": 800,
+   "quality": 0.005,
+   "min_distance": 6,
+   "block_size": 7,
+   "lk_win": 21,
+   "lk_levels": 4,
+   "fb_max_px": 0.5,
+   "min_points": 24,
+   "ransac_px": 1.0,
+   "moving_px": 0.5,
+   "model_ratio": 0.85,
+   "hom_gain": 0.1,
+   "layers_explained": 0.85,
+   "fun_ratio": 0.85,
+   "hom_max_for_3d": 0.7,
+   "max_layers": 4,
+   "layer_min_points": 12,
+   "static_pairs_fraction": 0.2,
+   "residual_interior": 0.1,
+   "residual_3d": 0.12,
+   "move_min_px": 3.0,
+   "zoom_min": 0.02,
+   "roll_min_deg": 1.0
+  },
+  "bible": {
+   "_doc": "12 October 2026: per-shot graphic bible (zrmd/bible.py). Analysis frames are decoded once per shot at width x sample_fps.",
+   "width": 480,
+   "sample_fps": 30.0,
+   "max_frames": 540,
+   "palette_frames": 8,
+   "palette_k": 8,
+   "palette_pixels": 24000,
+   "palette_merge_de": 2.0,
+   "palette_min_share": 0.02,
+   "border_frac": 0.04,
+   "accent_chroma": 30.0,
+   "accent_max_share": 0.15,
+   "text_match_de": 6.0,
+   "flat_std": 3.0,
+   "local_window": 5,
+   "family": {
+    "montage_max_s": 0.5,
+    "textcard_flat": 0.9,
+    "graphic_flat": 0.45,
+    "plate_3d_classes": [
+     "card_perspective",
+     "parallax_2_5d",
+     "rigid_3d",
+     "layer_2d_lit",
+     "complex"
+    ],
+    "textcard_cover": 0.75,
+    "graphic_entropy": 3.6,
+    "graphic_flat_strong": 0.85,
+    "graphic_cover": 0.2,
+    "_calibration": "12 October 2026: grid search against 755 eye-labelled shots of the 12 references, 88.9 % agreement before, 89.9 % after (in-sample)."
+   },
+   "elements": {
+    "max_tracks": 3,
+    "max_box_area": 0.6,
+    "min_frames": 5,
+    "min_move_pct": 0.6,
+    "min_scale": 0.04,
+    "min_opacity": 0.15
+   },
+   "text": {
+    "height": 1080,
+    "min_h": 0.008,
+    "max_h": 0.22,
+    "min_aspect": 1.2,
+    "max_lines": 4,
+    "pad": 0.25,
+    "fg_threshold": 24
+   },
+   "transition": {
+    "dark_luma": 0.05,
+    "bright_luma": 0.92,
+    "edge_frames": 3,
+    "same_bg_de": 5.0
+   },
+   "phases": {
+    "shot_min_s": 4.0,
+    "min_s": 1.0,
+    "change": 0.1,
+    "max": 12,
+    "grid": [
+     32,
+     18
+    ]
+   },
+   "thumbs": {
+    "width": 480,
+    "quality": 82
+   },
+   "review_snap_s": 0.3,
+   "fontmatch_weak_score": 0.6
+  },
+  "sound": {
+   "_doc": "12 October 2026: reference soundtrack summary for the bible (events.py transients plus a swell detector after R03 SegmentTest).",
+   "swell_band_hz": [
+    300,
+    10000
+   ],
+   "swell_median_s": 2.0,
+   "swell_excess": 1.5,
+   "swell_vertical": 9,
+   "swell_smooth": 25,
+   "swell_delta_db": 8.0,
+   "swell_pre_s": 0.3,
+   "swell_avg_s": 1.5,
+   "swell_wait_s": 0.75,
+   "swell_onset_frac": 0.15,
+   "hop": 240,
+   "main_events": 12,
+   "sync_tolerance_s": 0.05,
+   "section_smooth_s": 2.0,
+   "section_jump_db": 4.0,
+   "section_min_s": 3.0,
+   "impact_low_hz": 300.0,
+   "click_high_hz": 3000.0,
+   "click_max_s": 0.08,
+   "noise_flatness": 0.3,
+   "swell_min_rise_s": 0.2
+  }
+ },
+ "shaders": {
+  "_doc": "12 October 2026: procedural shader bank (datasets/shaders). verify_mean_max is the mean absolute error in 8-bit levels allowed between GLSL and its numpy twin; browser_gpu auto|on|off picks hardware capture or SwiftShader for stills.",
+  "bank": "{engine}/datasets/shaders",
+  "verify_size": 256,
+  "verify_random_sets": 2,
+  "verify_seed": 20261012,
+  "verify_mean_max": 2.0,
+  "still_fps": 30,
+  "still_timeout_ms": 10000,
+  "browser_gpu": "auto",
+  "thumb_size": 128,
+  "verify_outlier_levels": 8.0,
+  "verify_outlier_share_max": 0.001,
+  "_doc_outliers": "12 October 2026 (S4): a block is also red when more than verify_outlier_share_max of the pixels of a case differ by more than verify_outlier_levels 8-bit levels in their worst channel."
+ },
+ "vector": {
+  "_doc": "12 October 2026: F0 vector harness (zrmd.vector). render: rasteriser defaults; metrics: measurement defaults; verify: match thresholds and the cases of Scripts/VerifyVector.py.",
+  "render": {
+   "pad_px": 16,
+   "antialias": true,
+   "path_digits": 3,
+   "svg_shape_rendering": "geometric_precision",
+   "svg_engine": "skia",
+   "subunit_scale": 64
+  },
+  "metrics": {
+   "ink_threshold": 0.5,
+   "align": "ink_box",
+   "edge_threshold": 0.5,
+   "stroke_min_px": 0.5,
+   "profile_gap_cols": 1,
+   "terminal_walk_px": 6
+  },
+  "verify": {
+   "workers": 16,
+   "iou_min": 0.995,
+   "edge_mean_max_px": 0.05,
+   "edge_p95_max_px": 0.5,
+   "text": "Hamburgefonstiv",
+   "size_px": 96,
+   "cases_font": "Inter",
+   "alt_font": "Archivo",
+   "weight": 400,
+   "wrong_weight": 500,
+   "wrong_size_px": 100,
+   "kerning_text": "AVATAR To",
+   "kerning_max_err_px": 1.0,
+   "cross_renderer": {
+    "iou_min": 0.98,
+    "edge_mean_max_px": 0.15,
+    "edge_p95_max_px": 1.0
+   }
+  },
+  "features": {
+   "_doc": "12 October 2026: F1 font feature records (zrmd.vector.features, Scripts/BuildFontFeatures.py).",
+   "specimen": "Hamburgefonstiv",
+   "specimen_px": 96,
+   "glyph_px": 200,
+   "location_wght": 400,
+   "coverage_text": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+   "width_chars": "abcdefghijklmnopqrstuvwxyzHOn0",
+   "stem_wghts": [
+    100,
+    200,
+    300,
+    400,
+    500,
+    600,
+    700,
+    800,
+    900
+   ],
+   "aperture_rays": 360,
+   "e_centre_y": 0.72,
+   "stress_rays": 36,
+   "signature": {
+    "aspect_span": 0.35,
+    "aperture_span": 0.6,
+    "tilt_gain": 3.0,
+    "min": 0.15,
+    "margin": 0.1
+   },
+   "vector": [
+    "declared.x_height",
+    "declared.cap_height",
+    "ink.x_height",
+    "stroke.p50_em",
+    "stroke.contrast",
+    "mean_lower_advance_em",
+    "specimen_width_em",
+    "aperture.c",
+    "aperture.e",
+    "o.aspect",
+    "o.stress_ratio"
+   ],
+   "workers": 16,
+   "min_families": 400
+  },
+  "fit": {
+   "_doc": "12 October 2026: F1 font matcher (zrmd.vector.fontfit). loss = (1 - soft IoU) + w_edge * mean chamfer px.",
+   "workers": 16,
+   "probe_size_px": 100,
+   "coarse_iters": 3,
+   "top_k": 8,
+   "report_coarse": 20,
+   "fit_axes": [
+    "wght",
+    "wdth",
+    "opsz",
+    "slnt"
+   ],
+   "w_edge": 0.01,
+   "step_size_rel": 0.02,
+   "step_origin_px": 0.5,
+   "step_tracking_em": 0.005,
+   "step_axis_rel": 0.05,
+   "nm_max_evals": 160,
+   "nm_xatol": 0.002,
+   "match": {
+    "iou_min": 0.99,
+    "edge_mean_max_px": 0.3
+   },
+   "sigmas": [
+    4.0,
+    2.0
+   ],
+   "lsq_sigmas": [
+    1.5,
+    0.7
+   ],
+   "lsq_max_nfev": 40,
+   "lsq_h": 0.3,
+   "lsq_delta_unit_em": 0.002,
+   "lsq_delta_ridge": 0.002,
+   "lsq_tol": 1e-12,
+   "lsq_h_delta_em": 0.003,
+   "alt_rounds": 3,
+   "axis_frac": 0.08,
+   "axis_xatol": 0.05,
+   "axis_iters": 20,
+   "lsq_x_scale": 1.0,
+   "shift_h_px": 0.25,
+   "shift_bound_em": 0.08,
+   "coarse_grid_axes": [
+    "wdth",
+    "opsz"
+   ],
+   "coarse_grid_n": 7,
+   "axis_nm_evals": 30,
+   "polish": {
+    "_doc": "12 October 2026: profiled axis polish of the best fits (fontfit.polish_axes): each axis location gets its own placement refit.",
+    "top": 1,
+    "always": true,
+    "levels": 3,
+    "grid_n": 5,
+    "span_frac": 0.06,
+    "shrink": 3.0,
+    "rounds": 1,
+    "final_rounds": 3
+   }
+  },
+  "trace": {
+   "_doc": "12 October 2026: F2 raster-to-vector and 2D asset creator (zrmd.vector.trace, primitives, asset). Levels are 0..255 sRGB, distances in pixels.",
+   "assets_dir": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design/assets2d",
+   "raster_ss": 4,
+   "_doc_raster_ss": "12 October 2026: reference rasteriser of F2, used for the fidelity render, the final polish of every fit and the synthetic verify sources: draw ss times larger and box-average. Skia at 1x under-covers curved strokes (a width 10 cubic: exact area 1664.18 px, 1x 1657.2, 4x 1662.9), which no geometry can match.",
+   "workers": 16,
+   "smooth_step": 10,
+   "min_region_px": 12,
+   "aa_window": 3,
+   "aa_mix_tol": 14,
+   "model_max_px": 20000,
+   "flat_rms_max": 2.5,
+   "gradient_rms_max": 3.0,
+   "gradient_stops_max": 16,
+   "stop_simplify_levels": 1.0,
+   "containment_min": 0.9,
+   "background_border_share": 0.5,
+   "occlusion_extend_px": 3,
+   "band_px": 3,
+   "min_edge_contrast": 12,
+   "blur_band_px": 12,
+   "blur_min_sigma": 0.6,
+   "aa_sigma": 0.35,
+   "contour_min_area": 3.0,
+   "resample_px": 0.5,
+   "corner_span_px": 2.5,
+   "corner_deg": 50,
+   "fit_error_px": 0.3,
+   "fit_max_iter": 4,
+   "path_digits": 3,
+   "crop_margin_px": 6,
+   "refine": {
+    "band_px": 3,
+    "max_nfev": 40,
+    "stages": [
+     [
+      4,
+      0.5
+     ],
+     [
+      4,
+      0.2
+     ],
+     [
+      4,
+      0.05
+     ],
+     [
+      4,
+      0.1
+     ]
+    ],
+    "compass_steps": [
+     0.1,
+     0.05,
+     0.02
+    ],
+    "compass_sweeps": 2
+   },
+   "primitives": {
+    "enabled": true,
+    "order": [
+     "circle",
+     "ellipse",
+     "rect",
+     "rounded_rect",
+     "line",
+     "arc",
+     "polyline",
+     "stroke_path"
+    ],
+    "iou_min": 0.995,
+    "edge_mean_max_px": 0.15,
+    "solidity_min": 0.85,
+    "thin_ratio": 3.0,
+    "spur_ratio": 0.8,
+    "skeleton_fit_error_px": 0.6,
+    "caps": [
+     "round",
+     "butt",
+     "square"
+    ],
+    "max_nfev": 60,
+    "radius_starts": [
+     0.08,
+     0.2,
+     0.35
+    ],
+    "compass_steps": [
+     0.5,
+     0.25,
+     0.1,
+     0.05,
+     0.02,
+     0.01
+    ],
+    "stages": [
+     [
+      4,
+      0.5
+     ],
+     [
+      4,
+      0.2
+     ],
+     [
+      4,
+      0.05
+     ],
+     [
+      4,
+      0.1
+     ]
+    ],
+    "polyline_tol_px": 1.0,
+    "polyline_max_vertices": 8,
+    "polyline_tol_width": [
+     0.5,
+     0.25
+    ]
+   },
+   "fidelity": {
+    "iou_min": 0.99,
+    "edge_mean_max_px": 0.5,
+    "colour_mae_max": 2.0,
+    "colour_p99_max": 24
+   },
+   "verify": {
+    "cases": "{engine}/datasets/vector/synthetic-svg-cases.json",
+    "iou_min": 0.995,
+    "edge_mean_max_px": 0.5,
+    "colour_mae_max": 1.5,
+    "shift_px": 1.0,
+    "blur_tol": 0.15
+   },
+   "hole_rms_max": 3.0,
+   "large_region_px": 40,
+   "core_depth_px": 6,
+   "gradient_core_px": 1.5,
+   "quad_max_err_px": 0.1,
+   "path_iou_goal": 0.997,
+   "_doc_quadratic": "12 October 2026: a free path is refined as cubics, and also as quadratics (cu2qu within quad_max_err_px) when the cubic form stays under path_iou_goal; the higher soft IoU wins.",
+   "_doc_stages": "12 October 2026: the last least-squares stage of refine.stages and primitives.stages runs at 4x (was 1x) so every stage and the polish share the reference rasteriser raster_ss."
+  },
+  "create": {
+   "_doc": "12 October 2026: F1 parametric font creator (zrmd.vector.fontcreate).",
+   "head_timestamp": 3843216000,
+   "overshoot_band_em": 0.03,
+   "sigma": 1.0,
+   "global_h": 1.0,
+   "global_nfev": 40,
+   "spacing_nfev": 30,
+   "snap_iters": 60,
+   "snap_damping": 0.6,
+   "snap_min_damping": 0.02,
+   "smooth_passes": 2,
+   "smooth_lambda": 0.5,
+   "snap_max_step_em": 0.01,
+   "out_dir": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design/fonts",
+   "global_unit_px": 0.25,
+   "strip_half_px": 2.0,
+   "strip_step_px": 0.5,
+   "snap_off_gain": 1.0,
+   "fit_axes": [
+    "wght",
+    "wdth"
+   ],
+   "axis_span": 0.12,
+   "axis_grid": 16,
+   "axis_levels": 2,
+   "workers": 16,
+   "starts": 3,
+   "_doc_starts": "12 October 2026: create_font runs the creator from the first N distinct matcher families and keeps the best.",
+   "layout_rounds": 3,
+   "_doc_layout_rounds": "12 October 2026: rounds of spacing then globals (with line size) in fontcreate._fit_at.",
+   "layout_sigmas": [
+    6.0,
+    3.0,
+    1.0
+   ],
+   "_doc_layout_sigmas": "12 October 2026: blur sigma (px) of each layout round of fontcreate._fit_at, coarse to fine; the last value repeats.",
+   "size_starts": [
+    0.97,
+    0.98,
+    0.99,
+    1.0,
+    1.01
+   ],
+   "_doc_size_starts": "12 October 2026: line size factors tried as starts of the first layout round (tracking compensated so the line length is kept); measured on the verifier target at the true wght: one start 0.949, five starts 0.9935."
+  },
+  "verify_fonts": {
+   "_doc": "12 October 2026: cases of Scripts/VerifyFonts.py (F1). Every reference is rendered from a known free font.",
+   "tolerance": {
+    "size_rel": 0.004,
+    "axis_units": 6.0
+   },
+   "matcher_cases": [
+    {
+     "name": "Montserrat wght 537, tracking, one glyph delta",
+     "family": "Montserrat",
+     "text": "Hamburgefonstiv",
+     "size": 83.4,
+     "axes": {
+      "wght": 537
+     },
+     "tracking_em": 0.021,
+     "deltas": {
+      "3": 1.3
+     },
+     "origin": [
+      20.37,
+      90.61
+     ],
+     "canvas": [
+      820,
+      140
+     ]
+    },
+    {
+     "name": "Open Sans wdth 87 wght 610",
+     "family": "Open Sans",
+     "text": "Vexing Quorums",
+     "size": 61.7,
+     "axes": {
+      "wdth": 87,
+      "wght": 610
+     },
+     "tracking_em": -0.012,
+     "origin": [
+      14.62,
+      70.18
+     ],
+     "canvas": [
+      560,
+      104
+     ]
+    },
+    {
+     "name": "Source Serif 4 opsz 30 wght 420",
+     "family": "Source Serif 4",
+     "text": "Gracefully Kept",
+     "size": 70.2,
+     "axes": {
+      "opsz": 30,
+      "wght": 420
+     },
+     "tracking_em": 0.0,
+     "origin": [
+      12.4,
+      74.9
+     ],
+     "canvas": [
+      580,
+      116
+     ]
+    },
+    {
+     "name": "Lato Regular (static)",
+     "family": "Lato",
+     "file_hint": "Lato-Regular",
+     "text": "Studio Wave",
+     "size": 77.0,
+     "axes": {},
+     "tracking_em": 0.035,
+     "origin": [
+      16.3,
+      80.55
+     ],
+     "canvas": [
+      520,
+      124
+     ]
+    }
+   ],
+   "red_exclude": [
+    "Montserrat",
+    "Montserrat Underline"
+   ],
+   "creator": {
+    "family": "Montserrat",
+    "axes": {
+     "wght": 480
+    },
+    "text": "Hamburgefonstiv",
+    "size": 90.0,
+    "origin": [
+     18.3,
+     95.4
+    ],
+    "canvas": [
+     860,
+     150
+    ],
+    "tracking_em": 0.01,
+    "global": {
+     "weight_units": 9.0,
+     "contrast_units": 5.0,
+     "x_height_scale": 1.05,
+     "overshoot_units": 6.0
+    },
+    "advance_units": {
+     "a": 25.0
+    }
+   },
+   "variation_weight_units": 20.0,
+   "work_dir": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design/fonts/_verify"
+  },
+  "marks": {
+   "_doc": "12 October 2026: F3 marks (zrmd.vector.marks, Scripts/F3Marks.py). extract: frame choice; coverage: alpha matting of light text over a local background; fit: one-file text fitting loop; match: rule for IoU 0.99.",
+   "extract": {
+    "fps": 30,
+    "tophat_px": 41,
+    "motion_weight": 1.0
+   },
+   "coverage": {
+    "background_px": 41,
+    "background_smooth_px": 3.0,
+    "ink_percentile": 99.0,
+    "residual_max": 28.0,
+    "occluder_dilate_px": 3,
+    "crop_margin_px": 12,
+    "min_contrast": 0.35,
+    "noise_floor_percentile": 97.0,
+    "noise_floor_distance_px": 6,
+    "band_frac": 0.1,
+    "extent_tol": 0.6,
+    "ink_bin_px": 60,
+    "ink_core_percentile": 95.0,
+    "max_width_band": 3.0,
+    "stray_gap_px": 3,
+    "stray_level": 0.15,
+    "min_thick_frac": 0.45,
+    "max_gap_band": 1.5
+   },
+   "fit": {
+    "probe_size_px": 100,
+    "fit_axes": [
+     "wght",
+     "wdth",
+     "opsz"
+    ],
+    "axis_start": {
+     "wght": 400,
+     "wdth": 100,
+     "opsz": 14
+    },
+    "step_size_rel": 0.01,
+    "step_origin_px": 0.5,
+    "step_tracking_em": 0.003,
+    "step_blur_px": 0.2,
+    "step_axis_rel": 0.03,
+    "blur_start_px": 0.5,
+    "sigmas": [
+     2.0,
+     0.8,
+     0.0
+    ],
+    "nm_max_evals": [
+     220,
+     220,
+     260
+    ],
+    "nm_xatol": 0.01,
+    "nm_polish_evals": 160,
+    "delta_rounds": 2,
+    "delta_unit_px": 0.25,
+    "delta_ridge": 0.5,
+    "delta_h": 0.4,
+    "delta_max_nfev": 40,
+    "polish_simplex": 0.3,
+    "wght_starts": [
+     350,
+     500,
+     650,
+     800
+    ],
+    "blur_max_px": 1.5,
+    "align_tracking_grid": [
+     -0.03,
+     -0.015,
+     0.0,
+     0.015,
+     0.03
+    ],
+    "align_step_px": 1,
+    "size_factors": [
+     0.72,
+     0.78,
+     0.84,
+     0.9,
+     0.95,
+     1.0,
+     1.05,
+     1.1,
+     1.18
+    ]
+   },
+   "match": {
+    "iou_min": 0.99,
+    "edge_mean_max_px": 0.3
+   },
+   "workers": 16,
+   "create_overrides": {
+    "_doc": "12 October 2026: F3 overrides of vector.create for marks (F1 defaults unchanged): longer edge snapping.",
+    "snap_iters": 200,
+    "snap_min_damping": 0.002,
+    "snap_max_step_em": 0.02
+   }
+  }
+ },
+ "marks2d": {
+  "_doc": "12 October 2026: F3, 1:1 reproduction of the texts and 2D marks of a reference (Scripts/Reproduce2D.py). Private benchmark: every 1:1 version is rights private-1to1; only variations may be published after rights validation.",
+  "spec": "{engine}/datasets/marks/onekey-pro-2.json",
+  "motions_dir": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design/motions",
+  "cache_dir": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design-refcache/onekey-pro-2/f3",
+  "workers": 16,
+  "_doc_coverage": "12 October 2026: ink coverage = (luma - grey opening of luma) / ink level; the opening is k = open_factor * stroke p90 (first pass open_first_px), the ink level the p99.7 of the difference, the floor noise_floor_rel of it.",
+  "open_first_px": 41,
+  "open_factor": 3.0,
+  "open_min_px": 9,
+  "ink_percentile": 99.7,
+  "noise_floor_rel": 0.04,
+  "occluder_em_rounds": 1,
+  "target": {
+   "iou_min": 0.99,
+   "edge_mean_max_px": 0.3,
+   "de2000_max": 2.0
+  },
+  "fit_overrides": {},
+  "retry_overrides": {
+   "top_k": 16,
+   "alt_rounds": 4
+  }
+ }
+}

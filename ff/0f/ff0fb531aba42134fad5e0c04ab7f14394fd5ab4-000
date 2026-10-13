@@ -1,0 +1,868 @@
+# 12 October 2026: graphic bible of a reference video (B2). For every shot found by zrmd.analyze.shots.detect:
+# family (text card, graphic, plate 3D or footage, montage), palette and colour roles in CIEDE2000, global camera
+# motion and 3D probe (zrmd.analyze.camera), tracked elements and their exact GSAP eases (zrmd.analyze.easefit through
+# curves.fit_track_exact), typography of the text lines (zrmd.analyze.typography, optional font match), transition
+# into the shot, phases inside long shots, and the sound events that fall in it (zrmd.audio.summary).
+# Rights: only numbers leave this module. Storyboard thumbnails are written to the local reference cache, never to the
+# workshop; text read by OCR for the font match stays in memory.
+# FR : bible graphique d'une reference, plan par plan ; seuls des nombres sortent, les vignettes restent dans le cache.
+from __future__ import annotations
+
+import json
+import math
+import subprocess
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image
+from skimage.color import deltaE_ciede2000, lab2rgb, rgb2lab
+
+from . import settings
+from .analyze import camera, layers, typography
+from .media import iter_frames, probe
+
+DATE = "12 October 2026"
+WORKSHOP = settings.path("workshop")
+REFERENCES = WORKSHOP / "references"
+CACHE = settings.path("refcache")
+FAMILY_FR = {"textcard": "carte texte", "graphic": "graphique", "plate": "plaque 3D ou prise de vue", "montage": "montage"}
+
+
+def cfg_default() -> dict:
+    return settings.get("analysis.bible")
+
+
+# ------------------------------------------------------------------ reference files
+def reference(slug: str) -> tuple[dict, Path]:
+    meta = json.loads((REFERENCES / slug / "reference.json").read_text(encoding="utf-8"))
+    return meta, CACHE / slug / meta["file_name"]
+
+
+def thumbs_dir(slug: str) -> Path:
+    return CACHE / slug / "storyboard"
+
+
+def detect_shots(slug: str, video: Path, force: bool = False) -> dict:
+    """shots.json (contract 4.1) plus the luma curve kept beside it for transitions."""
+    from .analyze import shots
+    target = REFERENCES / slug / "analysis" / "shots.json"
+    curves_path = REFERENCES / slug / "analysis" / "shots-curves.json"
+    if target.exists() and curves_path.exists() and not force:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        data["curves"] = json.loads(curves_path.read_text(encoding="utf-8"))
+        return data
+    result = shots.detect(str(video))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({k: v for k, v in result.items() if k != "curves"}, indent=1, default=float) + "\n",
+                      encoding="utf-8")
+    curves_path.write_text(json.dumps(result["curves"], default=float) + "\n", encoding="utf-8")
+    return result
+
+
+# ------------------------------------------------------------------ eye review (12 October 2026)
+# references/<slug>/review.json is written by a person who looked at the contact sheets: cuts the detector missed
+# ("add_cuts", seconds plus a kind), false cuts ("remove_cuts"), and per-shot entries keyed by a time inside the shot
+# (paraphrased description, content family, plate kind). An added cut snaps to the frame of largest luma difference
+# within review_snap_s; everything from the review is marked as such in bible.json, next to the measured values.
+def load_review(slug: str) -> dict:
+    p = REFERENCES / slug / "review.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def apply_cuts(det: dict, review: dict, snap_s: float) -> dict:
+    fps = det["fps"]
+    mad = det["curves"]["mad"]
+    n = len(mad)
+    cuts = [dict(c, source="detector") for c in det["cuts"]]
+    for r in review.get("remove_cuts", []):
+        t = r["t"] if isinstance(r, dict) else r
+        near = [c for c in cuts if abs(c["t"] - t) <= snap_s]
+        if near:
+            cuts.remove(min(near, key=lambda c: abs(c["t"] - t)))
+    for r in review.get("add_cuts", []):
+        t = r["t"] if isinstance(r, dict) else r
+        lo, hi = max(1, int((t - snap_s) * fps)), min(n - 1, int((t + snap_s) * fps) + 1)
+        # The nearest local maximum of the luma difference (+-2 frames) to the eye time, not the window maximum,
+        # so that a dense montage does not snap two eye cuts onto the same neighbouring peak.
+        # Frames next to an existing cut are left out, so a strong neighbouring cut neither wins nor hides the eye cut.
+        free = [i for i in range(lo, hi) if all(abs(i - c["frame"]) > 2 for c in cuts)]
+        top = max((mad[i] for i in free), default=0.0)
+        peaks = [i for i in free if mad[i] >= max(mad[max(0, i - 2):i + 3]) and mad[i] >= 0.3 * top]
+        f = min(peaks, key=lambda i: abs(i - t * fps)) if peaks else int(round(t * fps))
+        if any(abs(c["frame"] - f) <= 2 for c in cuts):
+            continue
+        cuts.append({"frame": f, "t": f / fps, "kind": (r.get("kind") if isinstance(r, dict) else None) or "hard",
+                     "source": "review", "eye_t": t})
+    cuts.sort(key=lambda c: c["frame"])
+    bounds = [0] + [c["frame"] for c in cuts if c["kind"] != "flash"] + [det["frames"]]
+    shots_out = []
+    for k in range(len(bounds) - 1):
+        a, b = bounds[k], bounds[k + 1]
+        if b <= a:
+            continue
+        entry = next((c for c in cuts if c["frame"] == a), None)
+        shots_out.append({"id": f"S{len(shots_out) + 1:02d}", "start_frame": a, "end_frame": b, "start": a / fps,
+                          "end": b / fps, "duration": (b - a) / fps, "enter": entry["kind"] if entry else "start",
+                          "cut_source": entry["source"] if entry else "start"})
+    return dict(det, cuts=cuts, shots=shots_out)
+
+
+def apply_shot_review(shots: list[dict], review: dict, cfg: dict) -> list[dict]:
+    """Attach eye entries to the shot that contains their time; returns the entries that matched nothing."""
+    unmatched = []
+    for e in review.get("shots", []):
+        s = next((x for x in shots if x["start"] - 1e-6 <= e["t"] < x["end"]), None)
+        if s is None:
+            unmatched.append(e)
+            continue
+        if e.get("text"):
+            s["description"] = e["text"]
+        if e.get("content"):
+            s["content_measured"], s["family_measured"], s["plate_kind_measured"] = s["content"], s["family"], s.get("plate_kind")
+            s["content"] = e["content"]
+            s["plate_kind"] = e.get("plate_kind") if e["content"] == "plate" else None
+            s["family"] = "montage" if s["duration"] < cfg["family"]["montage_max_s"] else e["content"]
+        s["eye_reviewed"] = True
+    return unmatched
+
+
+# ------------------------------------------------------------------ colour
+def to_lab(rgb_u8: np.ndarray) -> np.ndarray:
+    return rgb2lab(np.asarray(rgb_u8, np.float64).reshape(-1, 1, 3) / 255.0).reshape(-1, 3)
+
+
+def lab_hex(lab) -> str:
+    rgb = np.clip(lab2rgb(np.asarray(lab, np.float64).reshape(1, 1, 3)).reshape(3), 0, 1)
+    return "#" + "".join(f"{int(round(c * 255)):02x}" for c in rgb)
+
+
+def de00(a, b) -> float:
+    return float(deltaE_ciede2000(np.asarray(a, np.float64).reshape(1, 1, 3), np.asarray(b, np.float64).reshape(1, 1, 3))[0, 0])
+
+
+def merge_clusters(centres: np.ndarray, shares: np.ndarray, merge_de: float) -> list[dict]:
+    order = np.argsort(-shares)
+    kept: list[dict] = []
+    for i in order:
+        c, s = centres[i], float(shares[i])
+        for k in kept:
+            if de00(k["lab"], c) < merge_de:
+                tot = k["share"] + s
+                k["lab"] = (np.asarray(k["lab"]) * k["share"] + c * s) / tot
+                k["share"] = tot
+                break
+        else:
+            kept.append({"lab": np.asarray(c, np.float64), "share": s})
+    return kept
+
+
+def palette(frames: list[np.ndarray], cfg: dict) -> dict:
+    """Lab k-means palette over sampled frames, merged under palette_merge_de, with the border colour statistics."""
+    rng = np.random.default_rng(0)
+    pix, border = [], []
+    for f in frames:
+        h, w = f.shape[:2]
+        flat = f.reshape(-1, 3)
+        take = rng.choice(len(flat), size=min(len(flat), cfg["palette_pixels"] // max(len(frames), 1)), replace=False)
+        pix.append(flat[take])
+        b = max(1, int(cfg["border_frac"] * min(h, w)))
+        border.append(np.concatenate([f[:b].reshape(-1, 3), f[-b:].reshape(-1, 3), f[:, :b].reshape(-1, 3),
+                                      f[:, -b:].reshape(-1, 3)]))
+    lab = to_lab(np.concatenate(pix)).astype(np.float32)
+    k = min(cfg["palette_k"], len(lab))
+    cv2.setRNGSeed(0)
+    _, labels, centres = cv2.kmeans(lab, k, None, (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 40, 0.2), 3,
+                                    cv2.KMEANS_PP_CENTERS)
+    shares = np.bincount(labels.ravel(), minlength=k) / len(labels)
+    colours = [c for c in merge_clusters(centres.astype(np.float64), shares, cfg["palette_merge_de"])
+               if c["share"] >= cfg["palette_min_share"]]
+    border_lab = to_lab(np.concatenate(border)[:: 7])
+    # Background = the palette colour that most border pixels are closest to (Euclidean Lab for speed, CIEDE2000 report).
+    centre_arr = np.array([c["lab"] for c in colours])
+    nearest = np.argmin(((border_lab[:, None, :] - centre_arr[None]) ** 2).sum(-1), axis=1)
+    bg_index = int(np.bincount(nearest, minlength=len(colours)).argmax())
+    for i, c in enumerate(colours):
+        L, a, b = c["lab"]
+        c.update({"hex": lab_hex(c["lab"]), "chroma": round(float(math.hypot(a, b)), 1), "share": round(c["share"], 4),
+                  "lab": [round(float(v), 2) for v in c["lab"]], "role": "background" if i == bg_index else None})
+    border_std = float(np.mean(np.std(border_lab, axis=0)))
+    return {"colours": colours, "border_lab_std": round(border_std, 2), "background_hex": colours[bg_index]["hex"]}
+
+
+def assign_roles(pal: dict, text_rgb: list[list[float]], cfg: dict) -> dict:
+    colours = pal["colours"]
+    roles = {"background": pal["background_hex"]}
+    if text_rgb:
+        t_lab = to_lab(np.array(text_rgb, np.float64)).mean(axis=0)
+        best = min(colours, key=lambda c: de00(c["lab"], t_lab))
+        if de00(best["lab"], t_lab) <= cfg["text_match_de"] and best["role"] is None:
+            best["role"] = "text"
+            roles["text"] = best["hex"]
+        else:
+            roles["text"] = lab_hex(t_lab)
+    rest = [c for c in colours if c["role"] is None]
+    accents = [c for c in rest if c["chroma"] >= cfg["accent_chroma"] and c["share"] <= cfg["accent_max_share"]]
+    if accents:
+        acc = max(accents, key=lambda c: c["chroma"])
+        acc["role"] = "accent"
+        roles["accent"] = acc["hex"]
+    for c in colours:
+        if c["role"] is None:
+            c["role"] = "secondary"
+    roles["secondary"] = [c["hex"] for c in colours if c["role"] == "secondary"]
+    return roles
+
+
+# ------------------------------------------------------------------ picture features and family
+def picture_features(frames: list[np.ndarray], cfg: dict, text_boxes: list[list] | None = None) -> dict:
+    """12 October 2026: flat share, texture, colourfulness, edges, plus two cues that separate a text card from a
+    product render on a flat background: text_cover (share of the non-flat pixels inside text-like boxes) and
+    nonflat_entropy (bits of the gray histogram of the non-flat pixels: low for flat vector shapes, high for shading)."""
+    flat, texture, colourful, edges, cover, ent = [], [], [], [], [], []
+    win = cfg["local_window"]
+    for i, f in enumerate(frames):
+        g = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        m = cv2.blur(g, (win, win))
+        sd = np.sqrt(np.maximum(cv2.blur(g * g, (win, win)) - m * m, 0))
+        flat.append(float((sd < cfg["flat_std"]).mean()))
+        texture.append(float(np.median(sd)))
+        nf = sd >= cfg["flat_std"]
+        nf_g = cv2.dilate(nf.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        if nf_g.sum() >= 50:
+            vals = g[nf_g]
+            hist = np.bincount(np.clip(vals / 8, 0, 31).astype(int), minlength=32).astype(float)
+            hist /= hist.sum()
+            ent.append(float(-(hist[hist > 0] * np.log2(hist[hist > 0])).sum()))
+            if text_boxes is not None:
+                inside = np.zeros_like(nf)
+                for (x, y, bw, bh) in text_boxes[i]:
+                    inside[y:y + bh, x:x + bw] = True
+                cover.append(float((nf & inside).sum() / max(nf.sum(), 1)))
+        r, gg, b = [f[..., i].astype(np.float32) for i in range(3)]
+        rg, yb = r - gg, 0.5 * (r + gg) - b
+        colourful.append(float(np.hypot(rg.std(), yb.std()) + 0.3 * np.hypot(rg.mean(), yb.mean())))
+        edges.append(float((cv2.Canny(g.astype(np.uint8), 60, 160) > 0).mean()))
+    return {"text_cover": round(float(np.median(cover)), 3) if cover else 0.0,
+            "nonflat_entropy": round(float(np.median(ent)), 2) if ent else 0.0,
+            "flat_share": round(float(np.median(flat)), 3), "texture": round(float(np.median(texture)), 2),
+            "colourfulness": round(float(np.median(colourful)), 1), "edge_density": round(float(np.median(edges)), 4)}
+
+
+def classify_family(duration: float, feat: dict, ink_share: float, text_lines: int, probe_class: str, cfg: dict) -> dict:
+    fc = cfg["family"]
+    content = "plate"
+    if feat["flat_share"] >= fc["textcard_flat"] and text_lines >= 1 and feat["text_cover"] >= fc["textcard_cover"]:
+        content = "textcard"
+    elif feat["flat_share"] >= fc["graphic_flat"] and feat["nonflat_entropy"] <= fc["graphic_entropy"]:
+        content = "graphic"
+    elif feat["flat_share"] >= fc["graphic_flat_strong"] and feat["text_cover"] >= fc["graphic_cover"]:
+        content = "graphic"
+    family = "montage" if duration < fc["montage_max_s"] else content
+    plate_kind = None
+    if content == "plate":
+        plate_kind = "3d" if probe_class in fc["plate_3d_classes"] else "image"
+    return {"family": family, "content": content, "plate_kind": plate_kind}
+
+
+# ------------------------------------------------------------------ elements
+def layer_cfg(scale: float) -> dict:
+    c = settings.get("analysis.layers")
+    c["border_px"] = max(2, int(round(c["border_px"] * scale)))
+    c["min_ink_px"] = max(4, int(round(c["min_ink_px"] * scale * scale)))
+    c["merge_kernel"] = [max(3, int(round(v * scale))) for v in c["merge_kernel"]]
+    return c
+
+
+def track_elements(frames: list[np.ndarray], times: np.ndarray, lcfg: dict, max_area: float) -> list[dict]:
+    h, w = frames[0].shape[:2]
+    tracks: list[dict] = []
+    for k, frame in enumerate(frames):
+        bg = layers.background_color(frame, lcfg["border_px"])
+        for el in layers.elements_in_frame(frame, bg, lcfg):
+            bx, by, bw, bh = el["box"]
+            if bw * bh > max_area * w * h:
+                continue
+            best, best_iou = None, lcfg["track_iou"]
+            for tr in tracks:
+                if tr["frames"][-1]["k"] >= k - lcfg["track_gap"]:
+                    v = layers._iou(tr["frames"][-1]["box"], el["box"])
+                    if v > best_iou:
+                        best, best_iou = tr, v
+            if best is None:
+                best = {"id": f"L{len(tracks) + 1:02d}", "frames": []}
+                tracks.append(best)
+            best["frames"].append({"k": k, "t": float(times[k]), **el})
+    return tracks
+
+
+def element_curves(tracks: list[dict], w: int, h: int, bounds: tuple[float, float], cfg: dict) -> list[dict]:
+    from .analyze.curves import fit_track_reportable
+    ec = cfg["elements"]
+    scored = []
+    for tr in tracks:
+        fr = tr["frames"]
+        if len(fr) < ec["min_frames"]:
+            continue
+        cx = np.array([f["cx"] for f in fr]) * 100.0 / w
+        cy = np.array([f["cy"] for f in fr]) * 100.0 / w
+        ink = np.array([f["ink"] for f in fr], float)
+        ref = np.median(ink[-max(1, len(ink) // 3):])
+        sc = np.sqrt(ink / max(ref, 1.0))
+        peak = np.array([f["peak"] for f in fr], float)
+        op = peak / max(peak.max(), 1e-6)
+        activity = max(np.ptp(cx), np.ptp(cy)) / ec["min_move_pct"] + np.ptp(sc) / ec["min_scale"] + np.ptp(op) / ec["min_opacity"]
+        scored.append((activity, tr, cx, cy, sc, op))
+    scored.sort(key=lambda r: -r[0])
+    out = []
+    for activity, tr, cx, cy, sc, op in scored[: ec["max_tracks"]]:
+        t = np.array([f["t"] for f in tr["frames"]])
+        x, y, bw, bh = tr["frames"][-1]["box"]
+        row = {"id": tr["id"], "first_t": round(float(t[0]), 3), "last_t": round(float(t[-1]), 3),
+               "box_pct": [round(100 * x / w, 1), round(100 * y / h, 1), round(100 * bw / w, 1), round(100 * bh / h, 1)],
+               "color": "#" + "".join(f"{int(c):02x}" for c in tr["frames"][-1]["color"]), "channels": {}}
+        for name, v, lim in (("x", cx, ec["min_move_pct"]), ("y", cy, ec["min_move_pct"]), ("scale", sc, ec["min_scale"]),
+                             ("opacity", op, ec["min_opacity"])):
+            if np.ptp(v) >= lim:
+                tw, rejected = fit_track_reportable(t, v, bounds=bounds)
+                row["rejected_moves"] = row.get("rejected_moves", 0) + rejected
+                if tw:
+                    row["channels"][name] = tw
+        out.append(row)
+    return out
+
+
+# ------------------------------------------------------------------ typography
+def grab_frame(video: Path, t: float, height: int) -> np.ndarray:
+    info = probe(video)
+    w = int(round(info["width"] * height / info["height"] / 2)) * 2
+    size = w * height * 3
+    vf = f"scale={w}:{height}:flags=area,format=rgb24"
+    raw = b""
+    # 12 October 2026: fast seek first; when it returns nothing (seen on a 4K file under load), retry with an accurate
+    # seek after the input, then give up visibly (None) instead of crashing the whole reference.
+    for seek in (["-ss", f"{t:.4f}", "-i", str(video)], ["-i", str(video), "-ss", f"{t:.4f}"]):
+        raw = subprocess.run(["ffmpeg", "-v", "error", *seek, "-frames:v", "1", "-vf", vf, "-f", "rawvideo",
+                              "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
+        if len(raw) >= size:
+            return np.frombuffer(raw[:size], np.uint8).reshape(height, w, 3)
+    return None
+
+
+def text_lines(frame: np.ndarray, cfg: dict) -> list[dict]:
+    """Text-like elements of one full-height frame and their content-independent metrics."""
+    tc = cfg["text"]
+    h, w = frame.shape[:2]
+    lcfg = layer_cfg(h / 540.0)
+    lcfg["fg_threshold"] = tc["fg_threshold"]
+    bg = layers.background_color(frame, lcfg["border_px"])
+    lines = []
+    for el in layers.elements_in_frame(frame, bg, lcfg):
+        x, y, bw, bh = el["box"]
+        if not (tc["min_h"] * h <= bh <= tc["max_h"] * h) or bw < tc["min_aspect"] * bh:
+            continue
+        pad = int(tc["pad"] * bh)
+        x0, y0, x1, y1 = max(0, x - pad), max(0, y - pad), min(w, x + bw + pad), min(h, y + bh + pad)
+        crop = frame[y0:y1, x0:x1].astype(np.float32)
+        diff = np.abs(crop - bg[None, None, :].astype(np.float32)).max(axis=2)
+        ink = np.clip(diff / max(float(np.percentile(diff, 99.5)), 1.0), 0, 1)
+        m = typography.line_metrics(ink)
+        if not m or m["x_height"] < 3:
+            continue
+        cap = m["baseline"] - m["ascender"] + 1
+        lines.append({"box_pct": [round(100 * x / w, 1), round(100 * y / h, 1), round(100 * bw / w, 1), round(100 * bh / h, 1)],
+                      "x_height_px1080": round(m["x_height"] * 1080 / h, 1), "top_to_base_px1080": round(cap * 1080 / h, 1),
+                      "x_over_top": round(m["x_height"] / max(cap, 1), 3), "stroke_density": m["stroke_density"],
+                      "case": "capitales" if m["x_height"] / max(cap, 1) > 0.9 else "bas de casse",
+                      "color": "#" + "".join(f"{int(c):02x}" for c in el["color"]),
+                      "light_on_dark": bool(np.mean(el["color"]) > np.mean(bg)), "_crop": (x0, y0, x1, y1)})
+    lines.sort(key=lambda r: -r["x_height_px1080"])
+    return lines[: tc["max_lines"]]
+
+
+# ------------------------------------------------------------------ phases and thumbnails
+def phases(frames: list[np.ndarray], times: np.ndarray, start: float, cfg: dict) -> list[dict]:
+    pc = cfg["phases"]
+    gw, gh = pc["grid"]
+    sig = [cv2.resize(cv2.cvtColor(f, cv2.COLOR_RGB2GRAY), (gw, gh), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
+           for f in frames]
+    bounds = [0]
+    for i in range(1, len(sig)):
+        if np.abs(sig[i] - sig[bounds[-1]]).mean() > pc["change"] and times[i] - times[bounds[-1]] >= pc["min_s"]:
+            bounds.append(i)
+    if len(bounds) > pc["max"]:
+        keep = np.linspace(0, len(bounds) - 1, pc["max"]).round().astype(int)
+        bounds = [bounds[i] for i in keep]
+    out = []
+    for j, a in enumerate(bounds):
+        b = bounds[j + 1] if j + 1 < len(bounds) else len(frames)
+        out.append({"start": round(start + float(times[a]), 3), "end": round(start + float(times[b - 1]), 3),
+                    "mid_index": (a + b - 1) // 2})
+    return out
+
+
+def save_thumb(frame: np.ndarray, path: Path, cfg: dict) -> str:
+    tc = cfg["thumbs"]
+    img = Image.fromarray(frame)
+    if img.width != tc["width"]:
+        img = img.resize((tc["width"], int(round(img.height * tc["width"] / img.width))), Image.LANCZOS)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path, quality=tc["quality"])
+    return path.name
+
+
+# ------------------------------------------------------------------ one shot
+def analyze_shot(job: dict) -> dict:
+    """Worker: everything measured on one shot. job = {slug, video, shot, fps, cfg}."""
+    cfg, shot, video = job["cfg"], job["shot"], Path(job["video"])
+    info = probe(video)
+    W = cfg["width"]
+    H = int(round(info["height"] * W / info["width"] / 2)) * 2
+    dur = shot["end"] - shot["start"]
+    sfps = min(info["fps"], cfg["sample_fps"], cfg["max_frames"] / max(dur, 1e-3))
+    sfps = max(sfps, 1.0 / max(dur, 1e-3) * 3)
+    frames = list(iter_frames(video, W, H, fps=sfps, start=shot["start"], duration=dur, threads=4))
+    if not frames:
+        one = grab_frame(video, shot["start"] + dur / 2, H)
+        if one is None:
+            raise RuntimeError(f"no frame decoded for {shot['id']} of {video}")
+        frames = [cv2.resize(one, (W, H))]
+    times = np.arange(len(frames)) / sfps
+    n = len(frames)
+    pick = sorted(set(np.linspace(0, n - 1, min(cfg["palette_frames"], n)).round().astype(int)))
+    sampled = [frames[i] for i in pick]
+    pal = palette(sampled, cfg)
+    # Camera and 3D probe.
+    cam = camera.measure(frames, sfps) if n >= 3 else {"track": [], "probe": {"class": "static"}, "size": [W, H]}
+    cam_sum = camera.summarize(cam, (0.0, dur)) if n >= 3 else {"channels": {}, "kind": ["fixe"]}
+    # Elements at analysis size.
+    lcfg = layer_cfg(W / 960.0)
+    tracks = track_elements(frames, times, lcfg, cfg["elements"]["max_box_area"]) if n >= 3 else []
+    ink_share = float(np.median([sum(f["ink"] for tr in tracks for f in tr["frames"] if f["k"] == k) for k in pick] or [0])) / (W * H)
+    # Text lines on the frame where the most text-like elements are visible (full height).
+    counts, boxes = [], []
+    for k in pick:
+        bg = layers.background_color(frames[k], lcfg["border_px"])
+        els = layers.elements_in_frame(frames[k], bg, lcfg)
+        tb = [e["box"] for e in els if e["box"][2] >= cfg["text"]["min_aspect"] * e["box"][3]
+              and cfg["text"]["min_h"] * H <= e["box"][3] <= cfg["text"]["max_h"] * H]
+        counts.append(len(tb))
+        boxes.append(tb)
+    feat = picture_features(sampled, cfg, boxes)
+    fam_pre = classify_family(dur, feat, ink_share, max(counts) if counts else 0, cam["probe"]["class"], cfg)
+    text = []
+    text_t = None
+    # 12 October 2026: the eye class, when the review gives one, decides whether the text is measured.
+    if (job.get("eye_content") or fam_pre["content"]) in ("textcard", "graphic") and counts and max(counts) > 0:
+        best_k = pick[max(range(len(counts)), key=lambda i: (counts[i], i))]
+        text_t = shot["start"] + float(times[best_k])
+        full = grab_frame(video, text_t, cfg["text"]["height"])
+        text = text_lines(full, cfg) if full is not None else []
+        if text and job.get("keep_crop"):
+            x0, y0, x1, y1 = text[0]["_crop"]
+            p = CACHE / job["slug"] / "typography" / f"{shot['id']}.png"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(full[y0:y1, x0:x1]).save(p)
+            text[0]["_crop_file"] = str(p)
+    fam = classify_family(dur, feat, ink_share, len(text) if text else (max(counts) if counts else 0), cam["probe"]["class"], cfg)
+    roles = assign_roles(pal, [l_hex_to_rgb(l["color"]) for l in text], cfg)
+    curves = element_curves(tracks, W, H, (0.0, dur), cfg) if fam["content"] in ("textcard", "graphic") and n >= 3 else []
+    ph = phases(frames, times, shot["start"], cfg) if dur >= cfg["phases"]["shot_min_s"] else []
+    # Thumbnails into the local cache only.
+    td = thumbs_dir(job["slug"])
+    thumbs = {}
+    for key, idx in (("in", min(n - 1, max(0, int(0.08 * n)))), ("mid", n // 2), ("out", max(0, min(n - 1, int(0.92 * n))))):
+        thumbs[key] = save_thumb(frames[idx], td / f"{shot['id']}-{key}.jpg", cfg)
+    for j, p in enumerate(ph):
+        p["thumb"] = save_thumb(frames[p.pop("mid_index")], td / f"{shot['id']}-p{j + 1:02d}.jpg", cfg)
+    edge = max(1, min(cfg["transition"]["edge_frames"], n))
+    first_lab = to_lab(np.concatenate([f.reshape(-1, 3)[::97] for f in frames[:edge]])).mean(0)
+    last_lab = to_lab(np.concatenate([f.reshape(-1, 3)[::97] for f in frames[-edge:]])).mean(0)
+    for l in text:
+        l.pop("_crop", None)
+    return {"id": shot["id"], "start": round(shot["start"], 4), "end": round(shot["end"], 4), "duration": round(dur, 4),
+            "start_frame": shot["start_frame"], "end_frame": shot["end_frame"], "enter": shot["enter"],
+            "cut_source": shot.get("cut_source", "detector"),
+            "sample_fps": round(sfps, 3), "frames_measured": n, **fam, "features": feat, "palette": pal["colours"],
+            "roles": roles, "border_lab_std": pal["border_lab_std"], "camera": {**cam_sum, "probe": cam["probe"]},
+            "elements": curves, "elements_tracked": len(tracks), "text_lines": text, "text_frame_t": text_t,
+            "phases": ph, "thumbs": thumbs, "first_lab": [round(float(v), 2) for v in first_lab],
+            "last_lab": [round(float(v), 2) for v in last_lab]}
+
+
+def l_hex_to_rgb(h: str) -> list[float]:
+    return [int(h[i:i + 2], 16) for i in (1, 3, 5)]
+
+
+# ------------------------------------------------------------------ transitions
+def transitions(shots: list[dict], cuts: list[dict], luma: list[float], fps: float, cfg: dict) -> None:
+    tc = cfg["transition"]
+    by_frame = {c["frame"]: c for c in cuts}
+    for i, s in enumerate(shots):
+        if i == 0:
+            s["transition_in"] = {"kind": "ouverture"}
+            continue
+        prev = shots[i - 1]
+        f = s["start_frame"]
+        cut = by_frame.get(f, {})
+        kind = {"hard": "coupe franche", "dissolve": "fondu enchaîné", "flash": "flash"}.get(cut.get("kind", "hard"), "coupe franche")
+        a = luma[max(0, f - tc["edge_frames"]):f]
+        b = luma[f:f + tc["edge_frames"]]
+        if a and max(a) <= tc["dark_luma"]:
+            kind += " après passage au noir"
+        elif b and max(b) <= tc["dark_luma"]:
+            kind += " vers un noir"
+        elif a and min(a) >= tc["bright_luma"]:
+            kind += " après passage au blanc"
+        same = de00(prev["last_lab"], s["first_lab"]) <= tc["same_bg_de"]
+        s["transition_in"] = {"kind": kind, "frame": f, "same_tone": same,
+                              "delta_e_mean": round(de00(prev["last_lab"], s["first_lab"]), 2)}
+
+
+# ------------------------------------------------------------------ aggregation
+def aggregate(shots: list[dict], sound: dict | None, meta: dict, info: dict) -> dict:
+    durs = np.array([s["duration"] for s in shots])
+    fam = {}
+    for s in shots:
+        fam[s["family"]] = fam.get(s["family"], 0.0) + s["duration"]
+    total = float(durs.sum())
+    fam_share = {k: round(v / total, 3) for k, v in sorted(fam.items(), key=lambda kv: -kv[1])}
+    content = {}
+    for s in shots:
+        content[s["content"]] = content.get(s["content"], 0.0) + s["duration"]
+    # Global palette: per-shot colours weighted by shot duration, merged in CIEDE2000.
+    cfg = cfg_default()
+    labs, weights, roles = [], [], {}
+    for s in shots:
+        for c in s["palette"]:
+            labs.append(c["lab"])
+            weights.append(c["share"] * s["duration"])
+        for r, v in s["roles"].items():
+            if isinstance(v, str):
+                roles.setdefault(r, []).append((v, s["duration"]))
+    merged = merge_clusters(np.array(labs, np.float64), np.array(weights) / max(sum(weights), 1e-9), cfg["palette_merge_de"] * 3)
+    merged = sorted(merged, key=lambda c: -c["share"])[:12]
+    glob = [{"hex": lab_hex(c["lab"]), "share": round(c["share"], 3), "lab": [round(float(v), 1) for v in c["lab"]],
+             "chroma": round(float(math.hypot(c["lab"][1], c["lab"][2])), 1)} for c in merged]
+    role_summary = {}
+    for r, vals in roles.items():
+        groups: list[dict] = []
+        for hx, d in vals:
+            lab = to_lab(np.array([l_hex_to_rgb(hx)], np.float64))[0]
+            for g in groups:
+                if de00(g["lab"], lab) < 5.0:
+                    g["dur"] += d
+                    break
+            else:
+                groups.append({"hex": hx, "lab": lab, "dur": d})
+        groups.sort(key=lambda g: -g["dur"])
+        role_summary[r] = [{"hex": g["hex"], "share_of_time": round(g["dur"] / total, 3)} for g in groups[:4]]
+    eases, cam_kinds, probe_classes, trans = {}, {}, {}, {}
+    move_durs = []
+    for s in shots:
+        for el in s["elements"]:
+            for ch, tws in el["channels"].items():
+                for tw in tws:
+                    eases[tw["ease"]] = eases.get(tw["ease"], 0) + 1
+                    move_durs.append(tw["duration"])
+        for ch in s["camera"].get("channels", {}).values():
+            for tw in ch.get("moves", []):
+                eases[tw["ease"]] = eases.get(tw["ease"], 0) + 1
+        for k in s["camera"]["kind"]:
+            cam_kinds[k] = cam_kinds.get(k, 0) + 1
+        pc = s["camera"]["probe"]["class"]
+        probe_classes[pc] = probe_classes.get(pc, 0) + 1
+        t = s.get("transition_in", {}).get("kind", "")
+        trans[t] = trans.get(t, 0) + 1
+    lines = [l for s in shots for l in s["text_lines"]]
+    typo = {}
+    if lines:
+        xh = np.array([l["x_height_px1080"] for l in lines])
+        typo = {"lines_measured": len(lines), "x_height_px1080": {"min": float(xh.min()), "median": float(np.median(xh)),
+                                                                  "max": float(xh.max())},
+                "stroke_density_median": round(float(np.median([l["stroke_density"] for l in lines])), 3),
+                "case": {c: sum(1 for l in lines if l["case"] == c) for c in ("capitales", "bas de casse")},
+                "light_on_dark_share": round(float(np.mean([l["light_on_dark"] for l in lines])), 2),
+                "text_colours": sorted({l["color"] for l in lines})[:8]}
+    cut_count = len(shots) - 1
+    rhythm = {"shots": len(shots), "cuts": cut_count, "duration": round(total, 3),
+              "cuts_per_minute": round(cut_count / max(total, 1e-9) * 60, 1),
+              "shot_mean_s": round(float(durs.mean()), 3), "shot_median_s": round(float(np.median(durs)), 3),
+              "shot_min_s": round(float(durs.min()), 3), "shot_max_s": round(float(durs.max()), 3),
+              "shot_cv": round(float(durs.std() / max(durs.mean(), 1e-9)), 3),
+              "under_0_5s": int((durs < 0.5).sum()), "over_3s": int((durs > 3).sum())}
+    if sound:
+        rhythm["cuts_on_beat"] = sound.get("cuts_on_beat")
+        rhythm["cuts_on_attack"] = sound.get("cuts_on_attack")
+        if sound.get("tempo_bpm"):
+            beat = 60.0 / sound["tempo_bpm"]
+            rhythm["shot_median_beats"] = round(float(np.median(durs)) / beat, 2)
+    threed = {"plate_share": round(content.get("plate", 0.0) / total, 3),
+              "plate_3d_shots": sum(1 for s in shots if s.get("plate_kind") == "3d"),
+              "probe_classes": probe_classes}
+    return {"families_time_share": fam_share, "content_time_share": {k: round(v / total, 3) for k, v in content.items()},
+            "palette": glob, "roles": role_summary, "eases": dict(sorted(eases.items(), key=lambda kv: -kv[1])),
+            "element_move_median_s": round(float(np.median(move_durs)), 3) if move_durs else None,
+            "camera_kinds": cam_kinds, "transitions": dict(sorted(trans.items(), key=lambda kv: -kv[1])),
+            "typography": typo, "rhythm": rhythm, "three_d": threed}
+
+
+REVIEW_KIND_FR = {"whip": "transition par mouvement rapide (filé)", "match": "raccord sur forme ou mouvement",
+                  "hard": "coupe franche (relevée à l'œil)", "dissolve": "fondu enchaîné (relevé à l'œil)",
+                  "wipe": "volet", "push": "poussée", "zoom": "zoom traversant", "fade": "fondu par le noir"}
+
+
+def family_agreement(shots: list[dict]) -> dict | None:
+    with_c = [s for s in shots if "content_measured" in s]
+    if not with_c:
+        return None
+    same = sum(1 for s in with_c if s["content_measured"] == s["content"])
+    return {"reviewed": len(with_c), "same_content": same, "share": round(same / len(with_c), 3)}
+
+
+def attach_sound(shots: list[dict], sound: dict | None) -> None:
+    for s in shots:
+        if not sound:
+            s["sound"] = {"events": [], "swells": []}
+            continue
+        ev = [e for e in sound["events"] if s["start"] <= e["t"] < s["end"]]
+        main = set(sound["main_events"])
+        top = sorted(ev, key=lambda e: -e["strength"])[:4]
+        s["sound"] = {"events_count": len(ev),
+                      "events": [{"t": e["t"], "kind": e["kind"], "main": e["id"] in main, "peak_db": e["peak_db"]} for e in top],
+                      "swells": [w for w in sound["swells"] if s["start"] <= w["peak_t"] < s["end"]]}
+
+
+# ------------------------------------------------------------------ orchestration
+def build(slug: str, workers: int = 8, force_shots: bool = False, keep_crops: bool = True, with_sound: bool = True) -> dict:
+    meta, video = reference(slug)
+    info = probe(video)
+    det = detect_shots(slug, video, force_shots)
+    cfg = cfg_default()
+    review = load_review(slug)
+    detected = {"shots": len(det["shots"]), "cuts": len(det["cuts"])}
+    det = apply_cuts(det, review, cfg["review_snap_s"])
+    def eye_content(shot):
+        hit = [e for e in review.get("shots", []) if shot["start"] - 1e-6 <= e["t"] < shot["end"] and e.get("content")]
+        return hit[-1]["content"] if hit else None
+
+    jobs = [{"slug": slug, "video": str(video), "shot": s, "cfg": cfg, "keep_crop": keep_crops, "eye_content": eye_content(s)}
+            for s in det["shots"]]
+    sound = None
+    with ProcessPoolExecutor(workers) as pool:
+        sound_future = None
+        if with_sound and info.get("has_audio"):
+            from .audio import summary
+            cut_times = [c["t"] for c in det["cuts"] if c["kind"] != "flash"]
+            sound_future = pool.submit(summary.summarize, str(video), cut_times)
+        shots = list(pool.map(analyze_shot, jobs))
+        if sound_future is not None:
+            sound = sound_future.result()
+    transitions(shots, det["cuts"], det["curves"]["luma"], det["fps"], cfg)
+    for s_ in shots:
+        if s_.get("cut_source") == "review":
+            s_["transition_in"]["kind"] = REVIEW_KIND_FR.get(s_["enter"], s_["transition_in"]["kind"])
+    unmatched = apply_shot_review(shots, review, cfg)
+    attach_sound(shots, sound)
+    bible = {"schema": "zrmd/bible@1", "date": DATE, "slug": slug, "source": {k: meta.get(k) for k in
+             ("duration_s", "width", "height", "fps", "has_audio", "page_url")},
+             "cadence": det.get("cadence"), "frames": det.get("frames"), "fps": det["fps"],
+             "cuts": [{k: c.get(k) for k in ("frame", "t", "kind", "source")} for c in det["cuts"]],
+             "detected": detected, "review": {"file": "review.json" if review else None,
+             "added_cuts": sum(1 for c in det["cuts"] if c.get("source") == "review"),
+             "removed_cuts": len(review.get("remove_cuts", [])), "shots_described": sum(1 for x in shots if x.get("description")),
+             "family_agreement": family_agreement(shots), "unmatched_entries": unmatched},
+             "summary": aggregate(shots, sound, meta, info), "sound": sound and {k: v for k, v in sound.items() if k != "events"},
+             "sound_events": sound and sound["events"], "shots": shots,
+             "engine": {"eases": "GSAP 3.14.2 exact table", "settings": "settings.json analysis.bible, camera, easefit, sound"}}
+    target = REFERENCES / slug / "bible.json"
+    if target.exists():  # the font match depends only on the cached text crops; keep it across rebuilds
+        previous = json.loads(target.read_text(encoding="utf-8"))
+        if previous.get("font_match"):
+            bible["font_match"] = previous["font_match"]
+    target.write_text(json.dumps(bible, indent=1, ensure_ascii=False, default=float) + "\n", encoding="utf-8")
+    return bible
+
+
+# ------------------------------------------------------------------ descriptions and markdown (12 October 2026)
+def load_descriptions(slug: str) -> dict:
+    """The eye review carries the reference sentence; shot sentences are stored on the shots themselves."""
+    r = load_review(slug)
+    return {"reference": r.get("reference"), "shots": {}}
+
+
+def fr_num(v, nd: int = 2) -> str:
+    if v is None:
+        return "non mesuré"
+    return f"{v:.{nd}f}".replace(".", ",")
+
+
+def auto_description(s: dict) -> str:
+    """Fallback sentence from the measures alone, used until a human description exists."""
+    fam = FAMILY_FR[s["family"]]
+    cam = ", ".join(s["camera"]["kind"])
+    bg = s["roles"].get("background", "")
+    parts = [f"Plan {fam} sur un fond dominant {bg}"]
+    if s["text_lines"]:
+        parts.append(f"{len(s['text_lines'])} ligne(s) de texte mesurée(s)")
+    if s["elements"]:
+        parts.append(f"{len(s['elements'])} élément(s) animé(s) suivi(s)")
+    parts.append(f"mouvement global : {cam}")
+    return ", ".join(parts) + " (description automatique)."
+
+
+def description(s: dict, desc: dict) -> str:
+    return s.get("description") or desc.get("shots", {}).get(s["id"]) or auto_description(s)
+
+
+def shot_moves(s: dict) -> list[str]:
+    out = []
+    for ch, row in s["camera"].get("channels", {}).items():
+        for tw in row.get("moves", []):
+            out.append(f"image {ch} {tw['ease']} ({fr_num(tw['duration'])} s)")
+    for el in s["elements"]:
+        for ch, tws in el["channels"].items():
+            for tw in tws:
+                out.append(f"{el['id']} {ch} {tw['ease']} ({fr_num(tw['duration'])} s)")
+    return out
+
+
+def render_markdown(b: dict, desc: dict) -> str:
+    S, R = b["summary"], b["summary"]["rhythm"]
+    src = b["source"]
+    snd = b.get("sound") or {}
+    L = [f"# Bible graphique de la référence {b['slug']} ({b['date']})", ""]
+    L.append(f"Bible mesurée par `zrmd.bible` le {b['date']}, à partir du fichier du cache local ; aucun pixel ni aucun "
+             f"échantillon de la référence n'entre dans ce document, qui ne porte que des nombres et des descriptions "
+             f"paraphrasées. Storyboard : [storyboard.html](storyboard.html). Données : [bible.json](bible.json). ({b['date']})")
+    L.append("")
+    if desc.get("reference"):
+        L += [desc["reference"] + f" ({b['date']})", ""]
+    L += ["## Identité", "", "| Mesure | Valeur |", "|---|---|",
+          f"| Durée | {fr_num(src['duration_s'])} s |", f"| Format | {src['width']} x {src['height']} |",
+          f"| Cadence du fichier | {fr_num(b['fps'], 3)} images par seconde |",
+          f"| Cadence du contenu | {fr_num((b.get('cadence') or {}).get('fps'), 2)} images par seconde |",
+          f"| Son | {'oui' if src.get('has_audio') else 'non'} |", ""]
+    L += ["## Rythme de montage", "",
+          f"La référence compte {R['shots']} plans et {R['cuts']} coupes, soit {fr_num(R['cuts_per_minute'], 1)} coupes par "
+          f"minute ; un plan dure {fr_num(R['shot_median_s'])} s en médiane et {fr_num(R['shot_mean_s'])} s en moyenne, du plus "
+          f"court ({fr_num(R['shot_min_s'])} s) au plus long ({fr_num(R['shot_max_s'])} s), avec un coefficient de variation de "
+          f"{fr_num(R['shot_cv'])}. {R['under_0_5s']} plans durent moins d'une demi-seconde et {R['over_3s']} plus de trois secondes."]
+    if R.get("cuts_on_beat") is not None:
+        L[-1] += (f" La part des coupes tombant à 50 ms près d'un temps de la grille vaut {fr_num(100 * R['cuts_on_beat'], 0)} %, "
+                  f"et celle des coupes tombant sur une attaque sonore {fr_num(100 * (R.get('cuts_on_attack') or 0), 0)} %.")
+    if R.get("shot_median_beats"):
+        L[-1] += f" Le plan médian dure {fr_num(R['shot_median_beats'])} temps."
+    rv = b.get("review") or {}
+    det = b.get("detected") or {}
+    if rv.get("file"):
+        L[-1] += (f" Le détecteur avait trouvé {det.get('cuts')} coupes ; la revue à l'œil des planches (une image tous les quarts "
+                  f"de seconde) en a ajouté {rv.get('added_cuts')} et retiré {rv.get('removed_cuts')}, chaque ajout étant recalé sur "
+                  f"l'image de plus forte différence à 0,3 s près.")
+    L += [""]
+    L += ["## Familles de plans", "", "| Famille | Part du temps |", "|---|---|"]
+    L += [f"| {FAMILY_FR[k]} | {fr_num(100 * v, 1)} % |" for k, v in S["families_time_share"].items()]
+    fa = rv.get("family_agreement")
+    if fa:
+        L += ["", f"Le classement automatique (aplats, couverture du texte, entropie des zones non plates, sonde 3D) concorde avec "
+              f"le classement à l'œil sur {fa['same_content']} plans sur {fa['reviewed']}, soit {fr_num(100 * fa['share'], 0)} % ; "
+              f"la bible retient le classement à l'œil et garde la mesure à côté (`content_measured`)."]
+    L += ["", "La famille « montage » regroupe les plans de moins d'une demi-seconde, quel que soit leur contenu ; la part "
+          "du contenu seul est : " + ", ".join(f"{FAMILY_FR[k]} {fr_num(100 * v, 1)} %" for k, v in S["content_time_share"].items()) + ".", ""]
+    L += ["## Couleurs", "", "Palette globale (regroupement Lab, fusion sous 6 unités CIEDE2000, pondérée par la surface et la durée) :", "",
+          "| Couleur | Part | L* | Chroma |", "|---|---|---|---|"]
+    L += [f"| `{c['hex']}` | {fr_num(100 * c['share'], 1)} % | {fr_num(c['lab'][0], 1)} | {fr_num(c['chroma'], 1)} |" for c in S["palette"]]
+    L += ["", "Rôles (part du temps où la couleur tient ce rôle) :", "", "| Rôle | Couleurs |", "|---|---|"]
+    names = {"background": "fond", "text": "texte", "accent": "accent"}
+    for r, vals in S["roles"].items():
+        if r in names:
+            L.append(f"| {names[r]} | " + ", ".join(f"`{v['hex']}` ({fr_num(100 * v['share_of_time'], 0)} %)" for v in vals) + " |")
+    L += [""]
+    T = S["typography"]
+    L += ["## Typographie", ""]
+    if T:
+        xh = T["x_height_px1080"]
+        L.append(f"{T['lines_measured']} lignes de texte ont été mesurées sur l'image où le texte est le plus présent de chaque "
+                 f"plan carte texte ou graphique. La hauteur d'x, ramenée à une image de 1080 pixels de haut, va de "
+                 f"{fr_num(xh['min'], 1)} à {fr_num(xh['max'], 1)} pixels, médiane {fr_num(xh['median'], 1)} ; la densité de trait "
+                 f"médiane vaut {fr_num(T['stroke_density_median'], 3)}. On compte {T['case']['capitales']} lignes en capitales et "
+                 f"{T['case']['bas de casse']} en bas de casse, et {fr_num(100 * T['light_on_dark_share'], 0)} % des lignes sont claires "
+                 f"sur fond sombre. Couleurs de texte relevées : " + ", ".join(f"`{c}`" for c in T["text_colours"]) + ".")
+        fm = b.get("font_match")
+        weak = settings.get("analysis.bible.fontmatch_weak_score")
+        if fm and fm.get("ranking") and fm["ranking"][0]["score"] > weak:
+            L.append("")
+            L.append(f"Appariement de police faible sur la ligne de {fm['shot']} (meilleur score {fr_num(fm['ranking'][0]['score'], 3)}, "
+                     f"au-delà du seuil {fr_num(weak, 2)}) : aucune police libre de la base ne ressemble assez au dessin mesuré, "
+                     f"la plus proche étant {fm['ranking'][0]['family']} {int(fm['ranking'][0]['weight'])} ; la police se choisira à l'œil.")
+        elif fm and fm.get("ranking"):
+            top = fm["ranking"][:3]
+            L.append("")
+            L.append(f"Police libre la plus proche (comparateur `zrmd.analyze.fontmatch`, ligne de {fm['shot']}, texte lu en mémoire "
+                     f"et jamais écrit) : " + " ; ".join(f"{r['family']} {int(r['weight'])}, approche {fr_num(r['tracking_em'], 2)} em, "
+                                                          f"score {fr_num(r['score'], 3)}" for r in top) + ".")
+        elif fm and fm.get("error"):
+            L.append("")
+            L.append(f"Appariement de police non conclu : {fm['error']}.")
+    else:
+        L.append("Aucune ligne de texte mesurable dans les plans carte texte ou graphique.")
+    L += ["", "## Mouvements et courbes", ""]
+    if S["eases"]:
+        L.append("Courbes identifiées contre la table exacte de GSAP 3.14.2 (une courbe n'est gardée que si elle explique le "
+                 "mouvement à 6 % de l'amplitude près et que le mouvement dépasse dix fois le bruit de mesure) :")
+        L += ["", "| Ease | Occurrences |", "|---|---|"] + [f"| `{k}` | {v} |" for k, v in list(S["eases"].items())[:14]]
+        if S.get("element_move_median_s"):
+            L += ["", f"Un mouvement d'élément dure {fr_num(S['element_move_median_s'])} s en médiane."]
+    else:
+        L.append("Aucune courbe n'a passé le filtre de qualité ; les mouvements de cette référence sont trop bruités ou trop "
+                 "petits pour une identification fiable à cette résolution d'analyse.")
+    L += ["", "Mouvement global de l'image (similarité chaînée image après image ; sur un fond uni, il suit le calque dominant) :", "",
+          "| Mouvement | Plans |", "|---|---|"] + [f"| {k} | {v} |" for k, v in sorted(S["camera_kinds"].items(), key=lambda kv: -kv[1])]
+    L += ["", "## Transitions", "", "| Transition d'entrée | Plans |", "|---|---|"]
+    L += [f"| {k} | {v} |" for k, v in S["transitions"].items()]
+    D = S["three_d"]
+    L += ["", "## Usage de la 3D", "",
+          f"Les plaques (rendu 3D ou prise de vue) occupent {fr_num(100 * D['plate_share'], 1)} % du temps, dont {D['plate_3d_shots']} "
+          "plans que la sonde géométrique classe comme 3D (perspective, parallaxe, scène rigide, apparence changeante ou mouvement "
+          "complexe). La sonde répond juste quand elle dit 3D, mais elle manque les objets 3D qui glissent comme un calque (R04, "
+          "section 10) ; les descriptions plan par plan corrigent ce point à l'œil.", "", "| Classe de la sonde | Plans |", "|---|---|"]
+    L += [f"| {camera.CLASS_FR.get(k, k)} | {v} |" for k, v in sorted(D["probe_classes"].items(), key=lambda kv: -kv[1])]
+    L += ["", "## Son", ""]
+    if snd:
+        evs = b.get("sound_events") or []
+        kinds = {}
+        for e in evs:
+            kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+        L.append(f"Sonie intégrée {fr_num(snd.get('loudness_lufs'), 1)} LUFS, centroïde spectral médian {fr_num(snd.get('centroid_hz'), 0)} Hz, "
+                 f"part harmonique {fr_num(100 * (snd.get('harmonic_share') or 0), 0)} %. Le détecteur d'attaques relève {len(evs)} événements "
+                 f"(" + ", ".join(f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])) + f") et le détecteur de houles "
+                 f"{len(snd.get('swells', []))} montées ou souffles longs.")
+        main = [e for e in evs if e["id"] in set(snd.get("main_events", []))]
+        if main:
+            L += ["", "Événements principaux (les plus forts) :", "", "| Instant | Nature | Crête |", "|---|---|---|"]
+            L += [f"| {fr_num(e['t'])} s | {e['kind']} | {fr_num(e['peak_db'], 1)} dB |" for e in sorted(main, key=lambda e: e["t"])]
+        if snd.get("swells"):
+            L += ["", "Houles : " + ", ".join(f"{fr_num(w['t'])} s (montée {fr_num(w['rise_s'])} s)" for w in snd["swells"][:16]) + "."]
+        L += ["", "## Musique", "",
+              f"Tempo estimé {fr_num(snd.get('tempo_bpm'), 1)} BPM, {snd.get('beats')} temps détectés, régularité de la grille "
+              f"{fr_num(snd.get('beat_regularity'), 3)} (écart type relatif des intervalles, 0 pour une grille parfaite). La musique "
+              "ne se reprend jamais note à note : seuls le tempo, la grille, les sections, l'énergie et la production servent.", "",
+              "| Section | Début | Fin | Niveau médian |", "|---|---|---|---|"]
+        L += [f"| {i + 1} | {fr_num(s['start'])} s | {fr_num(s['end'])} s | {fr_num(s['level_db'], 1)} dB |" for i, s in enumerate(snd.get("sections", []))]
+    else:
+        L.append("La référence n'a pas de piste sonore.")
+    L += ["", "## Plans", "", "| Plan | Début | Durée | Famille | Description |", "|---|---|---|---|---|"]
+    for s in b["shots"]:
+        L.append(f"| {s['id']} | {fr_num(s['start'])} s | {fr_num(s['duration'])} s | {FAMILY_FR[s['family']]} | "
+                 f"{description(s, desc).replace('|', '/')} |")
+    L += ["", f"Paramètres : `settings.json`, sections `analysis.bible`, `analysis.camera`, `analysis.easefit`, `analysis.sound` ({b['date']}).", ""]
+    text = "\n".join(L)
+    return text.replace("—", ",").replace("–", ",")
+
+
+def write_markdown(slug: str) -> Path:
+    b = json.loads((REFERENCES / slug / "bible.json").read_text(encoding="utf-8"))
+    target = REFERENCES / slug / "bible.md"
+    target.write_text(render_markdown(b, load_descriptions(slug)), encoding="utf-8")
+    return target

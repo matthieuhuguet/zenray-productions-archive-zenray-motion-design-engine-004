@@ -1,0 +1,116 @@
+# 12 October 2026: transient family (click, tick, pop, blip, glitch, keyboard).
+# FR : famille des transitoires ; modes amortis, rafales de bruit, oscillateurs courts.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from . import common as c
+
+
+def _click_body(f_mode: float, decay_ms: float, noise_mix: float, decay_noise_ms: float, noise_hp: float,
+                seconds: float, seed: int, sr: int) -> np.ndarray:
+    t = c.axis(seconds, sr)
+    mode = c.damped_mode(f_mode, decay_ms / 1000.0, t)
+    rng = np.random.default_rng(seed)
+    burst = c.highpass(rng.standard_normal(len(t)), sr, noise_hp) * np.exp(-t / (decay_noise_ms / 1000.0))
+    mix = min(max(noise_mix, 0.0), 1.0)
+    return math.sqrt(1.0 - mix) * c.unit_energy(mode) + math.sqrt(mix) * c.unit_energy(burst)
+
+
+def click(p: dict, seed: int, sr: int) -> np.ndarray:
+    """One damped resonant mode plus a decaying high-passed noise burst, mixed by energy (R03 lab recipe)."""
+    x = _click_body(p["fMode"], p["decayModeMs"], p["noiseMix"], p["decayNoiseMs"], p["noiseHp"], c.syn()["clickSeconds"], seed, sr)
+    return c.out32(c.set_level(x, sr, p["gainDb"]))
+
+
+def tick(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Shorter, higher click with almost no noise; count > 1 repeats it every periodMs (a regular series)."""
+    s = c.syn()
+    one = _click_body(p["fMode"], p["decayModeMs"], p["noiseMix"], 0.3, 4000.0, s["tickSeconds"], seed, sr)
+    count = int(round(p.get("count", 1)))
+    if count <= 1:
+        return c.out32(c.set_level(one, sr, p["gainDb"]))
+    step = int(round(p["periodMs"] * sr / 1000.0))
+    out = np.zeros(step * (count - 1) + len(one))
+    for k in range(count):
+        out[k * step:k * step + len(one)] += one
+    return c.out32(c.set_level(out, sr, p["gainDb"]))
+
+
+def pop(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Bubble: sine whose pitch rises exponentially fStart -> fEnd, 1 ms-ish attack then exponential decay."""
+    T = p["duration"]
+    t = c.axis(T, sr)
+    freq = c.glide(p["fStart"], p["fEnd"], t, T)
+    attack = np.clip(t / (p["attackMs"] / 1000.0), 0.0, 1.0)
+    decay = np.exp(-4.6 * np.clip(t - p["attackMs"] / 1000.0, 0.0, None) / max(T - p["attackMs"] / 1000.0, 1e-4))
+    return c.out32(c.set_level(c.fade(np.sin(c.phase_of(freq, sr)) * attack * decay, sr), sr, p["gainDb"]))
+
+
+def blip(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Short pure note (sine to band-limited square), optional second note at intervalSemis, fast envelope."""
+    T = p["duration"]
+    t = c.axis(T, sr)
+    attack = np.clip(t / (p["attackMs"] / 1000.0), 0.0, 1.0)
+    env = attack * np.exp(-3.0 * t / T)
+    second_on = p["secondLevel"] > 0
+    half = T / 2.0 if second_on else T
+    first = c.bl_square_morph(p["freq"], t, sr, p["shape"]) * (t < half)
+    x = first * env
+    if second_on:
+        f2 = p["freq"] * 2.0 ** (p["intervalSemis"] / 12.0)
+        t2 = np.clip(t - half, 0.0, None)
+        env2 = np.clip(t2 / (p["attackMs"] / 1000.0), 0.0, 1.0) * np.exp(-3.0 * t2 / max(T - half, 1e-3))
+        x = x + p["secondLevel"] * c.bl_square_morph(f2, t2, sr, p["shape"]) * env2 * (t >= half)
+    return c.out32(c.set_level(c.fade(x, sr), sr, p["gainDb"]))
+
+
+def glitch(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Train of short grains (click, blip or noise drawn by seed), then bit reduction and sample-and-hold."""
+    s = c.syn()
+    T = p["duration"]
+    total = max(1, int(round(T * sr)))
+    rng = np.random.default_rng(seed)
+    out = np.zeros(total)
+    grain_n = max(8, int(round(p["grainMs"] * sr / 1000.0)))
+    tg = np.arange(grain_n) / sr
+    sources = s["glitchSources"]
+    for _ in range(int(round(p["grains"]))):
+        start = int(rng.integers(0, max(1, total - grain_n)))
+        kind = sources[int(rng.integers(0, len(sources)))]
+        if kind == "click":
+            g = c.damped_mode(p["toneHz"] * 2.0, p["grainMs"] / 3000.0, tg)
+        elif kind == "blip":
+            g = c.bl_square_morph(p["toneHz"] * 2.0 ** (int(rng.integers(-12, 13)) / 12.0), tg, sr, 1.0)
+        else:
+            g = rng.standard_normal(grain_n)
+        out[start:start + grain_n] += c.unit_energy(g) * 10 ** (-rng.uniform(0, 6) / 20.0)
+    levels = 2.0 ** (p["bits"] - 1)
+    peak = np.abs(out).max() or 1.0
+    out = np.round(out / peak * levels) / levels
+    hold = max(1, int(round(p["hold"])))
+    out = np.repeat(out[::hold], hold)[:total]
+    return c.out32(c.set_level(c.fade(out, sr), sr, p["gainDb"]))
+
+
+def keyboard(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Irregular series of dull clicks (band-passed noise plus a low mode), times and levels drawn by seed."""
+    s = c.syn()
+    T = p["duration"]
+    total = max(1, int(round(T * sr)))
+    rng = np.random.default_rng(seed)
+    out = np.zeros(total + int(s["keyboardClickSeconds"] * sr))
+    period = 1.0 / p["rate"]
+    t0 = 0.0
+    while t0 < T:
+        at = t0 + rng.uniform(-1, 1) * p["jitterMs"] / 1000.0
+        if 0 <= at < T:
+            tk = c.axis(s["keyboardClickSeconds"], sr)
+            noise = c.bandpass(rng.standard_normal(len(tk)), sr, p["noiseBand"], s["keyboardNoiseQ"]) * np.exp(-tk / 0.004)
+            body = 0.6 * c.unit_energy(c.damped_mode(p["fMode"], 0.006, tk)) + 0.8 * c.unit_energy(noise)
+            a = int(at * sr)
+            out[a:a + len(body)] += body * 10 ** (-rng.uniform(0, p["levelVarDb"]) / 20.0)
+        t0 += period
+    return c.out32(c.set_level(c.fade(out, sr), sr, p["gainDb"]))

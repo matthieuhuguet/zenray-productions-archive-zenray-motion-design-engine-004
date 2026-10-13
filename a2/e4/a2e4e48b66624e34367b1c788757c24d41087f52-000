@@ -1,0 +1,93 @@
+# 12 October 2026: task MI-assemble. Render each stem of the music bench from the params.json of its stem-iter version
+# (drums, bass, other, vocals), as pure functions of those parameters, so a bench version that mixes the best stems is
+# reproduced by ResynthMusic.py from its own params.json (key "stemIter"). The reference is never read here: every
+# stem module renders from our base version's files (V_034 stems, score, params) plus its own fitted tables.
+# FR : rendu de chaque piste depuis les parametres de sa version stem-iter, pour reproduire le banc assemble.
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+from .. import resynth as RS
+
+SCRIPTS = Path(__file__).resolve().parents[3] / "Scripts"
+
+# 12 October 2026: interface. stems = order of rendering; files = what each stem-iter version must provide (copied
+# into the bench version so it is self-contained). FR : interface, fichiers requis par piste.
+CFG = {
+    "stems": ["drums", "bass", "other", "vocals"],
+    "files": {"drums": ["params.json"], "bass": ["params.json"], "other": ["params.json", "score-other.json"],
+              "vocals": ["params.json"]},
+}
+
+
+def _scripts():
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
+
+
+def render_drums(d: Path, bench: Path, sr: int) -> np.ndarray:
+    """Replay the chain of operations of IterateDrums on the base drums stem. FR : rejoue la chaine batterie."""
+    _scripts()
+    import IterateDrums as ID
+    prm = json.loads((d / "params.json").read_text())
+    ID.SET["baseVersion"] = prm.get("base", ID.SET["baseVersion"])
+    score = json.loads((bench / ID.SET["baseVersion"] / "score.json").read_text())
+    x = ID.render(prm, sr, bench, score)
+    return np.asarray(x, np.float32)
+
+
+def render_bass(d: Path, bench: Path, sr: int) -> np.ndarray:
+    """Per-note shapes, eq, residual and frozen fader lane of an IterateBass version. FR : basse par note."""
+    from . import bass as BA
+    q = json.loads((d / "params.json").read_text())
+    B = BA.load_base(bench, q.get("base", "V_034"))
+    fx = {**B["prm"]["stemFx"]["bass"], "eq": q["eq"], "residual": q["residual"]}
+    B = {**B, "prm": {**B["prm"], "stemFx": {**B["prm"]["stemFx"], "bass": fx}}}
+    res = BA.residual(B)
+    dry, _ = BA.render_notes(B, q["notes"])
+    g = BA.gain_from_curve(B, q["faderDb"]) if q.get("faderDb") else None
+    return np.asarray(BA.chain(B, dry, res, q["eq"], frozen_gain=g), np.float32)
+
+
+def render_other(d: Path, bench: Path, sr: int) -> np.ndarray:
+    """Re-transcribed notes, timbre tables, fx chain and stereo of an IterateOther version. FR : piste other."""
+    _scripts()
+    import IterateOther as IO
+    from . import other as O
+    prm = json.loads((d / "params.json").read_text())
+    ctx = O.context(prm.get("base", "V_034"))
+    P, n = ctx["P"], ctx["n"]
+    notes = json.loads((d / "score-other.json").read_text())["notes"]
+    dry = O.render_dry(prm["voices"], notes, P, n, prm["seeds"])
+    x = O.apply_fx(dry, prm["stemFx"], IO.score_with(ctx, notes), P, n)
+    return np.asarray(RS.apply_stereo(x, prm["stemFx"].get("stereo"), sr, P), np.float32)
+
+
+def render_vocals(d: Path, bench: Path, sr: int) -> np.ndarray:
+    """Formant pad over the score envelopes and our base stems (leakage), then the base stereo. FR : voix."""
+    from . import vocals as V
+    q = json.loads((d / "params.json").read_text())
+    P = RS.params()
+    bdir = bench / q.get("base", "V_034")
+    ours = {k: RS.mono(RS._read(bdir / "stems" / f"{k}.wav", sr)) for k in ("drums", "bass", "other", "vocals")}
+    score = json.loads(Path(P["paths"]["score"]).read_text())
+    bprm = json.loads((bdir / "params.json").read_text())
+    n = bprm["lengthSamples"]
+    y, _ = V.render(q["model"], score, ours, n, sr, q["settings"])
+    st = (bprm.get("stemFx", {}).get("vocals", {}) or {}).get("stereo")
+    return np.asarray(RS.apply_stereo(y, st, sr, P), np.float32)
+
+
+RENDER = {"drums": render_drums, "bass": render_bass, "other": render_other, "vocals": render_vocals}
+
+
+def render_stem(stem: str, d: Path, bench: Path, sr: int, n: int) -> np.ndarray:
+    """One stem, stereo, padded or cut to n samples. FR : une piste, stereo, a la longueur n."""
+    x = RENDER[stem](Path(d), Path(bench), sr)
+    if x.ndim == 1:
+        x = np.stack([x, x], axis=1)
+    if len(x) < n:
+        x = np.pad(x, ((0, n - len(x)), (0, 0)))
+    return x[:n].astype(np.float32)

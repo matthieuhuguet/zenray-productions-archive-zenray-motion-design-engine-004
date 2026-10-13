@@ -1,0 +1,47 @@
+# 12 October 2026: tests of the F0 vector harness in both directions (green on identity, red on a wrong input).
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from zrmd.vector import metrics as M  # noqa: E402
+from zrmd.vector import render as R  # noqa: E402
+
+FONT = str(Path(__file__).resolve().parent.parent / "datasets/fonts/files/Inter/Inter[opsz,wght].ttf")
+
+
+def test_identity_is_exact():
+    a = R.render_text("Hamburg", FONT, 64, {"wght": 400})
+    b = R.render_text("Hamburg", FONT, 64, {"wght": 400})
+    c = M.compare(a.mask, b.mask)
+    assert a.sha256 == b.sha256 and c["iou"]["soft"] == 1.0 and c["edge"]["mean"] == 0.0
+
+
+def test_wrong_weight_and_size_are_detected():
+    a = R.render_text("Hamburg", FONT, 64, {"wght": 400})
+    for b in (R.render_text("Hamburg", FONT, 64, {"wght": 450}), R.render_text("Hamburg", FONT, 66, {"wght": 400})):
+        c = M.compare(a.mask, b.mask)
+        assert c["iou"]["soft"] < 0.99 and c["edge"]["mean"] > 0.05
+
+
+def test_unknown_axis_is_an_error():
+    try:
+        R.shape_text("a", FONT, 20, {"wdth": 80})
+    except KeyError:
+        return
+    raise AssertionError("an unknown axis must raise")
+
+
+def test_kerning_read_from_ink():
+    k = R.render_text("AVATAR", FONT, 96, {"wght": 400})
+    p = R.render_text("AVATAR", FONT, 96, {"wght": 400}, kerning=False)
+    measured = M.kerning_from_profiles(k.mask, p.mask)
+    font = [g["kern"] for g in k.outline.glyphs][:-1]
+    assert measured is not None and max(abs(a - b) for a, b in zip(measured, font)) <= 1.0
+
+
+def test_contrast_separates_grotesque_from_didone():
+    root = Path(FONT).parent.parent
+    didone = next((root / "PlayfairDisplay").glob("*.ttf"))
+    assert M.stroke_widths(R.render_text("Hamburg", str(didone), 96).mask)["contrast"] > \
+        2 * M.stroke_widths(R.render_text("Hamburg", FONT, 96).mask)["contrast"]

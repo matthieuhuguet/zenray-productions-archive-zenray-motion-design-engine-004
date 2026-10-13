@@ -1,0 +1,25 @@
+#!/bin/zsh
+# 12 October 2026: installs (or reinstalls) the LaunchAgent com.zenray.motion, then proves the service answers.
+# Usage: service/install.sh [--uninstall]
+# FR : installe le LaunchAgent du service local, puis prouve qu'il repond.
+set -euo pipefail
+SERVICE="${0:A:h}"
+LABEL=com.zenray.motion
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOGS="$HOME/Library/Application Support/ZenRayMotion"
+DOMAIN="gui/$(id -u)"
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+if [[ "${1:-}" == "--uninstall" ]]; then rm -f "$PLIST"; echo '{"ok":true,"uninstalled":true}'; exit 0; fi
+NODE="$(command -v node)"
+mkdir -p "$LOGS" "${PLIST:h}"
+sed -e "s|@NODE@|$NODE|g" -e "s|@SERVICE@|$SERVICE|g" -e "s|@LOGS@|$LOGS|g" -e "s|@PATH@|${NODE:h}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin|g" \
+  "$SERVICE/launchd/$LABEL.plist.template" > "$PLIST"
+plutil -lint "$PLIST" >/dev/null
+launchctl bootstrap "$DOMAIN" "$PLIST"
+for i in {1..20}; do
+  if curl -s -m 2 -X POST -H 'content-type: application/json' -H 'x-zr-motion-client: 1' http://127.0.0.1:3102/api/motion -d '{"action":"status"}' | grep -q '"ok":true'; then
+    echo "{\"ok\":true,\"label\":\"$LABEL\",\"plist\":\"$PLIST\"}"; exit 0
+  fi
+  sleep 0.5
+done
+echo "{\"ok\":false,\"error\":\"service did not answer on 127.0.0.1:3102, see $LOGS/Service.error.log\"}"; exit 1

@@ -1,0 +1,55 @@
+#!/usr/bin/env node
+// 12 October 2026, 11:45 CEST: entry point of the local service com.zenray.motion (127.0.0.1:3102), started by the
+// LaunchAgent. Wires config, engine, job queue, signed media, Assets client and the zenray-data request queue.
+// Flags: --no-queue (no cloud polling), --port <n>, --once-queue (one poll then exit, for a manual check).
+// FR : point d'entree du service local, lance par le LaunchAgent.
+import { loadConfig } from './lib/config.mjs'
+import { createEngine } from './lib/engine.mjs'
+import { createJobQueue, FINAL } from './lib/jobs.mjs'
+import { createMedia } from './lib/media.mjs'
+import { createAssetsClient } from './lib/assets.mjs'
+import { createActions } from './lib/actions.mjs'
+import { createServer } from './lib/server.mjs'
+import { createCloudQueue, createGitClone } from './lib/cloudQueue.mjs'
+
+const argv = process.argv.slice(2)
+const flag = (name) => argv.includes(name)
+const value = (name) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined }
+const config = loadConfig(value('--config'))
+if (value('--port')) config.bridge.port = Number(value('--port'))
+const log = (line) => console.log(`${new Date().toISOString()} ${line}`)
+
+const engine = createEngine(config.engine)
+const jobs = createJobQueue({ stateFile: config.jobs.stateFile, keepFinished: config.jobs.keepFinished })
+const media = createMedia({ bridge: config.bridge, engine: config.engine })
+const assets = createAssetsClient(config.assets)
+const actions = createActions({ config, engine, jobs, media, assets, origin: `http://${config.bridge.host}:${config.bridge.port}` })
+
+let queue = null
+if (config.cloudQueue.enabled && !flag('--no-queue')) {
+  const q = config.cloudQueue
+  const clone = createGitClone({ remote: q.remoteUrl || `https://github.com/${q.repo}.git`, branch: q.branch, folder: q.folder, directory: q.clone, author: q.author })
+  queue = createCloudQueue({ cfg: q, clone, submit: (req, o) => actions.submit(req, o), idPattern: config.requests.requestIdPattern, log })
+  jobs.onChange((job) => { if (job.origin === 'cloud' && FINAL.has(job.state)) queue.report(job) })
+}
+
+if (flag('--once-queue')) {
+  const picked = queue ? await queue.poll() : []
+  console.log(JSON.stringify({ ok: true, picked: picked.length, state: queue?.state || null }))
+  process.exit(0)
+}
+
+const server = createServer({ config, actions, media })
+server.listen(config.bridge.port, config.bridge.host, () => log(`com.zenray.motion listening on http://${config.bridge.host}:${config.bridge.port}${config.bridge.path}`))
+server.on('error', (error) => { log(`server error: ${error.message}`); process.exit(1) })
+
+let timer = null
+if (queue) {
+  const tick = async () => { if (!jobs.busy()) { const picked = await queue.poll(); if (picked.length) log(`cloud queue: ${picked.length} request(s) picked`) } }
+  setTimeout(tick, 5000)
+  timer = setInterval(tick, config.cloudQueue.pollSeconds * 1000)
+}
+
+const stop = () => { log('stopping'); clearInterval(timer); actions.stopStudio(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000).unref() }
+process.on('SIGTERM', stop)
+process.on('SIGINT', stop)

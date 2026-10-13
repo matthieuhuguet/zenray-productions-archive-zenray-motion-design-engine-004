@@ -1,0 +1,677 @@
+# 12 October 2026: task M2, measured timbre models for the music resynthesis (spectral modelling synthesis after
+# X. Serra, "A system for sound analysis/transformation/synthesis based on a deterministic plus stochastic
+# decomposition", 1989: a sound = sinusoids whose amplitudes follow measured trajectories plus a shaped noise).
+# No sample of the reference enters a render: the analysis reduces every role of a Demucs stem to a small table of
+# numbers (a spectral envelope in dB on third-octave bands times a few time knots after the onset, the median over
+# every note or hit of the role, relative to the note's transcribed level), and the synthesis rebuilds each note with
+# code: additive sines at the score's pitch for the tonal voices, fixed-seed noise shaped in the STFT domain plus a
+# measured pitch-swept sine for the drums. A calibration loop (render, measure our render exactly like the reference,
+# move the table by the dB difference) removes the bias of the analysis window, deterministically.
+# Every number lives in params.json (voices.<role>.model tables and voices.<role>.macros), settings in
+# datasets/resynth-params.json, key "sms" (HDA interface).
+# FR : modeles de timbre mesures (synthese par modelisation spectrale, sinusoides plus bruit) ; tables mediane par
+# role, relatives au niveau de la note ; rendu par le code seul, jamais d'echantillon de la reference.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+
+def _stft_mag(x: np.ndarray, n_fft: int, hop: int) -> np.ndarray:
+    import librosa
+    return np.abs(librosa.stft(np.asarray(x, np.float32), n_fft=n_fft, hop_length=hop, center=True))
+
+
+def band_centres(fmin: float, fmax: float, per_oct: int) -> np.ndarray:
+    k = np.arange(0, int(per_oct * math.log2(fmax / fmin)) + 1)
+    return fmin * 2 ** (k / per_oct)
+
+
+def _tri(freqs: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """Row-normalised triangular weights on log2 frequency (mean power per band)."""
+    lf = np.log2(np.maximum(freqs, 1.0))
+    lc = np.log2(centres)
+    d = lc[1] - lc[0]
+    W = np.clip(1.0 - np.abs(lf[None, :] - lc[:, None]) / d, 0.0, 1.0)
+    return W / (W.sum(axis=1, keepdims=True) + 1e-12)
+
+
+def _fill(table: np.ndarray, floor_db: float) -> np.ndarray:
+    """Empty cells (nan) filled along frequency by interpolation, then along time by the nearest knot, then floor."""
+    t = table.copy()
+    for k in range(t.shape[1]):
+        col = t[:, k]
+        ok = np.isfinite(col)
+        if ok.sum() >= 2:
+            t[:, k] = np.interp(np.arange(len(col)), np.flatnonzero(ok), col[ok])
+        elif ok.sum() == 1:
+            t[:, k] = col[ok][0]
+    for k in range(t.shape[1]):
+        if not np.isfinite(t[:, k]).all():
+            src = [j for j in range(t.shape[1]) if np.isfinite(t[:, j]).all()]
+            if src:
+                t[:, k] = t[:, min(src, key=lambda j: abs(j - k))]
+    return np.where(np.isfinite(t), t, floor_db)
+
+
+def event_dev_db(ev: dict, freqs_hz, t_rel) -> np.ndarray:
+    """12 October 2026 (task M3): per-event timbre deviation, in dB, at frequencies freqs_hz (any shape [F]) and times
+    t_rel after the onset ([T]); 0 when the event carries no "dev". ev["dev"] = {"bandsHz": [B], "segS": [S] segment
+    centres after the onset, "db": [B][S]}; a tonal note measured with gate devDur stretches its centres with its dur
+    (tempo changes). Interpolated linearly in log2 frequency and in time, held flat outside. FR : ecart de timbre par
+    evenement (zrmd/audio/eventdev.py), nul quand l'evenement n'en porte pas."""
+    f = np.atleast_1d(np.asarray(freqs_hz, np.float64))
+    t = np.atleast_1d(np.asarray(t_rel, np.float64))
+    dv = ev.get("dev")
+    if not dv:
+        return np.zeros((len(f), len(t)))
+    seg = np.asarray(dv["segS"], np.float64)
+    if dv.get("devDur") and ev.get("dur"):
+        seg = seg * (ev["dur"] / dv["devDur"])
+    tab = np.asarray(dv["db"], np.float64)  # [B, S]
+    lc = np.log2(np.asarray(dv["bandsHz"], np.float64))
+    lf = np.log2(np.maximum(f, 1.0))
+    rows = np.stack([np.interp(lf, lc, tab[:, k]) for k in range(tab.shape[1])], axis=1)  # [F, S]
+    return np.stack([np.interp(t, seg, rows[i]) for i in range(len(f))])
+
+
+def midi_hz(m: float) -> float:
+    return 440.0 * 2 ** ((m - 69.0) / 12.0)
+
+
+def note_hz(ev: dict, transpose: float = 0.0) -> float:
+    return midi_hz(ev["midi"] + ev.get("cents", 0.0) / 100.0 + transpose)
+
+
+# ---------------------------------------------------------------- onset refinement (12 October 2026)
+
+def refine_times(x: np.ndarray, sr: int, times: list[float], S: dict, band: tuple[float, float] | None = None) -> list[float]:
+    """Each transcribed time moved to the strongest rise of the band-limited log energy within +-searchS (2 ms
+    frames); a time without a rise above minRiseDb stays. Analysis only, deterministic. FR : recalage des attaques."""
+    from scipy import signal
+    y = np.asarray(x, np.float64)
+    if band:
+        sos = signal.butter(4, [max(band[0], 10.0), min(band[1], 0.45 * sr)], btype="bandpass", fs=sr, output="sos")
+        y = signal.sosfiltfilt(sos, y)
+    h = max(1, int(sr * S["refineHopMs"] / 1000))
+    m = len(y) // h
+    e = 10 * np.log10((y[: m * h] ** 2).reshape(m, h).mean(axis=1) + 1e-12)
+    rise = np.diff(e, prepend=e[0])
+    out = []
+    for t in times:
+        c = int(t * sr / h)
+        r = int(S["searchS"] * sr / h)
+        a, b = max(1, c - r), min(m - 1, c + r + 1)
+        if b <= a:
+            out.append(t)
+            continue
+        i = a + int(np.argmax(rise[a:b]))
+        out.append(round((i - 0.5) * h / sr, 5) if rise[i] >= S["minRiseDb"] else t)
+    return out
+
+
+# ---------------------------------------------------------------- tonal voices (12 October 2026)
+
+def measure_tonal(x: np.ndarray, sr: int, notes: list[dict], T: dict, gains: dict | None = None) -> np.ndarray:
+    """[bands, knots] median dB of harmonic amplitude (sine amplitude units) relative to the note level.
+    Each harmonic h of each note at each knot adds one observation to the band nearest h * f0 (source-filter view:
+    the envelope is fixed in hertz, so one table serves every pitch)."""
+    S = _stft_mag(x, T["nFft"], T["hop"])
+    nb = len(band_centres(T["fMin"], T["fMax"], T["bandsPerOct"]))
+    lc0 = math.log2(T["fMin"])
+    obs = [[[] for _ in T["knotsS"]] for _ in range(nb)]
+    binhz = sr / T["nFft"]
+    for ev in notes:
+        f0 = note_hz(ev)
+        lvl = ev["levelDb"]
+        for k, kt in enumerate(T["knotsS"]):
+            if kt > ev["dur"] + T["knotAfterGateS"]:
+                break
+            i = int(round((ev["t"] + kt) * sr / T["hop"]))
+            if i >= S.shape[1]:
+                break
+            for h in range(1, T["harmonics"] + 1):
+                f = h * f0
+                if f >= T["fMax"] or f < T["fMin"]:
+                    continue
+                b0 = f / binhz
+                w = max(1, int(round(b0 * (2 ** (T["peakCents"] / 1200.0) - 1))))
+                c = int(round(b0))
+                a = 20 * math.log10(S[max(0, c - w): c + w + 1, i].max() * 4.0 / T["nFft"] + 1e-12) - lvl
+                bi = int(round((math.log2(f) - lc0) * T["bandsPerOct"]))
+                if 0 <= bi < nb:
+                    obs[bi][k].append(a)
+    tab = np.full((nb, len(T["knotsS"])), np.nan)
+    for b in range(nb):
+        for k in range(len(T["knotsS"])):
+            if len(obs[b][k]) >= T["minObs"]:
+                tab[b, k] = float(np.median(obs[b][k]))
+    return tab
+
+
+def tonal_note(ev: dict, model: dict, macros: dict, T: dict, sr: int, transpose: float, rng: np.random.Generator) -> np.ndarray:
+    """One note: additive harmonics whose amplitudes follow the table at h * f0, held after the last knot until the
+    gate, then a release of macros.releaseS (T60). Glides from the score bend the pitch."""
+    f0 = note_hz(ev, transpose)
+    dur = max(ev["dur"], T["minGateS"])
+    rel = macros["releaseS"]
+    m = int(math.ceil((dur + rel) * sr))
+    t = np.arange(m, dtype=np.float64) / sr
+    knots = np.asarray(model["knotsS"]) * macros["timeScale"]
+    tab = np.asarray(model["tableDb"], np.float64)
+    lc = np.log2(np.asarray(model["centresHz"]))
+    ft = np.full(m, f0)
+    if ev.get("glide"):
+        g0 = midi_hz(ev["glide"]["fromMidi"] + transpose)
+        tau = max(ev["glide"].get("ms", 30.0), 1.0) / 1000.0 / 3.0
+        ft = f0 * (g0 / f0) ** np.exp(-t / tau)
+    phase = 2 * np.pi * np.cumsum(ft) / sr
+    tg = np.minimum(t, dur)
+    after = np.maximum(t - dur, 0.0)
+    relg = 10 ** (-3.0 * after / max(rel, 1e-3))
+    amp0 = 10 ** ((ev["levelDb"] + macros["gainDb"]) / 20.0)
+    out = np.zeros(m)
+    nyq = min(T["fMax"], 0.45 * sr)
+    dev_on = bool(ev.get("dev"))
+    t_dev = t if dev_on else None  # 12 October 2026 (M3): time after onset for the per-note deviation
+    for h in range(1, T["harmonics"] + 1):
+        fh = h * f0
+        if fh >= nyq:
+            break
+        row = np.array([np.interp(math.log2(max(fh, 1.0)), lc, tab[:, k]) for k in range(tab.shape[1])])
+        row = row + macros["tiltDbOct"] * math.log2(fh / T["tiltPivotHz"])
+        a = 10 ** (np.interp(tg, knots, row) / 20.0)
+        if dev_on:  # 12 October 2026 (M3): per-note deviation, on the time after onset (release included)
+            a = a * 10 ** (event_dev_db(ev, [fh], t_dev)[0] / 20.0)
+        out += a * np.sin(h * phase + rng.uniform(0, 2 * np.pi) * T["randomPhase"])
+    if T["attackS"] > 0:
+        out *= np.clip(t / T["attackS"], 0.0, 1.0)
+    return (amp0 * out * relg).astype(np.float32)
+
+
+def render_tonal(notes: list[dict], model: dict, macros: dict, T: dict, sr: int, n: int, seed: int, transpose: float = 0.0, lead: float = 0.0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    buf = np.zeros(n, np.float32)
+    for ev in notes:
+        y = tonal_note(ev, model, macros, T, sr, transpose, rng)
+        at = int(round((ev["t"] - lead) * sr))
+        if at < 0:
+            y, at = y[-at:], 0
+        k = min(len(y), n - at)
+        if k > 0:
+            buf[at:at + k] += y[:k]
+    return buf
+
+
+# ---------------------------------------------------------------- drums (12 October 2026)
+
+def measure_drum_bands(x: np.ndarray, sr: int, hits: list[dict], D: dict) -> np.ndarray:
+    """[bands, knots] median dB of mean band power (per bin, STFT D.nFft) relative to the hit level."""
+    S = _stft_mag(x, D["nFft"], D["hop"]) ** 2
+    W = _tri(np.fft.rfftfreq(D["nFft"], 1.0 / sr), band_centres(D["fMin"], D["fMax"], D["bandsPerOct"]))
+    B = 10 * np.log10(W @ S + 1e-20)
+    rows = []
+    for ev in hits:
+        idx = [int(round((ev["t"] + kt) * sr / D["hop"])) for kt in D["knotsS"]]
+        if idx[-1] >= B.shape[1]:
+            continue
+        rows.append(B[:, idx] - ev["levelDb"])
+    if not rows:
+        return np.full((W.shape[0], len(D["knotsS"])), D["floorDb"])
+    if D.get("aggregate", "median") == "meanPower":  # 12 October 2026: log of the mean power, consistent with tfBands
+        return 10 * np.log10(np.mean(10 ** (np.stack(rows) / 10.0), axis=0) + 1e-30)
+    return np.median(np.stack(rows), axis=0)
+
+
+def measure_drum_tone(x: np.ndarray, sr: int, hits: list[dict], D: dict) -> dict:
+    """Median pitch track (strongest bin in toneBandHz, parabolic interpolation) and its sine amplitude in dB re
+    level at each knot."""
+    n_fft = D["toneNFft"]
+    S = _stft_mag(x, n_fft, D["hop"])
+    f = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    lo, hi = np.searchsorted(f, D["toneBandHz"][0]), np.searchsorted(f, D["toneBandHz"][1])
+    fr, am = [], []
+    for ev in hits:
+        idx = [int(round((ev["t"] + kt) * sr / D["hop"])) for kt in D["knotsS"]]
+        if idx[-1] >= S.shape[1]:
+            continue
+        rf, ra = [], []
+        for i in idx:
+            col = S[lo:hi, i]
+            j = lo + int(np.argmax(col))
+            # 12 October 2026: parabolic interpolation with the neighbours even outside the search band (an edge peak
+            # was quantised to a whole bin before). FR : interpolation meme au bord de la bande.
+            if 0 < j < S.shape[0] - 1:
+                a_, b_, c_ = np.log(S[j - 1, i] + 1e-12), np.log(S[j, i] + 1e-12), np.log(S[j + 1, i] + 1e-12)
+                dj = float(np.clip(0.5 * (a_ - c_) / (a_ - 2 * b_ + c_ - 1e-12), -0.5, 0.5))
+            else:
+                dj = 0.0
+            rf.append(f[j] + dj * (f[1] - f[0]))
+            ra.append(20 * math.log10(S[j, i] * 4.0 / n_fft + 1e-12) - ev["levelDb"])
+        fr.append(rf)
+        am.append(ra)
+    if not fr:
+        return {"freqHz": [60.0] * len(D["knotsS"]), "ampDb": [-120.0] * len(D["knotsS"])}
+    return {"freqHz": [round(float(v), 3) for v in np.median(fr, axis=0)], "ampDb": [round(float(v), 3) for v in np.median(am, axis=0)]}
+
+
+def render_drum(hits: list[dict], model: dict, macros: dict, D: dict, sr: int, n: int, seed: int) -> np.ndarray:
+    """Noise part: power grid of every hit (band table interpolated over the knots, bands to bins by the triangular
+    weights), fixed-seed complex Gaussian phases, one inverse STFT. Tone part: phase-continuous sine per hit."""
+    import librosa
+    nf = D["nFft"]
+    hop = D["hop"]
+    frames = n // hop + 1
+    freqs = np.fft.rfftfreq(nf, 1.0 / sr)
+    centres = np.asarray(model["centresHz"])
+    lf = np.log2(np.maximum(freqs, 1.0))
+    knots = np.asarray(model["knotsS"]) * macros["timeScale"]
+    tab = np.asarray(model["bandsDb"], np.float64) + macros["noiseDb"]
+    tab = tab + macros["tiltDbOct"] * np.log2(centres / D["tiltPivotHz"])[:, None]
+    binmap = np.stack([np.interp(lf, np.log2(centres), tab[:, k]) for k in range(tab.shape[1])], axis=1)  # [F, K]
+    P = np.zeros((len(freqs), frames))
+    span = int(math.ceil(knots[-1] * sr / hop)) + 1
+    for ev in hits:
+        c = ev["t"] * sr / hop
+        i0 = int(math.ceil(c))
+        cols = np.arange(i0, min(frames, i0 + span))
+        if not len(cols):
+            continue
+        dt = cols * hop / sr - ev["t"]
+        g = np.stack([np.interp(dt, knots, binmap[b], left=-200.0, right=-200.0) for b in range(len(freqs))])
+        if ev.get("dev"):  # 12 October 2026 (M3): per-hit deviation table
+            g = g + event_dev_db(ev, freqs, dt)
+        P[:, cols] += 10 ** ((g + ev["levelDb"] + macros["gainDb"]) / 10.0)
+    rng = np.random.default_rng(seed)
+    ph = rng.standard_normal(P.shape) + 1j * rng.standard_normal(P.shape)
+    ph /= np.abs(ph) + 1e-12
+    # Mean band power per bin of a Hann STFT of white noise of unit amplitude spectral density -> magnitude.
+    y = librosa.istft(np.sqrt(P) * ph, hop_length=hop, n_fft=nf, length=n).astype(np.float64)
+    tone = model.get("tone")
+    if tone and macros["toneDb"] > -100:
+        tk = np.asarray(model["knotsS"]) * macros["timeScale"]
+        m = int(math.ceil(tk[-1] * sr))
+        t = np.arange(m) / sr
+        fhz = np.interp(t, tk, np.asarray(tone["freqHz"]) * macros["tonePitch"])
+        ph_ = 2 * np.pi * np.cumsum(fhz) / sr
+        a = 10 ** ((np.interp(t, tk, tone["ampDb"]) + macros["toneDb"]) / 20.0)
+        a *= np.clip(t / max(D["toneAttackS"], 1e-4), 0.0, 1.0)
+        base = (a * np.sin(ph_)).astype(np.float64)
+        for ev in hits:
+            at = int(round(ev["t"] * sr))
+            k = min(m, n - at)
+            if at >= 0 and k > 0:
+                b_ = base[:k]
+                if ev.get("dev"):  # 12 October 2026 (M3): the sine follows the deviation at its own (median) pitch
+                    b_ = b_ * 10 ** (event_dev_db(ev, [float(np.median(tone["freqHz"]))], t[:k])[0] / 20.0)
+                y[at:at + k] += b_ * 10 ** ((ev["levelDb"] + macros["gainDb"]) / 20.0)
+    return y.astype(np.float32)
+
+
+# ---------------------------------------------------------------- joint drum tables by non-negative least squares (12 October 2026)
+# A median over the hits of one class also measures whatever else sounds at the same moment (the next kick under the
+# tail of an open hat). The stem's band power is instead modelled as the sum, over every hit of every class, of the
+# hit's linear level times its class table, the table being piecewise linear in time between the knots (tent basis).
+# For each band this is linear in the unknown table values, so one non-negative least squares per band solves every
+# class at once (a non-negative deconvolution with activations fixed by the score). Relative weights (iteratively
+# reweighted by our own fit) make it a fit of dB rather than of raw power. FR : tables conjointes par moindres carres
+# non negatifs, une resolution par bande, toutes les classes a la fois.
+
+def fit_drum_tables(x: np.ndarray, sr: int, roles_ev: dict, D: dict, tone_power: np.ndarray | None = None, role_knots: dict | None = None) -> dict:
+    from scipy.optimize import nnls
+    S = _stft_mag(x, D["nFft"], D["hop"]) ** 2
+    W = _tri(np.fft.rfftfreq(D["nFft"], 1.0 / sr), band_centres(D["fMin"], D["fMax"], D["bandsPerOct"]))
+    B = W @ S
+    if tone_power is not None:
+        B = np.maximum(B - tone_power, 0.0)
+    frames = B.shape[1]
+    tf_ = np.arange(frames) * D["hop"] / sr
+    roles = list(roles_ev)
+    kn = {r: np.asarray((role_knots or {}).get(r, D["knotsS"])) for r in roles}
+    cols = []
+    for r in roles:
+        knots = kn[r]
+        for j in range(len(knots)):
+            a = np.zeros(frames)
+            for ev in roles_ev[r]:
+                dt = tf_ - ev["t"]
+                lo = knots[j - 1] if j else knots[0] - 1e-3
+                hi = knots[j + 1] if j + 1 < len(knots) else knots[j] + 1e-3
+                up = np.clip((dt - lo) / max(knots[j] - lo, 1e-6), 0.0, 1.0)
+                dn = np.clip((hi - dt) / max(hi - knots[j], 1e-6), 0.0, 1.0)
+                tent = np.where((dt >= lo) & (dt <= hi), np.minimum(up, dn), 0.0)
+                a += 10 ** (ev["levelDb"] / 10.0) * tent
+            cols.append(a)
+    A = np.stack(cols, axis=1)
+    used = A.sum(axis=1) > 0
+    A, Bu = A[used], B[:, used]
+    out = {r: np.full((B.shape[0], len(kn[r])), D["floorDb"]) for r in roles}
+    offs = np.cumsum([0] + [len(kn[r]) for r in roles])
+    for b in range(B.shape[0]):
+        y = Bu[b]
+        if y.max() <= 1e-20:
+            continue
+        w = 1.0 / (y + y.max() * 10 ** (-D["nnlsFloorDb"] / 10.0))
+        sol = None
+        for _ in range(D["nnlsRounds"]):
+            sw = np.sqrt(w)
+            sol, _r = nnls(A * sw[:, None], y * sw, maxiter=50 * A.shape[1])
+            fit = A @ sol
+            w = 1.0 / (np.maximum(fit, 0.0) + y + y.max() * 10 ** (-D["nnlsFloorDb"] / 10.0))
+        for i, r in enumerate(roles):
+            v = sol[offs[i]:offs[i + 1]]
+            out[r][b] = np.where(v > 0, 10 * np.log10(np.maximum(v, 1e-30)), D["floorDb"])
+    return out
+
+
+# 12 October 2026: the same joint fit for the tonal voices of a stem. The band power of the stem (bandsPerOct bands)
+# is the sum over notes and harmonics of the note's power times its voice table at the harmonic's band, piecewise
+# linear between the knots, held from the gate on and released like the synthesis; one non-negative least squares per
+# band solves every voice at once. The result (band power per unit note power) becomes a sine amplitude table through
+# the band power of a unit sine at the band centre, measured once on a rendered sine. FR : tables tonales conjointes.
+
+def _unit_sine_band_power(sr: int, T: dict, centres: np.ndarray, W: np.ndarray) -> np.ndarray:
+    n = int(0.5 * sr)
+    t = np.arange(n) / sr
+    out = np.zeros(len(centres))
+    for b, c in enumerate(centres):
+        S = _stft_mag(np.sin(2 * np.pi * c * t).astype(np.float32), T["nFft"], T["hop"]) ** 2
+        out[b] = float((W[b] @ S[:, S.shape[1] // 2]))
+    return out
+
+
+def fit_tonal_tables(x: np.ndarray, sr: int, roles_ev: dict, T: dict, releases: dict) -> dict:
+    from scipy.optimize import nnls
+    centres = band_centres(T["fMin"], T["fMax"], T["bandsPerOct"])
+    W = _tri(np.fft.rfftfreq(T["nFft"], 1.0 / sr), centres)
+    B = W @ (_stft_mag(x, T["nFft"], T["hop"]) ** 2)
+    frames = B.shape[1]
+    tf_ = np.arange(frames) * T["hop"] / sr
+    knots = np.asarray(T["knotsS"])
+    roles = list(roles_ev)
+    nb, nk = len(centres), len(knots)
+    lc0 = math.log2(T["fMin"])
+    A = np.zeros((nb, frames, len(roles) * nk))
+    for ri, r in enumerate(roles):
+        rel = releases[r]
+        for ev in roles_ev[r]:
+            f0 = note_hz(ev)
+            dur = max(ev["dur"], T["minGateS"])
+            i0, i1 = int(ev["t"] * sr / T["hop"]), min(frames, int((ev["t"] + dur + rel) * sr / T["hop"]) + 2)
+            if i1 <= i0:
+                continue
+            dt = tf_[i0:i1] - ev["t"]
+            dc = np.clip(dt, 0.0, dur)
+            relg = np.where(dt > dur, 10 ** (-6.0 * (dt - dur) / max(rel, 1e-3)), 1.0) * (dt >= 0)
+            tents = np.stack([np.interp(dc, knots, np.eye(nk)[j]) for j in range(nk)], axis=1) * relg[:, None]
+            p = 10 ** (ev["levelDb"] / 10.0)
+            for h in range(1, T["harmonics"] + 1):
+                f = h * f0
+                if f >= T["fMax"]:
+                    break
+                bi = int(round((math.log2(f) - lc0) * T["bandsPerOct"]))
+                if 0 <= bi < nb:
+                    A[bi, i0:i1, ri * nk:(ri + 1) * nk] += p * tents
+    unit = _unit_sine_band_power(sr, T, centres, W)
+    out = {r: np.full((nb, nk), np.nan) for r in roles}
+    for b in range(nb):
+        y = B[b]
+        Ab = A[b]
+        used = Ab.sum(axis=1) > 0
+        if used.sum() < nk or y[used].max() <= 1e-20 or unit[b] <= 1e-20:
+            continue
+        Ab, y = Ab[used], y[used]
+        w = 1.0 / (y + y.max() * 10 ** (-T["nnlsFloorDb"] / 10.0))
+        for _ in range(T["nnlsRounds"]):
+            sw = np.sqrt(w)
+            sol, _r = nnls(Ab * sw[:, None], y * sw, maxiter=50 * Ab.shape[1])
+            w = 1.0 / (Ab @ sol + y + y.max() * 10 ** (-T["nnlsFloorDb"] / 10.0))
+        for ri, r in enumerate(roles):
+            v = sol[ri * nk:(ri + 1) * nk]
+            out[r][b] = np.where(v > 0, 10 * np.log10(np.maximum(v / unit[b], 1e-30)), np.nan)
+    return out
+
+
+# ---------------------------------------------------------------- score-informed activations (12 October 2026)
+# With the tables fixed, the band power of the stem is linear in one gain per event (the note's or hit's activation):
+# B[band, frame] ~ sum_e a_e * Phi_e[band, frame], Phi_e being the band power of event e rendered alone at its current
+# level. A bounded linear least squares (relative weights, sparse) gives every a_e at once: wrong or missed levels move,
+# and a note the transcription invented falls toward the lower bound instead of sounding (score-informed NMF, after
+# S. Ewert and M. Mueller, "Using score-informed constraints for NMF-based source separation", ICASSP 2012). The new
+# levels are written back into the version's score; the render stays a pure function of score and params.
+# FR : activations informees par la partition ; un gain par evenement, resolu d'un coup, reecrit dans la partition.
+
+def fit_activations(x: np.ndarray, sr: int, specs: dict, roles_ev: dict, P: dict) -> dict:
+    from scipy import sparse
+    from scipy.optimize import lsq_linear
+    A_ = P["sms"]["activations"]
+    nf, hop = A_["nFft"], A_["hop"]
+    centres = band_centres(A_["fMin"], A_["fMax"], A_["bandsPerOct"])
+    W = _tri(np.fft.rfftfreq(nf, 1.0 / sr), centres)
+    B = W @ (_stft_mag(x, nf, hop) ** 2)
+    nb, frames = B.shape
+    rows, cols, vals, evs = [], [], [], []
+    for role, lst in roles_ev.items():
+        spec = specs[role]
+        for ev in lst:
+            pre = A_["preS"]
+            m = int(math.ceil((pre + A_["maxEventS"]) * sr))
+            loc = {**ev, "t": pre}
+            y = render_role(spec, [loc], P, m, P["render"]["seedBase"] + 7 * len(evs))
+            a0 = int(round((ev["t"] - pre) * sr))
+            if a0 < 0:
+                y, a0 = y[-a0:], 0
+            pad = a0 % hop
+            yy = np.concatenate([np.zeros(pad, np.float32), y])
+            F = W @ (_stft_mag(yy, nf, hop) ** 2)
+            f0 = (a0 - pad) // hop
+            keep = F > F.max() * 10 ** (-A_["supportDb"] / 10.0)
+            bi, fi = np.nonzero(keep)
+            fi = fi + f0
+            ok = fi < frames
+            j = len(evs)
+            rows.append(bi[ok] * frames + fi[ok])
+            cols.append(np.full(ok.sum(), j))
+            vals.append(F[keep][ok])
+            evs.append((role, ev))
+    r = np.concatenate(rows)
+    c = np.concatenate(cols)
+    v = np.concatenate(vals)
+    used, ri = np.unique(r, return_inverse=True)
+    y = B.reshape(-1)[used]
+    w = 1.0 / np.sqrt(y + y.max() * 10 ** (-A_["floorDb"] / 10.0))
+    M = sparse.csr_matrix((v * w[ri], (ri, c)), shape=(len(used), len(evs)))
+    lo, hi = 10 ** (A_["minGainDb"] / 10.0), 10 ** (A_["maxGainDb"] / 10.0)
+    res = lsq_linear(M, y * w, bounds=(lo, hi), method="trf", lsmr_tol="auto", max_iter=A_["maxIter"])
+    moved = {}
+    for (role, ev), a in zip(evs, res.x):
+        d = 10 * math.log10(max(a, lo))
+        ev.setdefault("levelDb0", ev["levelDb"])
+        ev["levelDb"] = float(ev["levelDb"] + d)
+        moved.setdefault(role, []).append(d)
+    return {r_: {"meanAbsDb": round(float(np.mean(np.abs(d))), 3), "atFloor": int(np.sum(np.asarray(d) <= A_["minGainDb"] + 0.01))} for r_, d in moved.items()}
+
+
+# ---------------------------------------------------------------- analysis plus calibration of one stem (12 October 2026)
+
+def default_macros(kind: str) -> dict:
+    if kind == "drum":
+        return {"gainDb": 0.0, "noiseDb": 0.0, "toneDb": 0.0, "tonePitch": 1.0, "tiltDbOct": 0.0, "timeScale": 1.0}
+    return {"gainDb": 0.0, "tiltDbOct": 0.0, "timeScale": 1.0, "releaseS": 0.25}
+
+
+def render_role(spec: dict, events: list[dict], P: dict, n: int, seed: int, transpose: float = 0.0) -> np.ndarray:
+    sr = P["sampleRate"]
+    S = P["sms"]
+    if spec["kind"] == "drum":
+        return render_drum(events, spec["model"], spec["macros"], {**S["drum"], **spec.get("settings", {})}, sr, n, seed)
+    return render_tonal(events, spec["model"], spec["macros"], {**S["tonal"], **spec.get("settings", {})}, sr, n, seed, transpose)
+
+
+def analyse_stem(job: dict) -> dict:
+    """Every role of one stem: initial tables from the reference stem, then S.calibrationRounds rounds of render the
+    whole stem, measure each role on our render the same way, move each table by step * (reference - ours)."""
+    P, x, roles_ev, kinds = job["P"], job["x"], job["events"], job["kinds"]
+    sr, S = P["sampleRate"], P["sms"]
+    n = len(x)
+    specs, ref_tabs, ref_tone = {}, {}, {}
+    for role, evs in roles_ev.items():
+        kind = kinds[role]
+        if kind == "drum":
+            D = {**S["drum"], **S["roleSettings"].get(role, {})}
+            ref_tabs[role] = measure_drum_bands(x, sr, evs, D)
+            model = {"knotsS": D["knotsS"], "centresHz": [round(float(c), 3) for c in band_centres(D["fMin"], D["fMax"], D["bandsPerOct"])],
+                     "bandsDb": np.round(ref_tabs[role], 3).tolist()}
+            if role in S["toneRoles"]:
+                model["tone"] = measure_drum_tone(x, sr, evs, D)
+                ref_tone[role] = {k: list(v) for k, v in model["tone"].items()}
+            settings = S["roleSettings"].get(role, {})
+        else:
+            T = {**S["tonal"], **S["roleSettings"].get(role, {})}
+            raw = measure_tonal(x, sr, evs, T)
+            ref_tabs[role] = raw
+            model = {"knotsS": T["knotsS"], "centresHz": [round(float(c), 3) for c in band_centres(T["fMin"], T["fMax"], T["bandsPerOct"])],
+                     "tableDb": np.round(_fill(raw, T["floorDb"]), 3).tolist()}
+            settings = S["roleSettings"].get(role, {})
+        specs[role] = {"engine": "sms", "kind": kind, "model": model, "macros": {**default_macros(kind), **S["macroDefaults"].get(role, {})},
+                       "settings": settings, "gainDb": 0.0, "mute": False}
+    drum_roles = {r: e for r, e in roles_ev.items() if kinds[r] == "drum"}
+    if drum_roles and S["drum"].get("tableFit") == "nnls":
+        D = S["drum"]
+        tp = None
+        if ref_tone:  # the measured swept sines are rendered alone and their band power removed first
+            tone_only = sum(render_role({**specs[r], "macros": {**specs[r]["macros"], "noiseDb": -300.0}}, drum_roles[r], P, n, 0)
+                            for r in drum_roles if r in ref_tone)
+            Wt = _tri(np.fft.rfftfreq(D["nFft"], 1.0 / sr), band_centres(D["fMin"], D["fMax"], D["bandsPerOct"]))
+            tp = Wt @ (_stft_mag(tone_only, D["nFft"], D["hop"]) ** 2)
+        tabs = fit_drum_tables(x, sr, drum_roles, D, tp, {r: specs[r]["model"]["knotsS"] for r in drum_roles})
+        ref_nnls = tabs
+        for r, t in tabs.items():
+            specs[r]["model"]["bandsDb"] = np.round(t, 3).tolist()
+    # 12 October 2026: after an nnls start, the calibration may run in table space ("nnls") or on the knot medians
+    # ("median", measured better on tfBands: 87.2 against 84.0 at nFft 512). FR : calibration apres le depart nnls.
+    tonal_roles = {r: e for r, e in roles_ev.items() if kinds[r] == "tonal"}
+    r0 = next(iter(tonal_roles)) if tonal_roles else None
+    if tonal_roles and {**S["tonal"], **specs[r0]["settings"]}.get("tableFit") == "nnls":
+        T0 = {**S["tonal"], **specs[r0]["settings"]}
+        tabs = fit_tonal_tables(x, sr, tonal_roles, T0, {r: specs[r]["macros"]["releaseS"] for r in tonal_roles})
+        for r, t in tabs.items():
+            fl = _fill(t, T0["floorDb"])
+            specs[r]["model"]["tableDb"] = np.round(np.clip(fl, T0["floorDb"], 40.0), 3).tolist()
+    nnls_mode = bool(drum_roles) and S["drum"].get("tableFit") == "nnls" and S["drum"].get("nnlsCalibration") == "nnls"
+
+    def our_nnls(bufs_):
+        """12 October 2026: our render seen through the same joint fit (calibration in table space)."""
+        D_ = S["drum"]
+        tp_ = None
+        if ref_tone:
+            t_only = sum(render_role({**specs[r], "macros": {**specs[r]["macros"], "noiseDb": -300.0}}, drum_roles[r], P, n, 0) for r in drum_roles if r in ref_tone)
+            Wt_ = _tri(np.fft.rfftfreq(D_["nFft"], 1.0 / sr), band_centres(D_["fMin"], D_["fMax"], D_["bandsPerOct"]))
+            tp_ = Wt_ @ (_stft_mag(t_only, D_["nFft"], D_["hop"]) ** 2)
+        tot = sum(bufs_[r] for r in drum_roles)
+        return fit_drum_tables(tot, sr, drum_roles, D_, tp_, {r: specs[r]["model"]["knotsS"] for r in drum_roles})
+
+    history = []
+    rounds = S["calibrationRounds"] if not (drum_roles and S["drum"].get("tableFit") == "nnls") else S["drum"]["nnlsCalibrationRounds"]
+    rounds = S.get("calibrationRoundsByStem", {}).get(job["stem"], rounds)  # 12 October 2026: per-stem override
+    for rnd in range(rounds):
+        bufs = {r: render_role(specs[r], roles_ev[r], P, n, P["render"]["seedBase"] + i) for i, r in enumerate(specs)}
+        total = sum(bufs.values())
+        row = {}
+        ours_n = our_nnls(bufs) if nnls_mode else None
+        if S["levels"]["use"] and rnd >= S["levels"]["fromRound"]:
+            row["_levels"] = refine_levels(x, total, bufs, roles_ev, kinds, sr, S)
+        for role in specs:
+            kind = kinds[role]
+            if kind == "drum":
+                D = {**S["drum"], **specs[role]["settings"]}
+                if nnls_mode:
+                    o_, r_n = np.asarray(ours_n[role]), np.asarray(ref_nnls[role])
+                    diff = np.where((o_ > D["floorDb"] + 1) & (r_n > D["floorDb"] + 1), r_n - o_, 0.0)
+                else:
+                    ours = measure_drum_bands(total, sr, roles_ev[role], D)
+                    diff = ref_tabs[role] - ours
+                if role in ref_tone:
+                    # 12 October 2026: under the swept sine the noise is not observable (tone and noise trade power), so
+                    # there the noise table may only go down. FR : sous la sinusoide, le bruit ne peut que descendre.
+                    low = np.asarray(specs[role]["model"]["centresHz"]) <= D["toneNoiseMaxHz"]
+                    diff = np.where(low[:, None], np.minimum(diff, 0.0), diff)
+                if role in ref_tone:  # 12 October 2026: the swept sine is calibrated too (window smears the sweep)
+                    ot = measure_drum_tone(total, sr, roles_ev[role], D)
+                    tone = specs[role]["model"]["tone"]
+                    st = S["calibrationStep"]
+                    tone["ampDb"] = [round(float(a + st * np.clip(r_ - o_, -S["maxStepDb"], S["maxStepDb"])), 3)
+                                     for a, r_, o_ in zip(tone["ampDb"], ref_tone[role]["ampDb"], ot["ampDb"])]
+                    tone["freqHz"] = [round(float(np.clip(f_ * (r_ / max(o_, 1.0)) ** st, D["toneBandHz"][0], D["toneBandHz"][1])), 3)
+                                      for f_, r_, o_ in zip(tone["freqHz"], ref_tone[role]["freqHz"], ot["freqHz"])]
+                tab = np.asarray(specs[role]["model"]["bandsDb"]) + S["calibrationStep"] * np.clip(diff, -S["maxStepDb"], S["maxStepDb"])
+                specs[role]["model"]["bandsDb"] = np.round(np.clip(tab, D["floorDb"], 40.0), 3).tolist()
+            else:
+                T = {**S["tonal"], **specs[role]["settings"]}
+                ours = measure_tonal(total, sr, roles_ev[role], T)
+                diff = np.where(np.isfinite(ref_tabs[role]) & np.isfinite(ours), ref_tabs[role] - ours, 0.0)
+                tab = np.asarray(specs[role]["model"]["tableDb"]) + S["calibrationStep"] * np.clip(diff, -S["maxStepDb"], S["maxStepDb"])
+                specs[role]["model"]["tableDb"] = np.round(np.clip(tab, T["floorDb"], 40.0), 3).tolist()
+            ok = np.isfinite(diff) & np.isfinite(ref_tabs[role])
+            row[role] = round(float(np.mean(np.abs(diff[ok]))), 3) if ok.any() else None
+        history.append(row)
+    # 12 October 2026: alternate activations (levels) and table calibration. FR : alternance gains et tables.
+    A_ = S.get("activations", {})
+    if A_.get("use") and job["stem"] in A_.get("stems", []):
+        for _ in range(A_["rounds"]):
+            history.append({"_activations": fit_activations(x, sr, specs, roles_ev, P)})
+            for _r in range(A_["postCalibrationRounds"]):
+                bufs = {r: render_role(specs[r], roles_ev[r], P, n, P["render"]["seedBase"] + i) for i, r in enumerate(specs)}
+                total = sum(bufs.values())
+                row = {}
+                for role in specs:
+                    if kinds[role] == "drum":
+                        D = {**S["drum"], **specs[role]["settings"]}
+                        diff = ref_tabs[role] - measure_drum_bands(total, sr, roles_ev[role], D)
+                        if role in ref_tone:
+                            low = np.asarray(specs[role]["model"]["centresHz"]) <= D["toneNoiseMaxHz"]
+                            diff = np.where(low[:, None], np.minimum(diff, 0.0), diff)
+                        tab = np.asarray(specs[role]["model"]["bandsDb"]) + S["calibrationStep"] * np.clip(diff, -S["maxStepDb"], S["maxStepDb"])
+                        specs[role]["model"]["bandsDb"] = np.round(np.clip(tab, D["floorDb"], 40.0), 3).tolist()
+                    else:
+                        T = {**S["tonal"], **specs[role]["settings"]}
+                        ours = measure_tonal(total, sr, roles_ev[role], T)
+                        diff = np.where(np.isfinite(ref_tabs[role]) & np.isfinite(ours), ref_tabs[role] - ours, 0.0)
+                        tab = np.asarray(specs[role]["model"]["tableDb"]) + S["calibrationStep"] * np.clip(diff, -S["maxStepDb"], S["maxStepDb"])
+                        specs[role]["model"]["tableDb"] = np.round(np.clip(tab, T["floorDb"], 40.0), 3).tolist()
+                    row[role] = round(float(np.mean(np.abs(diff[np.isfinite(diff)]))), 3)
+                history.append(row)
+    return {"stem": job["stem"], "specs": specs, "calibration": history,
+            "levels": {r: [{"i": e.get("i"), "levelDb": e["levelDb"]} for e in evs] for r, evs in roles_ev.items()}}
+
+
+def refine_levels(ref: np.ndarray, total: np.ndarray, bufs: dict, roles_ev: dict, kinds: dict, sr: int, S: dict) -> dict:
+    """12 October 2026: per-event level (the transcription's velocity) re-measured against our own render: in the
+    bins and frames where the event's role sounds (weight = role power / our total power), the reference energy over
+    ours, in dB; levelDb moves by step * clip(diff). A Wiener-style share, so simultaneous hits of other roles do not
+    pull the level. Analysis of the score only, no sample enters a render. FR : vitesses re-mesurees par evenement."""
+    L = S["levels"]
+    nf, hop = L["nFft"], L["hop"]
+    Pr = _stft_mag(ref, nf, hop) ** 2
+    Pt = _stft_mag(total, nf, hop) ** 2 + 1e-20
+    moved = {}
+    for role, evs in roles_ev.items():
+        Pk = _stft_mag(bufs[role], nf, hop) ** 2
+        share = Pk / Pt
+        d_all = []
+        for ev in evs:
+            w = L["drumWindowS"] if kinds[role] == "drum" else min(max(ev.get("dur", 0.1), 0.05), L["tonalMaxWindowS"])
+            a, b = int(ev["t"] * sr / hop), int((ev["t"] + w) * sr / hop) + 1
+            if b > Pr.shape[1]:
+                continue
+            num = float((share[:, a:b] * Pr[:, a:b]).sum())
+            den = float(Pk[:, a:b].sum())
+            if den <= 1e-14 or num <= 1e-14:
+                continue
+            d = float(np.clip(10 * math.log10(num / den), -L["maxStepDb"], L["maxStepDb"]))
+            ev.setdefault("levelDb0", ev["levelDb"])
+            ev["levelDb"] = float(np.clip(ev["levelDb"] + L["step"] * d, ev["levelDb0"] - L["maxTotalDb"], ev["levelDb0"] + L["maxTotalDb"]))
+            d_all.append(abs(d))
+        moved[role] = round(float(np.mean(d_all)), 3) if d_all else None
+    return moved

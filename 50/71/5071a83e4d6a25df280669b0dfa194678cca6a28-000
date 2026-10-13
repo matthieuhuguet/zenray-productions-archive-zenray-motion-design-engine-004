@@ -1,0 +1,55 @@
+# 12 October 2026, 16:05 CEST: split a text shot into caption instances.
+# Two successive captions often sit in the same place, so box overlap cannot separate them. The ink pattern can:
+# frame to frame, the ink masks of one caption stay alike (scale or brightness moves change little after
+# normalising the box), while a new caption rewrites them. A caption is a run of frames with ink whose
+# normalised mask stays similar; an empty gap or a mask change starts the next one.
+from __future__ import annotations
+
+import cv2
+import numpy as np
+
+from .. import settings
+from ..media import iter_frames, probe
+
+
+def _norm_mask(ink: np.ndarray, size=(256, 32)) -> np.ndarray | None:
+    ys, xs = np.nonzero(ink)
+    if len(xs) < 30:
+        return None
+    crop = ink[ys.min():ys.max() + 1, xs.min():xs.max() + 1].astype(np.float32)
+    return cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+
+
+def captions(video: str, start: float, end: float, cfg: dict | None = None) -> list[dict]:
+    cfg = cfg or settings.get("analysis.captions")
+    info = probe(video)
+    fps = info["fps"]
+    masks, times, present = [], [], []
+    for k, frame in enumerate(iter_frames(video, cfg["width"], cfg["height"], gray=True, start=start, duration=end - start)):
+        ink = frame > cfg["ink_level"]
+        m = _norm_mask(ink)
+        masks.append(m); times.append(start + k / fps); present.append(m is not None)
+    segments, current = [], None
+    for i, m in enumerate(masks):
+        if m is None:
+            if current and i - current["last"] > cfg["gap_frames"]:
+                segments.append(current); current = None
+            continue
+        if current is not None:
+            ref = masks[current["last"]]
+            sim = float(np.corrcoef(ref.ravel(), m.ravel())[0, 1]) if ref.std() > 0 and m.std() > 0 else 0.0
+            if sim < cfg["change_similarity"]:
+                segments.append(current); current = None
+        if current is None:
+            current = {"first": i, "last": i}
+        else:
+            current["last"] = i
+    if current:
+        segments.append(current)
+    out = []
+    for s in segments:
+        if s["last"] - s["first"] + 1 < cfg["min_frames"]:
+            continue
+        out.append({"start": round(times[s["first"]], 4), "end": round(times[s["last"]] + 1 / fps, 4),
+                    "frames": s["last"] - s["first"] + 1})
+    return out

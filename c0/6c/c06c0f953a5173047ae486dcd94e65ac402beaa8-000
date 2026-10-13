@@ -1,0 +1,448 @@
+# 12 October 2026: music map of a reference (tempo, beat grid, sections, energy, key) and an ORIGINAL bed made in code.
+# Analysis measures numbers only. Generation never reads a reference sample: it rebuilds the production on the same
+# grid (drum programming, pitch-drop kick, sidechain pump, step gate, bass and pad) over a generic progression of the
+# measured key, chosen from a small public library by seed. The music score never compares notes (R03 section 8).
+# FR : carte musicale mesuree, puis musique originale en code sur la meme grille ; aucune note de la reference.
+from __future__ import annotations
+
+import math
+
+import librosa
+import numpy as np
+from scipy import signal
+
+from . import config, loudness
+
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def _db(x: np.ndarray) -> float:
+    return float(10 * np.log10(np.mean(np.asarray(x, dtype=np.float64) ** 2) + 1e-12))
+
+
+def _lp(x, sr, hz, order=4):
+    return signal.sosfilt(signal.butter(order, hz, fs=sr, output="sos"), x)
+
+
+def _hp(x, sr, hz, order=4):
+    return signal.sosfilt(signal.butter(order, hz, btype="highpass", fs=sr, output="sos"), x)
+
+
+def kick_grid(drums: np.ndarray, sr: int, cfg: dict) -> dict:
+    """Beat grid from the low-passed drum stem: autocorrelation tempo, then a least-squares phase and period fit."""
+    m = cfg["music"]
+    hop = int(m["hopMs"] * sr / 1000)
+    low = _lp(drums, sr, m["lowPassHz"]).astype(np.float32)
+    env = librosa.onset.onset_strength(y=low, sr=sr, hop_length=hop)
+    onsets = librosa.onset.onset_detect(onset_envelope=env, sr=sr, hop_length=hop, units="time", delta=0.3)
+    lags = np.arange(int(60.0 / m["maxBpm"] / (hop / sr)), int(60.0 / m["minBpm"] / (hop / sr)) + 1)
+    e = env - env.mean()
+    ac = np.array([np.dot(e[:-lag], e[lag:]) for lag in lags])
+    period = float(lags[int(np.argmax(ac))] * hop / sr)
+    if len(onsets) < 4:
+        return {"bpm": 60.0 / period, "period": period, "t0": 0.0, "kickOnsets": [round(float(t), 4) for t in onsets], "residualMs": None}
+    t0 = float(onsets[0])
+    for _ in range(4):
+        k = np.round((onsets - t0) / period)
+        good = np.abs(onsets - (t0 + k * period)) < 0.03
+        if good.sum() < 3:
+            break
+        A = np.vstack([np.ones(good.sum()), k[good]]).T
+        t0, period = (float(v) for v in np.linalg.lstsq(A, onsets[good], rcond=None)[0])
+    k = np.round((onsets - t0) / period)
+    resid = onsets - (t0 + k * period)
+    good = np.abs(resid) < 0.03
+    first = float(onsets[good][0]) if good.any() else t0
+    return {"bpm": 60.0 / period, "period": period, "t0": first - round((first - t0) / period) * period + 0.0,
+            "firstKick": first, "kickOnsets": [round(float(t), 4) for t in onsets],
+            "residualMs": round(float(1000 * np.std(resid[good])), 2) if good.any() else None, "kicksOnGrid": int(good.sum())}
+
+
+def beat_times(t0: float, period: float, duration: float) -> np.ndarray:
+    start = t0 - math.floor(t0 / period) * period
+    return np.arange(start, duration, period)
+
+
+def key_of(x: np.ndarray, sr: int, cfg: dict) -> dict:
+    """Mean chroma against the 24 rotated Krumhansl profiles (major and minor)."""
+    m = cfg["music"]
+    y = librosa.resample(np.asarray(x, dtype=np.float32), orig_sr=sr, target_sr=22050)
+    chroma = librosa.feature.chroma_cqt(y=y, sr=22050).mean(axis=1)
+    best = (-2.0, 0, "major")
+    scores = {}
+    for mode, prof in (("major", m["krumhanslMajor"]), ("minor", m["krumhanslMinor"])):
+        for tonic in range(12):
+            r = float(np.corrcoef(chroma, np.roll(prof, tonic))[0, 1])
+            scores[f"{NOTE_NAMES[tonic]} {mode}"] = round(r, 3)
+            if r > best[0]:
+                best = (r, tonic, mode)
+    return {"tonic": best[1], "mode": best[2], "name": f"{NOTE_NAMES[best[1]]} {best[2]}", "correlation": round(best[0], 3),
+            "chroma": [round(float(v), 3) for v in chroma / (chroma.max() + 1e-12)]}
+
+
+def beat_features(stems: dict, sr: int, beats: np.ndarray, duration: float, cfg: dict) -> np.ndarray:
+    """Per-beat levels in dB: kick band, hat band, bass, other, mix (one row per beat)."""
+    m = cfg["music"]
+    kick = _lp(stems["drums"], sr, m["lowPassHz"])
+    hat = _hp(stems["drums"], sr, m["hat"]["hpHz"])
+    mix = stems["drums"] + stems["bass"] + stems["other"]
+    edges = np.append(beats, duration)
+    rows = []
+    for a, b in zip(edges[:-1], edges[1:]):
+        i, j = int(a * sr), max(int(b * sr), int(a * sr) + 1)
+        rows.append([_db(kick[i:j]), _db(hat[i:j]), _db(stems["bass"][i:j]), _db(stems["other"][i:j]), _db(mix[i:j])])
+    return np.array(rows)
+
+
+def sections_of(feat: np.ndarray, beats: np.ndarray, duration: float, cfg: dict) -> list[dict]:
+    """Novelty between the K beats before and after each beat (dB features), peaks at least sectionMinBeats apart."""
+    m = cfg["music"]
+    K = m["sectionKernelBeats"]
+    f = np.maximum(feat, -60.0) / 10.0
+    nov = np.zeros(len(f))
+    for b in range(1, len(f)):
+        pre, post = f[max(0, b - K):b], f[b:b + K]
+        nov[b] = float(np.linalg.norm(pre.mean(axis=0) - post.mean(axis=0)))
+    order = np.argsort(-nov)
+    picks = []
+    for b in order:
+        if nov[b] < 1.0 or len(picks) >= m["sectionMax"] - 1:
+            break
+        if all(abs(b - p) >= m["sectionMinBeats"] for p in picks):
+            picks.append(int(b))
+    bounds = [0] + sorted(picks) + [len(f)]
+    out = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        seg = feat[a:b]
+        out.append({"startBeat": a, "endBeat": b, "start": round(float(beats[a]) if a < len(beats) else duration, 4),
+                    "end": round(float(beats[b]) if b < len(beats) else duration, 4),
+                    "kickDb": round(float(np.median(seg[:, 0])), 2), "hatDb": round(float(np.median(seg[:, 1])), 2),
+                    "bassDb": round(float(np.median(seg[:, 2])), 2), "otherDb": round(float(np.median(seg[:, 3])), 2),
+                    "mixDb": round(float(np.median(seg[:, 4])), 2)})
+    out[0]["start"] = 0.0
+    return out
+
+
+def gate_depth(other: np.ndarray, sr: int, start: float, end: float, period: float, steps_per_beat: int) -> float:
+    """Depth (dB) of the amplitude modulation of the 'other' stem at the step rate inside [start, end]."""
+    seg = other[int(start * sr):int(end * sr)]
+    if len(seg) < sr // 2:
+        return 0.0
+    hop = int(0.005 * sr)
+    env = np.sqrt(np.convolve(seg ** 2, np.ones(hop) / hop, mode="valid")[::hop] + 1e-12)
+    env = env - env.mean()
+    spec = np.abs(np.fft.rfft(env * np.hanning(len(env)))) ** 2
+    freqs = np.fft.rfftfreq(len(env), 0.005)
+    rate = steps_per_beat / period
+    near = (freqs > rate * 0.5) & (freqs < rate * 1.5)
+    at = np.abs(freqs - rate) < 0.06 * rate
+    if not at.any() or not near.any():
+        return 0.0
+    return round(float(10 * np.log10(spec[at].max() / (np.median(spec[near]) + 1e-20))), 2)
+
+
+def beat_shapes(stems: dict, sr: int, beats: np.ndarray, sections: list[dict], cfg: dict) -> list[dict]:
+    """12 October 2026: per section, the median amplitude envelope of one beat (shapePoints samples) for each shape
+    stem, normalised to its maximum. It measures the production (sidechain pump, step gate), never a pitch.
+    FR : forme d'enveloppe d'un temps par section (pompage, gate), mesure de production, jamais une hauteur."""
+    m = cfg["music"]
+    n_pts = m["shapePoints"]
+    out = []
+    for sec in sections:
+        rows = {k: [] for k in m["shapeStems"]}
+        for b in beats[sec["startBeat"]:sec["endBeat"]]:
+            a = int(b * sr)
+            span = int((beats[1] - beats[0]) * sr) if len(beats) > 1 else sr
+            for k in m["shapeStems"]:
+                seg = stems[k][a:a + span]
+                if len(seg) < span:
+                    continue
+                r = np.sqrt(np.mean(seg.reshape(n_pts, -1)[:, : (span // n_pts)] ** 2, axis=1) if span % n_pts == 0
+                            else np.mean(seg[: (span // n_pts) * n_pts].reshape(n_pts, -1) ** 2, axis=1))
+                rows[k].append(r)
+        shape = {}
+        for k, v in rows.items():
+            if v:
+                med = np.median(np.asarray(v), axis=0)
+                shape[k] = [round(float(x), 4) for x in np.maximum(med / (med.max() + 1e-12), m["shapeFloor"])]
+        out.append(shape)
+    return out
+
+
+def drum_steps(drums: np.ndarray, sr: int, t0: float, period: float, kick_onsets: list, cfg: dict) -> list[list]:
+    """12 October 2026: drum programming read off the drum stem: every onset near a sixteenth step becomes
+    [step index from t0, 'kick' | 'snare' | 'hat', level dB]. Rhythm and production only, no pitch.
+    FR : programmation de batterie mesuree au seizieme, par bande (grosse caisse, caisse claire, charleston)."""
+    ds = cfg["music"]["drumSteps"]
+    hop = int(cfg["music"]["hopMs"] * sr / 1000)
+    env = librosa.onset.onset_strength(y=drums.astype(np.float32), sr=sr, hop_length=hop)
+    on = librosa.onset.onset_detect(onset_envelope=env, sr=sr, hop_length=hop, units="time", delta=ds["delta"], backtrack=False)
+    step = period / 4.0
+    ko = np.asarray(kick_onsets)
+    bands = {k: signal.butter(4, ds[k], btype="bandpass", fs=sr, output="sos") for k in ("lowHz", "midHz", "highHz")}
+    out = []
+    n = int(ds["measureMs"] * sr / 1000)
+    # Every measured kick onset is a kick step, whatever the flux threshold found (12 October 2026: the kick at
+    # 6.43 s of onekey-pro-2 was lost when the flux onset moved). FR : chaque attaque de grosse caisse mesuree compte.
+    kick_steps = set()
+    for t in ko:
+        k = round((t - t0) / step)
+        if abs(t - (t0 + k * step)) <= ds["matchMs"] / 1000.0:
+            seg = drums[int(t * sr):int(t * sr) + n]
+            if len(seg) == n:
+                out.append([int(k), "kick", round(_db(seg), 2)])
+                kick_steps.add(int(k))
+    for t in on:
+        k = round((t - t0) / step)
+        if abs(t - (t0 + k * step)) > ds["matchMs"] / 1000.0:
+            continue
+        seg = drums[int(t * sr):int(t * sr) + n]
+        if len(seg) < n:
+            continue
+        e = {b: float(np.mean(signal.sosfilt(sos, seg) ** 2)) for b, sos in bands.items()}
+        tot = sum(e.values()) + 1e-20
+        # A measured kick onset at this step makes it a kick; otherwise the low-band share decides.
+        is_kick = (ko.size and np.min(np.abs(ko - t)) <= ds["matchMs"] / 1000.0) or e["lowHz"] / tot >= ds["kickLowShare"]
+        kind = "kick" if is_kick else ("hat" if e["highHz"] / tot >= ds["hatHighShare"] else "snare")
+        if kind == "kick" and int(k) in kick_steps:
+            continue
+        out.append([int(k), kind, round(_db(seg), 2)])
+    if out:
+        top = {kk: max(r[2] for r in out if r[1] == kk) for kk in {r[1] for r in out}}
+        out = [r for r in out if r[2] >= top[r[1]] - ds["minDbBelowMax"]]
+    return out
+
+
+def kick_decay_ms(drums: np.ndarray, sr: int, kick_onsets: list, cfg: dict) -> float:
+    """12 October 2026: median amplitude time constant of the measured kicks (low band, time to fall dropDb below
+    the peak, converted to an exponential tau). Production only. FR : constante de decroissance des grosses caisses."""
+    kd = cfg["music"]["kickDecay"]
+    low = _lp(drums, sr, cfg["music"]["lowPassHz"])
+    w = max(1, int(kd["windowMs"] * sr / 1000))
+    taus = []
+    for t in kick_onsets:
+        seg = low[int(t * sr):int(t * sr) + int(kd["maxMs"] * sr / 1000)]
+        if len(seg) < 4 * w:
+            continue
+        env = np.sqrt(np.convolve(seg ** 2, np.ones(w) / w, mode="valid"))
+        i = int(np.argmax(env))
+        below = np.nonzero(20 * np.log10(env[i:] / (env[i] + 1e-12) + 1e-12) <= -kd["dropDb"])[0]
+        if below.size:
+            taus.append(1000.0 * below[0] / sr / (kd["dropDb"] / 8.686))
+    return float(np.median(taus)) if taus else 0.0
+
+
+def bass_register(bass: np.ndarray, sr: int, cfg: dict) -> float:
+    """Median dominant frequency of the bass stem (Welch), used only to choose the octave of our own bass line."""
+    br = cfg["music"]["bassRegister"]
+    f, pxx = signal.welch(bass, fs=sr, nperseg=1 << 15)
+    band = (f >= br["fMin"]) & (f <= br["fMax"])
+    return float(f[band][np.argmax(pxx[band])]) if band.any() else 0.0
+
+
+def analyze(stems: dict, sr: int, cfg: dict | None = None) -> dict:
+    """stems: {'drums','bass','other'} mono float arrays at sr (Demucs output, or our generated stems)."""
+    cfg = cfg or config.cfg()
+    m = cfg["music"]
+    duration = len(stems["drums"]) / sr
+    grid = kick_grid(stems["drums"], sr, cfg)
+    beats = beat_times(grid["t0"], grid["period"], duration)
+    feat = beat_features(stems, sr, beats, duration, cfg)
+    sections = sections_of(feat, beats, duration, cfg)
+    for s in sections:
+        s["gate8Db"] = gate_depth(stems["other"], sr, s["start"], s["end"], grid["period"], 2)
+        s["gate16Db"] = gate_depth(stems["other"], sr, s["start"], s["end"], grid["period"], 4)
+    shapes = beat_shapes(stems, sr, beats, sections, cfg)
+    for s_, sh in zip(sections, shapes):
+        s_["beatShape"] = sh
+    mix = stems["drums"] + stems["bass"] + stems["other"]
+    curve, times = loudness.short_term(mix, sr, m["energyWindowS"], m["energyHopS"])
+    harm = sum(stems[k] for k in m["keyHarmonicStems"])
+    steps = drum_steps(stems["drums"], sr, grid["t0"], grid["period"], grid["kickOnsets"], cfg) if m["drumSteps"]["use"] else []
+    register = bass_register(stems["bass"], sr, cfg) if m["bassRegister"]["use"] else 0.0
+    kick_tau = kick_decay_ms(stems["drums"], sr, grid["kickOnsets"], cfg) if m["kickDecay"]["use"] else 0.0
+    ko = np.asarray(grid["kickOnsets"])
+    kick_beats = [bool(ko.size and np.min(np.abs(ko - b)) <= m["kickMatchMs"] / 1000.0) for b in beats]
+    return {"drumSteps": steps, "bassRegisterHz": round(register, 2), "kickDecayMs": round(kick_tau, 1), "kickBeats": kick_beats, "beatLevels": [[round(float(v), 2) for v in row] for row in feat], "beatLevelNames": ["kick", "hat", "bass", "other", "mix"],
+            "duration": round(duration, 4), "bpm": round(grid["bpm"], 3), "period": round(grid["period"], 6), "t0": round(grid["t0"], 4),
+            "firstKick": grid.get("firstKick"), "gridResidualMs": grid["residualMs"], "kicksOnGrid": grid.get("kicksOnGrid"),
+            "beats": [round(float(b), 4) for b in beats], "sections": sections, "key": key_of(harm, sr, cfg),
+            "energy": {"times": [round(float(t), 3) for t in times], "lufs": [round(float(v), 2) for v in curve]},
+            "integratedLufs": round(loudness.integrated(mix, sr), 2)}
+
+
+# ---------------------------------------------------------------- generation (original material only)
+
+def _midi_hz(n: float) -> float:
+    return 440.0 * 2.0 ** ((n - 69) / 12.0)
+
+
+def _kick(sr, k):
+    t = np.arange(int(k["decayMs"] * 5 / 1000 * sr)) / sr
+    f = k["fEnd"] + (k["fStart"] - k["fEnd"]) * np.exp(-t / (k["dropMs"] / 1000))
+    x = np.sin(2 * math.pi * np.cumsum(f) / sr) * np.exp(-t / (k["decayMs"] / 1000))
+    x[: int(0.002 * sr)] += k["clickLevel"] * np.hanning(int(0.002 * sr) * 2)[: int(0.002 * sr)]
+    return x
+
+
+def _noise_hit(sr, rng, decay_ms, hp=None, lp=None, tone=None):
+    t = np.arange(int(decay_ms * 6 / 1000 * sr)) / sr
+    x = rng.standard_normal(len(t))
+    if hp:
+        x = _hp(x, sr, hp, 2)
+    if lp:
+        x = _lp(x, sr, lp, 2)
+    if tone:
+        x = 0.6 * x / (np.abs(x).max() + 1e-9) + np.sin(2 * math.pi * tone * t)
+    return x * np.exp(-t / (decay_ms / 1000))
+
+
+def _place(buf, hit, at, sr, gain=1.0):
+    a = int(round(at * sr))
+    if a >= len(buf) or a + len(hit) <= 0:
+        return
+    s = max(0, -a)
+    n = min(len(hit) - s, len(buf) - max(a, 0))
+    buf[max(a, 0):max(a, 0) + n] += gain * hit[s:s + n]
+
+
+def section_roles(sec: dict, ref: dict, cfg: dict) -> dict:
+    """Which instruments play in a section, decided from measured stem levels relative to the loudest section."""
+    m = cfg["music"]
+    top = {k: max(s[k] for s in ref["sections"]) for k in ("kickDb", "hatDb", "bassDb", "otherDb", "mixDb")}
+    rel = {k: sec[k] - top[k] for k in top}
+    return {"kick": rel["kickDb"] > m["kickPresenceDb"], "hat": rel["hatDb"] > m["kickPresenceDb"],
+            "snare": rel["kickDb"] > m["kickPresenceDb"], "bass": rel["bassDb"] > m["kickPresenceDb"],
+            "pad": rel["otherDb"] > m["kickPresenceDb"] - 6, "gate": max(sec.get("gate8Db", 0), sec.get("gate16Db", 0)) > 10.0,
+            "gainDb": float(np.clip(rel["mixDb"], -m["energyGainRangeDb"], 0.0)),
+            "levels": {k: float(np.clip(rel[k], -m["energyGainRangeDb"], 0.0)) for k in ("kickDb", "hatDb", "bassDb", "otherDb")}}
+
+
+def generate(ref: dict, sr: int, cfg: dict | None = None, seed: int | None = None) -> dict:
+    """Original bed on the measured grid. Returns stems {'drums','bass','other'} (mono float64) and the plan used."""
+    cfg = cfg or config.cfg()
+    m = cfg["music"]
+    seed = m["seed"] if seed is None else seed
+    rng = np.random.default_rng(seed)
+    n = int(round(ref["duration"] * sr))
+    P = ref["period"]
+    step = P / 4.0
+    drums, bass, pad = np.zeros(n), np.zeros(n), np.zeros(n)
+    kick_env = np.zeros(n)
+    progs = m["progressions"][ref["key"]["mode"]]
+    prog = progs[int(rng.integers(0, len(progs)))]
+    tonic = ref["key"]["tonic"]
+    kick = _kick(sr, dict(m["kick"], decayMs=ref["kickDecayMs"]) if ref.get("kickDecayMs") else m["kick"])
+    beats = np.asarray(ref["beats"])
+    bar0 = ref["firstKick"] if ref.get("firstKick") is not None else ref["t0"]
+    measured_steps = bool(ref.get("drumSteps")) and m["drumSteps"]["use"]
+    if measured_steps:
+        # Drum programming from the measured sixteenth steps, levels relative to the loudest hit of each kind.
+        tops = {k: max(r[2] for r in ref["drumSteps"] if r[1] == k) for k in {r[1] for r in ref["drumSteps"]}}
+        hits = {"kick": kick, "snare": None, "hat": None}
+        for k_step, kind, level in ref["drumSteps"]:
+            t = ref["t0"] + k_step * step
+            if kind == "kick":
+                hit, base_level = kick, m["kick"]["level"]
+            elif kind == "snare":
+                hit, base_level = _noise_hit(sr, rng, m["snare"]["decayMs"], lp=m["snare"]["noiseLp"], tone=m["snare"]["toneHz"]), m["snare"]["level"]
+            else:
+                hit, base_level = _noise_hit(sr, rng, m["hat"]["decayMs"], hp=m["hat"]["hpHz"]), m["hat"]["level"]
+            _place(drums, hit, t, sr, base_level * 10 ** ((level - tops[kind]) / 20.0))
+    plan = []
+    for sec in ref["sections"]:
+        roles = section_roles(sec, ref, cfg)
+        lv = {k: 10 ** (v / 20.0) for k, v in roles["levels"].items()}
+        plan.append({"start": sec["start"], "end": sec["end"], **{k: v for k, v in roles.items() if k != "levels"}})
+        sb = [(i, b) for i, b in enumerate(beats) if sec["start"] - 1e-6 <= b < sec["end"] - 1e-6]
+        for bi, b in sb:
+            # Per-beat programming: an instrument plays on this beat when its measured band is present there.
+            # FR : programmation au temps pres, decidee par la presence mesuree de chaque bande sur ce temps.
+            row = ref["beatLevels"][bi] if bi < len(ref.get("beatLevels", [])) else None
+            if row is not None:
+                tops = np.percentile(np.asarray(ref["beatLevels"]), m["beatTopPercentile"], axis=0)
+                rel_b = [row[j] - tops[j] for j in range(5)]
+                kb = ref["kickBeats"][bi] if bi < len(ref.get("kickBeats", [])) else rel_b[0] > m["kickPresenceDb"]
+                roles = dict(roles, kick=kb, snare=kb,
+                             hat=rel_b[1] > m["kickPresenceDb"], bass=rel_b[2] > m["kickPresenceDb"], pad=rel_b[3] > m["kickPresenceDb"] - 6)
+                lv = {k: 10 ** (float(np.clip(rel_b[j], -m["energyGainRangeDb"], 0.0)) / 20.0)
+                      for j, k in enumerate(("kickDb", "hatDb", "bassDb", "otherDb"))}
+            beat_index = int(round((b - bar0) / P))
+            bar_index = beat_index // m["beatsPerBar"]
+            chord_root = (tonic + prog[(bar_index // m["barsPerChord"]) % len(prog)]) % 12
+            minor = ref["key"]["mode"] == "minor"
+            third = 3 if (minor and prog[(bar_index // m["barsPerChord"]) % len(prog)] in (0, 5, 7)) else 4
+            for s16 in range(4):
+                t = b + s16 * step
+                pos = (beat_index % m["beatsPerBar"]) * 4 + s16
+                if measured_steps:
+                    if roles["kick"] and s16 == 0:
+                        _place(kick_env, np.exp(-np.arange(int(m["pump"]["releaseMs"] * 4e-3 * sr)) / (m["pump"]["releaseMs"] / 1000 * sr)), t, sr)
+                    continue
+                if roles["kick"] and s16 == 0:
+                    _place(drums, kick, t, sr, m["kick"]["level"] * lv["kickDb"])
+                    _place(kick_env, np.exp(-np.arange(int(m["pump"]["releaseMs"] * 4e-3 * sr)) / (m["pump"]["releaseMs"] / 1000 * sr)), t, sr)
+                if roles["hat"] and pos in m["hat"]["steps"]:
+                    _place(drums, _noise_hit(sr, rng, m["hat"]["decayMs"], hp=m["hat"]["hpHz"]), t, sr, m["hat"]["level"] * lv["hatDb"])
+                if roles["snare"] and pos in m["snare"]["steps"]:
+                    _place(drums, _noise_hit(sr, rng, m["snare"]["decayMs"], lp=m["snare"]["noiseLp"], tone=m["snare"]["toneHz"]), t, sr,
+                           m["snare"]["level"] * lv["kickDb"])
+            shape = sec.get("beatShape", {}) if m["useMeasuredShapes"] else {}
+            if roles["bass"]:
+                if ref.get("bassRegisterHz"):
+                    # Octave chosen so our root sits nearest the measured bass register (the register, not the notes).
+                    reg_midi = 69 + 12 * math.log2(ref["bassRegisterHz"] / 440.0)
+                    f = _midi_hz(chord_root + 12 * round((reg_midi - chord_root) / 12.0))
+                else:
+                    f = _midi_hz(12 * (m["bass"]["octave"] + 1) + chord_root)
+                tt = np.arange(int(P * sr)) / sr
+                note = np.tanh(m["bass"]["drive"] * (np.sin(2 * math.pi * f * tt) + 0.3 * np.sin(4 * math.pi * f * tt)))
+                env = (np.interp(tt / P, (np.arange(len(shape["bass"])) + 0.5) / len(shape["bass"]), shape["bass"]) if "bass" in shape
+                       else np.exp(-tt / (m["bass"]["decayMs"] / 1000)))
+                _place(bass, _lp(note * env, sr, m["bass"]["lpHz"], 2), b, sr, m["bass"]["level"] * lv["bassDb"])
+            if roles["pad"]:
+                notes = [chord_root, chord_root + third, chord_root + 7]
+                tt = np.arange(int(P * sr) + 1) / sr
+                tone = np.zeros(len(tt))
+                for nn in notes:
+                    f = _midi_hz(12 * (m["pad"]["octave"] + 1) + nn)
+                    for v in range(m["pad"]["voices"]):
+                        det = 2 ** ((v - (m["pad"]["voices"] - 1) / 2) * m["pad"]["detuneCents"] / 1200)
+                        tone += np.sin(2 * math.pi * f * det * tt + 1.7 * v)
+                if "other" in shape:
+                    tone *= np.interp(tt / P, (np.arange(len(shape["other"])) + 0.5) / len(shape["other"]), shape["other"])
+                elif roles["gate"]:
+                    steps = m["pad"]["gateSteps"]
+                    phase = (tt / (P / steps)) % 1.0
+                    tone *= (phase < m["pad"]["gateDuty"]).astype(float)
+                _place(pad, tone, b, sr, m["pad"]["level"] * lv["otherDb"])
+    pad = _lp(pad, sr, m["pad"]["lpHz"], 2)
+    # With measured beat shapes the pump is already inside the bass and pad envelopes; the synthetic pump is the
+    # fallback. FR : avec les formes mesurees, le pompage est deja dans les enveloppes.
+    pump = np.ones(n) if m["useMeasuredShapes"] else 1.0 - m["pump"]["depth"] * np.clip(kick_env, 0.0, 1.0)
+    return {"stems": {"drums": drums, "bass": bass * pump, "other": pad * pump}, "plan": plan, "progression": prog,
+            "key": ref["key"]["name"], "seed": seed}
+
+
+def score(ref: dict, gen: dict, cfg: dict | None = None) -> dict:
+    """Music score without note comparison: tempo, section boundaries, energy curve, key identity or relative."""
+    cfg = cfg or config.cfg()
+    m = cfg["music"]
+    base = cfg["score"]["base"]
+    tempo_e = abs(gen["bpm"] / ref["bpm"] - 1.0) * 100.0 / m["scoreTempoJndPct"]
+    rb = [s["start"] for s in ref["sections"][1:]]
+    gb = [s["start"] for s in gen["sections"][1:]]
+    errs = [min(abs(a - b) for b in gb) / (ref["period"] * m["scoreBoundaryBeats"]) if gb else 3.0 for a in rb]
+    bound_e = math.sqrt(float(np.mean(np.square(errs)))) if errs else 0.0
+    a, b = np.asarray(ref["energy"]["lufs"]), np.asarray(gen["energy"]["lufs"])
+    k = min(len(a), len(b))
+    corr = float(np.corrcoef(a[:k], b[:k])[0, 1]) if k > 2 else 0.0
+    rk, gk = ref["key"], gen["key"]
+    same = rk["tonic"] == gk["tonic"] and rk["mode"] == gk["mode"]
+    rel = (rk["mode"] != gk["mode"]) and ((rk["tonic"] + (3 if rk["mode"] == "minor" else -3)) % 12 == gk["tonic"])
+    parts = {"tempo": 100 * base ** (tempo_e ** 2), "sections": 100 * base ** (bound_e ** 2), "energy": 100 * max(corr, 0.0),
+             "key": 100.0 if (same or rel) else 50.0}
+    geo = float(np.exp(np.mean(np.log(np.maximum(list(parts.values()), 1e-6)))))
+    return {"score": round(geo, 2), "parts": {k: round(v, 2) for k, v in parts.items()}, "tempoErrorPct": round(tempo_e * m["scoreTempoJndPct"], 3),
+            "boundaryErrorsS": [round(e * ref["period"] * m["scoreBoundaryBeats"], 3) for e in errs], "energyCorrelation": round(corr, 4),
+            "keyRef": rk["name"], "keyGen": gk["name"]}

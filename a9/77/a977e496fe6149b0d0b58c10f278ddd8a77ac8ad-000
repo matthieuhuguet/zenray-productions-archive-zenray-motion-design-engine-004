@@ -1,0 +1,203 @@
+# 12 October 2026, 15:20 CEST: the zrmd command line, the stable contract used by the MCP server, the local
+# service and the site bridge. Every command prints one JSON object on stdout and exits 0 on success.
+# Usage: python -I -m zrmd.cli <command> [options]
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+from . import settings, versions
+
+WORKSHOP = settings.path("workshop")
+MOTIONS = WORKSHOP / "motions"
+REFERENCES = WORKSHOP / "references"
+CACHE = settings.path("refcache")
+
+
+def out(data: dict, code: int = 0):
+    print(json.dumps(data, indent=1, ensure_ascii=False, default=float))
+    sys.exit(code)
+
+
+def reference_video(slug: str) -> Path:
+    meta = json.loads((REFERENCES / slug / "reference.json").read_text(encoding="utf-8"))
+    return CACHE / slug / meta["file_name"]
+
+
+def cmd_references(a):
+    items = []
+    for p in sorted(REFERENCES.glob("*/reference.json")):
+        m = json.loads(p.read_text(encoding="utf-8"))
+        items.append({k: m.get(k) for k in ("slug", "page_url", "duration_s", "width", "height", "fps", "has_audio", "title", "brand")})
+    out({"ok": True, "references": items})
+
+
+def cmd_shots(a):
+    from .analyze import shots
+    result = shots.detect(str(reference_video(a.slug)))
+    target = REFERENCES / a.slug / "analysis" / "shots.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # 12 October 2026: numpy scalars (float32 spread) are cast, they used to stop the command.
+    target.write_text(json.dumps({k: v for k, v in result.items() if k != "curves"}, indent=1, default=float) + "\n", encoding="utf-8")
+    out({"ok": True, "path": str(target), "shots": len(result["shots"]), "cuts": len(result["cuts"]), "cadence": result["cadence"]})
+
+
+def motion_summary(folder: Path) -> dict:
+    motion = versions.read_json(folder / "motion.json", {}) or {}
+    latest = motion.get("latest") or versions.latest_version(folder)
+    fid = versions.read_json(folder / latest / "fidelity.json", {}) if latest else {}
+    return {"id": folder.name, "title": motion.get("title", folder.name), "latest": latest,
+            "versions": versions.list_versions(folder), "score": fid.get("score") if fid else None,
+            "dimensions": fid.get("dimensions") if fid else None, "source": motion.get("source"),
+            "render": str(folder / latest / "render.mp4") if latest else None}
+
+
+def cmd_motions(a):
+    MOTIONS.mkdir(parents=True, exist_ok=True)
+    out({"ok": True, "motions": [motion_summary(p) for p in sorted(MOTIONS.iterdir()) if p.is_dir()]})
+
+
+def cmd_motion(a):
+    folder = MOTIONS / a.id
+    if not folder.exists():
+        out({"ok": False, "error": f"unknown motion {a.id}"}, 2)
+    summary = motion_summary(folder)
+    v = a.version or summary["latest"]
+    summary["params"] = versions.read_json(folder / v / "params.json") if v else None
+    summary["version"] = v
+    out({"ok": True, **summary})
+
+
+def cmd_iterate(a):
+    """New version from the latest (or --parent) with dotted overrides 'a.b.c=value' (JSON values), then cook,
+    render and verify when the motion has a source shot."""
+    from .emit import hyperframes as hf
+    from .render import render
+    folder = MOTIONS / a.id
+    parent = a.parent or versions.latest_version(folder)
+    params = versions.read_json(folder / parent / "params.json")
+    overrides = {}
+    for item in a.set or []:
+        key, _, raw = item.partition("=")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        overrides[key] = value
+    if a.strict:
+        # 12 October 2026: the site's door. Only exposed keys, inside their bounds (zrmd.exposed.validate).
+        from . import exposed
+        motion = versions.read_json(folder / "motion.json", {}) or {}
+        try:
+            overrides = exposed.validate(params, motion.get("recipe"), overrides)
+        except ValueError as error:
+            out({"ok": False, "error": str(error), "code": "refused"}, 2)
+    for key, value in overrides.items():
+        versions.set_path(params, key, value)
+    vdir = versions.create_version(folder, params, parent=parent, note=a.note or "iteration", author=a.author)
+    project = hf.cook(params, vdir)
+    mp4 = render(project, vdir / "render.mp4")
+    report = None
+    motion = versions.read_json(folder / "motion.json", {}) or {}
+    src = motion.get("source") or {}
+    if src.get("slug") and not a.no_verify:
+        from .verify import fidelity
+        cfg = settings.get("analysis.layers"); cfg["group"] = motion.get("recipe") == "textcard"
+        report = fidelity.shot_report(str(reference_video(src["slug"])), str(mp4), src["start"], src["end"], cfg=cfg)
+        (vdir / "fidelity.json").write_text(json.dumps(report, indent=1, default=float) + "\n", encoding="utf-8")
+    poster(mp4, vdir / "poster.jpg")
+    out({"ok": True, "version": vdir.name, "render": str(mp4), "score": report and report["score"],
+         "dimensions": report and report["dimensions"]})
+
+
+def poster(mp4: Path, target: Path, at: float = 0.5):
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", str(at), "-i", str(mp4), "-frames:v", "1", "-vf", "scale=640:-2",
+                    "-q:v", "3", str(target)], check=False)
+
+
+def cmd_catalog(a):
+    """Write the gallery catalogue (workshop/catalog.json) from every motion's latest version."""
+    MOTIONS.mkdir(parents=True, exist_ok=True)
+    items = []
+    for folder in sorted(MOTIONS.iterdir()):
+        if not folder.is_dir():
+            continue
+        s = motion_summary(folder)
+        if not s["latest"]:
+            continue
+        p = folder / s["latest"] / "poster.jpg"
+        if not p.exists() and s["render"] and Path(s["render"]).exists():
+            poster(Path(s["render"]), p)
+        motion = versions.read_json(folder / "motion.json", {}) or {}
+        params = versions.read_json(folder / s["latest"] / "params.json", {}) or {}
+        canvas = params.get("canvas", {})
+        items.append({**s, "poster": str(p), "tags": motion.get("tags", []), "recipe": motion.get("recipe"),
+                      "duration": canvas.get("frames", 0) / max(canvas.get("fps", 60), 1), "updated": motion.get("updated")})
+    data = {"schema": "zrmd/catalog@1", "updated": versions.stamp(), "motions": items}
+    versions.write_json(WORKSHOP / "catalog.json", data)
+    out({"ok": True, "path": str(WORKSHOP / "catalog.json"), "count": len(items)})
+
+
+def cmd_exposed(a):
+    """12 October 2026: the parameters the site may change for a version (at most 8 per category), with current values."""
+    from . import exposed
+    folder = MOTIONS / a.id
+    if not (folder / "motion.json").exists():
+        out({"ok": False, "error": f"unknown motion {a.id}"}, 2)
+    motion = versions.read_json(folder / "motion.json", {}) or {}
+    v = a.version or motion.get("latest") or versions.latest_version(folder)
+    params = versions.read_json(folder / v / "params.json") if v else None
+    if params is None:
+        out({"ok": False, "error": f"{a.id} has no params for {v}"}, 2)
+    out({"ok": True, "id": a.id, "version": v, "recipe": motion.get("recipe"),
+         "max_per_category": exposed.definitions()["max_per_category"], "categories": exposed.exposed_for(params, motion.get("recipe"))})
+
+
+def cmd_montage(a):
+    """12 October 2026: assemble motions and local clips into one HyperFrames composition per format, render on --render.
+    The spec is a JSON file: {id, formats, fps, fit, background, clips: [{kind: motion|file, ...}]} (zrmd.emit.montage)."""
+    from .emit import montage
+    from .render import render
+    spec = json.loads(Path(a.spec).read_text(encoding="utf-8"))
+    try:
+        plan = montage.plan(spec, MOTIONS)
+    except (ValueError, FileNotFoundError) as error:
+        out({"ok": False, "error": str(error), "code": "refused"}, 2)
+    folder = montage.root() / plan["id"]
+    folder.mkdir(parents=True, exist_ok=True)
+    versions.write_json(folder / "spec.json", spec)
+    results = []
+    for fmt in plan["formats"]:
+        project = montage.cook(plan, folder, fmt)
+        item = {"format": fmt, "project": str(project)}
+        if a.render:
+            item["render"] = str(render(project, folder / f"{fmt}.mp4", fps=plan["fps"], quality=montage.family()["render_quality"]))
+        results.append(item)
+    out({"ok": True, "id": plan["id"], "frames": plan["frames"], "fps": plan["fps"], "duration": plan["frames"] / plan["fps"],
+         "clips": len(plan["clips"]), "outputs": results})
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="zrmd")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("references").set_defaults(fn=cmd_references)
+    s = sub.add_parser("shots"); s.add_argument("slug"); s.set_defaults(fn=cmd_shots)
+    sub.add_parser("motions").set_defaults(fn=cmd_motions)
+    s = sub.add_parser("motion"); s.add_argument("id"); s.add_argument("--version"); s.set_defaults(fn=cmd_motion)
+    s = sub.add_parser("iterate"); s.add_argument("id"); s.add_argument("--set", action="append")
+    s.add_argument("--parent"); s.add_argument("--note"); s.add_argument("--author", default="zrmd")
+    s.add_argument("--no-verify", action="store_true"); s.add_argument("--strict", action="store_true")
+    s.set_defaults(fn=cmd_iterate)
+    sub.add_parser("catalog").set_defaults(fn=cmd_catalog)
+    s = sub.add_parser("exposed"); s.add_argument("id"); s.add_argument("--version"); s.set_defaults(fn=cmd_exposed)
+    s = sub.add_parser("montage"); s.add_argument("--spec", required=True); s.add_argument("--render", action="store_true")
+    s.set_defaults(fn=cmd_montage)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

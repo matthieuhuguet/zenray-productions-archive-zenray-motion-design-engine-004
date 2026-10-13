@@ -1,0 +1,192 @@
+// 12 October 2026, 11:35 CEST: the actions of the motion bridge (R06 section 6.3): status, catalogue, motion, request,
+// job, jobs, cancel, montage, render, timeline, preview-url, open-studio, publish, load, unload. Every long action is a
+// job of the single queue; a deterministic request (params, format) runs without any language model, a free
+// instruction waits for an agent (state waiting-agent).
+// FR : les actions du pont des motions ; une demande deterministe s'execute seule, une consigne libre attend un agent.
+import { spawn } from 'node:child_process'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { Refusal, checkMotionId, checkVersion, validateMontage, validateRequest } from './validate.mjs'
+
+const readJson = (file, fallback = null) => { try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return fallback } }
+
+export function createActions({ config, engine, jobs, media, assets, origin, spawnImpl = spawn }) {
+  const { engine: paths, requests: rules } = config
+  const motionsDir = path.join(paths.workshop, 'motions')
+  const montageFamily = readJson(path.join(paths.root, 'params', 'montage.json'), {})
+  let studio = null
+  // origin: a string, or a function when the port is only known after listen (tests).
+  const mediaUrl = (params) => media.url(params, typeof origin === 'function' ? origin() : origin)
+
+  function versionsOf(motionId) {
+    const folder = path.join(motionsDir, motionId)
+    if (!existsSync(path.join(folder, 'motion.json'))) throw new Refusal(`motion inconnu : ${motionId}`)
+    const names = readdirSync(folder).filter((n) => /^V_\d{3}$/.test(n)).sort()
+    return names.map((v) => {
+      const meta = readJson(path.join(folder, v, 'version.json'), {})
+      const fid = readJson(path.join(folder, v, 'fidelity.json'), null)
+      const hasRender = existsSync(path.join(folder, v, 'render.mp4'))
+      return {
+        version: v, parent: meta.parent || null, created: meta.created || null, note: meta.note || '', author: meta.author || null,
+        score: fid?.score ?? null, dimensions: fid?.dimensions ?? null, weakest: fid?.weakest ?? null,
+        render: hasRender ? mediaUrl({ kind: 'render', motion: motionId, version: v }) : null,
+        poster: existsSync(path.join(folder, v, 'poster.jpg')) ? mediaUrl({ kind: 'poster', motion: motionId, version: v }) : null,
+      }
+    })
+  }
+
+  // A deterministic iteration: the engine validates the exposed keys again (--strict), cooks, renders, verifies.
+  async function runParams(req, { step, signal }) {
+    step('validation')
+    const args = ['iterate', req.motionId, '--strict', '--note', req.note || `site: ${Object.keys(req.overrides).length} parameter(s)`, '--author', 'site']
+    if (req.baseVersion) args.push('--parent', req.baseVersion)
+    for (const [key, value] of Object.entries(req.overrides)) args.push('--set', `${key}=${JSON.stringify(value)}`)
+    step('render', { detail: 'cook, render, verify' })
+    const result = await engine.call(args, { timeoutMs: paths.renderTimeoutMs, signal })
+    step('catalogue')
+    await engine.call(['catalog'], { signal }).catch(() => null)
+    step('done', { version: result.version, score: result.score })
+    return { result: { version: result.version, score: result.score, dimensions: result.dimensions } }
+  }
+
+  async function runMontage(spec, { step, signal }, render = true) {
+    step('validation')
+    const folder = path.join(paths.montageRoot, spec.id)
+    await mkdir(folder, { recursive: true })
+    const specFile = path.join(folder, 'spec.request.json')
+    await writeFile(specFile, JSON.stringify(spec, null, 1))
+    step(render ? 'render' : 'cook', { formats: spec.formats })
+    const result = await engine.call(['montage', '--spec', specFile, ...(render ? ['--render'] : [])], { timeoutMs: paths.renderTimeoutMs, signal })
+    step('done')
+    return {
+      result: {
+        id: result.id, duration: result.duration, frames: result.frames, clips: result.clips,
+        outputs: result.outputs.map((o) => ({ ...o, url: o.render ? mediaUrl({ kind: 'montage', motion: result.id, format: o.format }) : null })),
+      },
+    }
+  }
+
+  /** Submit a validated iteration request (page or cloud queue). Returns the job view. */
+  function submit(body, { origin: from = 'page' } = {}) {
+    let req
+    try { req = validateRequest(body, rules) } catch (error) {
+      if (body?.id && /^req-/.test(String(body.id))) return jobs.record({ id: String(body.id), kind: 'request', origin: from }, 'refused', { error: error.message })
+      throw error
+    }
+    try { checkMotionId(req.motionId, rules); versionsOf(req.motionId) } catch (error) {
+      if (req.id) return jobs.record({ id: req.id, kind: 'request', motionId: req.motionId, origin: from }, 'refused', { error: error.message })
+      throw error
+    }
+    const meta = { id: req.id, kind: 'request', mode: req.mode, motionId: req.motionId, baseVersion: req.baseVersion, origin: from, request: req }
+    if (req.mode === 'instruction') return jobs.record(meta, 'waiting-agent', { note: 'consigne libre : un agent la traitera par le serveur MCP du moteur' })
+    if (req.mode === 'params') return jobs.enqueue(meta, (ctx) => runParams(req, ctx))
+    const version = req.baseVersion || versionsOf(req.motionId).at(-1)?.version
+    const spec = { id: `${req.motionId.toLowerCase().replace(/[^a-z0-9-]+/g, '-').slice(0, 30)}-${(version || 'v').toLowerCase().replace('_', '')}-formats`,
+      formats: req.formats, fit: req.fit, clips: [{ kind: 'motion', motion: req.motionId, ...(version ? { version } : {}) }] }
+    return jobs.enqueue(meta, (ctx) => runMontage(validateMontage(spec, rules, montageFamily.id_pattern), ctx))
+  }
+
+  function timeline(motionId, version) {
+    const v = version || versionsOf(motionId).at(-1)?.version
+    const params = readJson(path.join(motionsDir, motionId, v || '', 'params.json'))
+    if (!params) throw new Refusal(`pas de paramètres pour ${motionId} ${v}`)
+    const { width, height, fps, frames } = params.canvas || {}
+    const layers = (params.layers || []).map((l) => ({
+      id: l.id, type: l.type, start: l.start_frame || 0, end: l.end_frame ?? frames,
+      tracks: Object.fromEntries(Object.entries(l.tracks || {}).map(([prop, tw]) => [prop, tw.map((t) => ({ start: t.start_frame, frames: t.frames, ease: t.ease || 'none' }))])),
+    }))
+    return { motionId, version: v, canvas: { width, height, fps, frames, duration: frames / fps }, layers }
+  }
+
+  async function openStudio(motionId, version) {
+    const v = version || versionsOf(motionId).at(-1)?.version
+    const project = path.join(motionsDir, motionId, v, '16x9')
+    if (!existsSync(path.join(project, 'index.html'))) throw new Refusal('composition absente sur le Mac (LOAD d\'abord)')
+    if (studio?.child && !studio.child.killed) studio.child.kill('SIGTERM')
+    const port = String(config.studio.port)
+    const child = spawnImpl('node', [path.join(paths.root, 'Scripts', 'RunHyperframes.mjs'), 'preview', '--no-open', '--port', port],
+      { cwd: project, detached: false, stdio: 'ignore' })
+    studio = { child, motionId, version: v }
+    return { url: `http://localhost:${port}/`, motionId, version: v }
+  }
+
+  async function publish(motionId, version, push) {
+    if (!existsSync(config.publisher.script)) throw new Refusal(`publieur absent : ${config.publisher.script} (fusionner la branche motion-design-tab)`)
+    return jobs.enqueue({ kind: 'publish', motionId, origin: 'page' }, ({ step, signal }) => new Promise((resolve, reject) => {
+      step(push ? 'publish' : 'dry-run')
+      const args = [config.publisher.script, '--motion', motionId, ...(version ? ['--version', version] : []), ...(push ? ['--push'] : [])]
+      const child = spawnImpl('node', args, { cwd: path.dirname(config.publisher.script), stdio: ['ignore', 'pipe', 'pipe'], signal })
+      let out = '', err = ''
+      child.stdout.on('data', (d) => { out += d }); child.stderr.on('data', (d) => { err += d })
+      child.on('error', (error) => reject(Object.assign(error, { code: error.name === 'AbortError' ? 'cancelled' : 'publish-failed' })))
+      child.on('close', (code) => {
+        let json = null; try { json = JSON.parse(out.trim().split('\n').at(-1)) } catch {}
+        if (code === 0 && json?.ok) resolve({ result: json })
+        else reject(Object.assign(new Error(json?.error || err.trim().split('\n').slice(-2).join(' ') || `publisher exited ${code}`), { code: 'publish-failed' }))
+      })
+    }))
+  }
+
+  const handlers = {
+    status: async () => {
+      const pinned = readJson(path.join(paths.root, 'tooling', 'package.json'), {})?.devDependencies?.hyperframes || null
+      const list = jobs.list()
+      return {
+        service: 'com.zenray.motion', schemaVersion: config.schemaVersion, checkedAt: new Date().toISOString(),
+        engine: { python: existsSync(paths.python), root: existsSync(paths.root), hyperframes: pinned },
+        busy: jobs.busy(), counts: list.reduce((acc, j) => ({ ...acc, [j.state]: (acc[j.state] || 0) + 1 }), {}),
+        publisher: existsSync(config.publisher.script), studio: studio ? { motionId: studio.motionId, version: studio.version, port: config.studio.port } : null,
+      }
+    },
+    catalogue: async () => {
+      await engine.call(['catalog']).catch(() => null)
+      const catalog = readJson(path.join(paths.workshop, 'catalog.json'), { motions: [] })
+      return {
+        catalog: {
+          ...catalog,
+          motions: (catalog.motions || []).map((m) => ({
+            ...m, render: undefined,
+            posterUrl: m.latest ? mediaUrl({ kind: 'poster', motion: m.id, version: m.latest }) : null,
+            renderUrl: m.latest ? mediaUrl({ kind: 'render', motion: m.id, version: m.latest }) : null,
+            poster: undefined,
+          })),
+        },
+        jobs: jobs.list().filter((j) => !['done', 'cancelled'].includes(j.state)).slice(0, 20),
+      }
+    },
+    motion: async (body) => {
+      const id = checkMotionId(body.motionId, rules)
+      const all = versionsOf(id)
+      const version = checkVersion(body.version, rules) || all.at(-1)?.version
+      const meta = readJson(path.join(motionsDir, id, 'motion.json'), {})
+      const exposed = version ? await engine.call(['exposed', id, '--version', version]).catch((error) => ({ error: error.message })) : null
+      return { motion: { id, title: meta.title || id, recipe: meta.recipe || null, tags: meta.tags || [], source: meta.source || null, latest: meta.latest || null, version, versions: all, exposed } }
+    },
+    request: async (body) => ({ job: submit(body, { origin: 'page' }) }),
+    job: async (body) => { const job = jobs.get(String(body.id || '')); if (!job) throw new Refusal('demande inconnue'); return { job } },
+    jobs: async () => ({ jobs: jobs.list() }),
+    cancel: async (body) => { const job = jobs.cancel(String(body.id || '')); if (!job) throw new Refusal('demande inconnue'); return { job } },
+    // The spec is validated BEFORE queuing, so a refusal reaches the page at once (400 with its cause).
+    montage: async (body) => { const spec = validateMontage(body.spec, rules, montageFamily.id_pattern); return { job: jobs.enqueue({ kind: 'montage', origin: 'page' }, (ctx) => runMontage(spec, ctx, body.render !== false)) } },
+    render: async (body) => { const spec = validateMontage(body.spec, rules, montageFamily.id_pattern); return { job: jobs.enqueue({ kind: 'render', origin: 'page' }, (ctx) => runMontage(spec, ctx, true)) } },
+    timeline: async (body) => ({ timeline: timeline(checkMotionId(body.motionId, rules), checkVersion(body.version, rules)) }),
+    'preview-url': async (body) => {
+      const kind = body.kind === 'poster' ? 'poster' : 'render'
+      const id = checkMotionId(body.motionId, rules), version = checkVersion(body.version, rules, { optional: false })
+      return { url: mediaUrl({ kind, motion: id, version }) }
+    },
+    'open-studio': async (body) => ({ studio: await openStudio(checkMotionId(body.motionId, rules), checkVersion(body.version, rules)) }),
+    publish: async (body) => ({ job: await publish(checkMotionId(body.motionId, rules), checkVersion(body.version, rules), body.push === true) }),
+    load: async (body) => ({ load: await assets.load(checkMotionId(body.motionId, rules), checkVersion(body.version, rules)) }),
+    unload: async (body) => ({ unload: await assets.unload(checkMotionId(body.motionId, rules), checkVersion(body.version, rules)) }),
+  }
+
+  async function handle(body) {
+    const fn = handlers[body.action]
+    if (!fn) throw Object.assign(new Error(`action inconnue : ${String(body.action).slice(0, 40)}`), { status: 400, code: 'unknown-action' })
+    return fn(body)
+  }
+
+  return { handle, submit, actions: Object.keys(handlers), stopStudio: () => studio?.child?.kill('SIGTERM') }
+}

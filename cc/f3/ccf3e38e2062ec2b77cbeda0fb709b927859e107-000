@@ -1,0 +1,56 @@
+# 12 October 2026: task M1 tests, the transcriber proven both ways on a synthetic score whose truth is exact.
+# Green: render the known score with the verification voices, transcribe it back, note and hit F-measures high.
+# Red: the same transcription judged against a shifted truth (80 ms, +1 semitone) collapses.
+# FR : la transcription est verte sur un cas connu et rouge sur une verite decalee.
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from zrmd.audio import transcribe as T  # noqa: E402
+
+
+def test_known_case_green_and_red():
+    P = T.params()
+    r = T.known_case(P, P["analysis"]["sr"], P["analysis"]["workers"])
+    v = P["verify"]
+    assert r["drums"]["f"] >= v["knownDrumF"], r["drums"]
+    assert r["bass"]["f"] >= v["knownNoteF"], r["bass"]
+    assert r["other"]["f"] >= v["knownNoteF"], r["other"]
+    assert r["bassGlides"]["found"] >= 1
+    assert max(r["redShifted"].values()) < 0.2, r["redShifted"]
+
+
+def test_match_f_both_ways():
+    ref = [0.5, 1.0, 1.5, 2.0]
+    assert T.match_f(ref, [0.51, 1.02, 1.49, 2.0], 0.05)["f"] == 1.0
+    assert T.match_f(ref, [0.6, 1.1, 1.6, 2.1], 0.05)["f"] == 0.0
+
+
+def test_shifted_moves_notes_and_automation():
+    s = {"drums": [{"t": 1.0, "class": "kick"}], "voices": {"bass": {"notes": [{"t": 1.0, "dur": 0.5, "midi": 30}]}},
+         "automation": {"hopS": 0.05, "stems": {"bass": [-10.0, -20.0, -30.0, -40.0]}}}
+    b = T.shifted(s, 0.1, 2)
+    assert b["drums"][0]["t"] == 1.1 and b["voices"]["bass"]["notes"][0]["midi"] == 32
+    assert b["automation"]["stems"]["bass"] == [-10.0, -10.0, -10.0, -20.0]
+    assert s["voices"]["bass"]["notes"][0]["midi"] == 30  # the original is untouched
+
+
+if __name__ == "__main__":
+    # Runs under pytest, or directly: python -I tests/test_transcribe.py (exit code 0 when all pass).
+    import json
+    import time
+    ok, out = True, {}
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            t = time.time()
+            try:
+                fn()
+                out[name] = {"pass": True, "seconds": round(time.time() - t, 1)}
+            except AssertionError as exc:
+                ok = False
+                out[name] = {"pass": False, "seconds": round(time.time() - t, 1), "error": str(exc)}
+    print(json.dumps(out, indent=1))
+    sys.exit(0 if ok else 1)

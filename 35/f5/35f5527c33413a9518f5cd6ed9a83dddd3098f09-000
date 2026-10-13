@@ -1,0 +1,31 @@
+// 12 October 2026, 12:10 CEST: signed local media: valid token 200 and range 206, tampered or expired token 403,
+// path escape 400.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import http from 'node:http'
+import { createMedia } from '../lib/media.mjs'
+import { loadConfig } from '../lib/config.mjs'
+import { listen, tempWorkshop } from './helpers.mjs'
+
+test('signed media', async (t) => {
+  const ws = tempWorkshop()
+  const config = loadConfig()
+  let clock = Date.now()
+  const media = createMedia({ bridge: config.bridge, engine: { workshop: ws.workshop, montageRoot: ws.montageRoot }, now: () => clock })
+  const server = http.createServer((req, res) => media.serve(req, res))
+  const base = await listen(server)
+  t.after(() => server.close())
+  const url = media.url({ kind: 'render', motion: 'selftest', version: 'V_001' }, base)
+  const full = await fetch(url)
+  assert.equal(full.status, 200)
+  assert.equal(full.headers.get('content-type'), 'video/mp4')
+  const size = Number(full.headers.get('content-length'))
+  const part = await fetch(url, { headers: { range: 'bytes=0-99' } })
+  assert.equal(part.status, 206)
+  assert.equal(part.headers.get('content-range'), `bytes 0-99/${size}`)
+  assert.equal((await fetch(url.replace(/token=[0-9a-f]{4}/, 'token=0000'))).status, 403)
+  assert.equal((await fetch(url.replace('V_001', 'V_002'))).status, 403)
+  assert.equal((await fetch(media.url({ kind: 'render', motion: '..', version: 'V_001' }, base))).status, 400)
+  clock += config.bridge.mediaUrlTtlMs + 1
+  assert.equal((await fetch(url)).status, 403)
+})

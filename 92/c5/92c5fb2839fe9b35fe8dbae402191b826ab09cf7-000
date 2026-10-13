@@ -1,0 +1,91 @@
+# 12 October 2026, 08:05 CEST: layer decomposition of one shot (background + tracked foreground elements).
+# Background: per-frame robust colour of the picture border (flat backgrounds) with a low-order fit when it varies.
+# Foreground: pixels far from the background, grouped into elements (text lines merge horizontally), tracked across
+# frames by overlap. Each element gets per-frame box, ink area, colour and an opacity estimate relative to its
+# brightest frame. Pure measurement; nothing of the picture itself is kept.
+from __future__ import annotations
+
+import cv2
+import numpy as np
+
+from .. import settings
+from ..media import iter_frames, probe
+
+
+def background_color(frame: np.ndarray, border: int) -> np.ndarray:
+    h, w = frame.shape[:2]
+    strip = np.concatenate([frame[:border].reshape(-1, 3), frame[-border:].reshape(-1, 3),
+                            frame[:, :border].reshape(-1, 3), frame[:, -border:].reshape(-1, 3)])
+    return np.median(strip, axis=0)
+
+
+def elements_in_frame(frame: np.ndarray, bg: np.ndarray, cfg: dict) -> list[dict]:
+    diff = np.abs(frame.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
+    mask = (diff > cfg["fg_threshold"]).astype(np.uint8)
+    if mask.sum() < cfg["min_ink_px"]:
+        return []
+    kx, ky = cfg["merge_kernel"]
+    merged = np.ones_like(mask) if cfg.get("group") else cv2.dilate(mask, np.ones((ky, kx), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+    found = []
+    for i in range(1, count):
+        x, y, w, h, area = stats[i]
+        ink = mask[y:y + h, x:x + w] & (labels[y:y + h, x:x + w] == i).astype(np.uint8)
+        n = int(ink.sum())
+        if n < cfg["min_ink_px"]:
+            continue
+        pixels = frame[y:y + h, x:x + w][ink.astype(bool)]
+        ys, xs = np.nonzero(ink)
+        weights = diff[y:y + h, x:x + w][ink.astype(bool)].astype(np.float64)
+        cx = float((xs * weights).sum() / weights.sum()) + x
+        cy = float((ys * weights).sum() / weights.sum()) + y
+        sx = float(np.sqrt(((xs + x - cx) ** 2 * weights).sum() / weights.sum()))
+        sy = float(np.sqrt(((ys + y - cy) ** 2 * weights).sum() / weights.sum()))
+        found.append({"box": [int(x + xs.min()), int(y + ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)],
+                      "cx": round(cx, 3), "cy": round(cy, 3), "sx": round(sx, 4), "sy": round(sy, 4),
+                      "mass": round(float(weights.sum()), 1),
+                      "ink": n, "color": [round(float(c), 1) for c in np.percentile(pixels, 90, axis=0)],
+                      "peak": float(diff[y:y + h, x:x + w][ink.astype(bool)].max())})
+    return found
+
+
+def _iou(a, b):
+    ax, ay, aw, ah = a; bx, by, bw, bh = b
+    ix = max(0, min(ax + aw, bx + bw) - max(ax, bx)); iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    return inter / max(aw * ah + bw * bh - inter, 1)
+
+
+def analyze_shot(video: str, start: float, end: float, cfg: dict | None = None) -> dict:
+    cfg = cfg or settings.get("analysis.layers")
+    info = probe(video)
+    w, h = cfg["width"], cfg["height"]
+    scale = info["width"] / w
+    tracks: list[dict] = []
+    backgrounds = []
+    for k, frame in enumerate(iter_frames(video, w, h, start=start, duration=end - start)):
+        t = start + k / info["fps"]
+        bg = background_color(frame, cfg["border_px"])
+        backgrounds.append([round(float(c), 1) for c in bg])
+        for el in elements_in_frame(frame, bg, cfg):
+            best, best_iou = None, cfg["track_iou"]
+            for tr in tracks:
+                if tr["frames"][-1]["k"] >= k - cfg["track_gap"]:
+                    v = _iou(tr["frames"][-1]["box"], el["box"])
+                    if v > best_iou:
+                        best, best_iou = tr, v
+            if best is None:
+                best = {"id": f"L{len(tracks) + 1:02d}", "frames": []}
+                tracks.append(best)
+            best["frames"].append({"k": k, "t": round(t, 4), **el})
+    for tr in tracks:
+        peak_ink = max(f["ink"] for f in tr["frames"])
+        peak_bright = max(f["peak"] for f in tr["frames"])
+        for f in tr["frames"]:
+            f["opacity"] = round(f["peak"] / max(peak_bright, 1e-6), 4)
+            f["box_full"] = [round(v * scale, 1) for v in f["box"]]
+        tr["first_t"], tr["last_t"] = tr["frames"][0]["t"], tr["frames"][-1]["t"]
+        tr["peak_ink"] = peak_ink
+    tracks = [t for t in tracks if len(t["frames"]) >= cfg["min_track_frames"]]
+    return {"start": start, "end": end, "fps": info["fps"], "analysis_size": [w, h], "scale_to_source": scale,
+            "background": backgrounds, "elements": tracks}

@@ -1,0 +1,246 @@
+# 12 October 2026, 10:50 CEST: glyph comparator that ranks free fonts against a measured caption line.
+# FR : comparateur de glyphes qui classe les polices libres de la base face à une ligne de légende mesurée.
+#
+# Method. The target line (light text on dark) is normalised to ink 0..1 and cropped on its ink. For every font
+# file of datasets/fonts/index.json, every weight (wght axis, step 25, or the file's own weight when static) and
+# every letter-spacing (-0.04..+0.08 em), the same string is rendered with Pillow at twice the target size, then
+# scaled uniformly so its x-height equals the measured one. The ink width difference is measured at that point,
+# before any horizontal fitting; the candidate is then stretched in width only to the target ink width, aligned
+# on the baseline and the left ink edge, and compared by soft IoU of the ink and by a symmetric chamfer distance
+# (in x-heights). The score combines the three terms; lower is better.
+from __future__ import annotations
+
+import json
+import os
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import cv2
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+from zrmd.analyze.typography import line_metrics, load_font, render_line
+
+INDEX = Path(__file__).resolve().parents[2] / "datasets" / "fonts" / "index.json"
+DATE = "12 October 2026"
+
+# Parameter interface (one place). FR : interface de paramètres, un seul endroit.
+PARAMS = {
+    "weight_step": 25,
+    "weight_range": (100, 900),
+    "tracking_coarse": [-0.04, -0.02, 0.0, 0.02, 0.04, 0.06, 0.08],
+    "tracking_refine": 0.01,
+    "ink_threshold": 0.35,
+    "oversample": 2.0,          # render at this multiple of the target x-height, then downscale
+    "pad_above_xh": 1.6,        # canvas extent above the baseline, in x-heights
+    "pad_below_xh": 0.9,        # canvas extent below the baseline
+    "pad_side_xh": 0.25,
+    "w_iou": 1.0,               # score = w_iou*(1-IoU) + w_chamfer*chamfer_xh + w_width*|width error|
+    "w_chamfer": 4.0,
+    "w_width": 2.0,
+    "workers": 16,
+}
+
+
+# ---------------------------------------------------------------- target preparation
+def normalise(gray: np.ndarray) -> np.ndarray:
+    """Light-on-dark gray (any dtype) to ink 0..1 using robust background and foreground levels."""
+    g = np.asarray(gray, np.float32)
+    if g.ndim == 3:
+        g = g.mean(axis=2)
+    bg, fg = np.percentile(g, 5), np.percentile(g, 99.7)
+    return np.clip((g - bg) / max(fg - bg, 1e-6), 0.0, 1.0)
+
+
+def ink_crop(ink: np.ndarray, threshold: float) -> tuple[np.ndarray, int, int]:
+    """Crop to the ink bounding box; returns crop and its (y0, x0)."""
+    ys, xs = np.nonzero(ink >= threshold)
+    if len(ys) == 0:
+        raise ValueError("no ink in the image")
+    return ink[ys.min():ys.max() + 1, xs.min():xs.max() + 1], int(ys.min()), int(xs.min())
+
+
+def prepare_target(gray: np.ndarray, params: dict = PARAMS) -> dict:
+    ink = normalise(gray)
+    crop, _, _ = ink_crop(ink, params["ink_threshold"])
+    m = line_metrics(crop, params["ink_threshold"])
+    if m is None:
+        raise ValueError("line metrics failed on target")
+    xh, base = m["x_height"], m["baseline"]
+    above, below = int(round(params["pad_above_xh"] * xh)), int(round(params["pad_below_xh"] * xh))
+    side = int(round(params["pad_side_xh"] * xh))
+    h, w = above + below, crop.shape[1] + 2 * side
+    canvas = np.zeros((h, w), np.float32)
+    _paste(canvas, crop, above - int(base), side)
+    mask = canvas >= 0.5
+    return {"canvas": canvas, "mask": mask, "dist": distance_transform_edt(~mask), "x_height": xh,
+            "ink_width": float(crop.shape[1]), "above": above, "side": side, "metrics": m}
+
+
+def _paste(canvas: np.ndarray, img: np.ndarray, y: int, x: int) -> None:
+    """Paste img into canvas at (y, x), clipping at the borders (max blend)."""
+    H, W = canvas.shape
+    y0, x0 = max(y, 0), max(x, 0)
+    y1, x1 = min(y + img.shape[0], H), min(x + img.shape[1], W)
+    if y1 <= y0 or x1 <= x0:
+        return
+    sub = img[y0 - y:y1 - y, x0 - x:x1 - x]
+    canvas[y0:y1, x0:x1] = np.maximum(canvas[y0:y1, x0:x1], sub)
+
+
+# ---------------------------------------------------------------- candidate scoring
+def score_candidate(cand_ink: np.ndarray, target: dict, params: dict = PARAMS) -> dict | None:
+    """cand_ink: rendered line (ink 0..1) at any size. Scaled to the target x-height, measured, fitted, scored."""
+    crop, _, _ = ink_crop(cand_ink, params["ink_threshold"])
+    m = line_metrics(crop, params["ink_threshold"])
+    if m is None:
+        return None
+    s = target["x_height"] / m["x_height"]
+    h, w = max(1, int(round(crop.shape[0] * s))), max(1, int(round(crop.shape[1] * s)))
+    crop = cv2.resize(crop, (w, h), interpolation=cv2.INTER_AREA)
+    base = m["baseline"] * s
+    width_err = (w - target["ink_width"]) / target["ink_width"]          # measured before width fitting
+    crop = cv2.resize(crop, (int(round(target["ink_width"])), h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.zeros_like(target["canvas"])
+    _paste(canvas, crop, target["above"] - int(round(base)), target["side"])
+    t = target["canvas"]
+    iou = float(np.minimum(canvas, t).sum() / max(np.maximum(canvas, t).sum(), 1e-6))
+    mask = canvas >= 0.5
+    if mask.sum() == 0:
+        return None
+    d_ct = target["dist"][mask].mean()
+    d_tc = distance_transform_edt(~mask)[target["mask"]].mean()
+    chamfer_xh = float(0.5 * (d_ct + d_tc) / target["x_height"])
+    score = params["w_iou"] * (1 - iou) + params["w_chamfer"] * chamfer_xh + params["w_width"] * abs(width_err)
+    return {"score": round(float(score), 5), "iou": round(iou, 4), "chamfer_xh": round(chamfer_xh, 5),
+            "width_err": round(float(width_err), 5), "scale_to_target": s}
+
+
+# ---------------------------------------------------------------- worker
+_TARGET: dict | None = None
+_TEXT = ""
+_PARAMS: dict = PARAMS
+
+
+def _init(target: dict, text: str, params: dict) -> None:
+    global _TARGET, _TEXT, _PARAMS
+    _TARGET, _TEXT, _PARAMS = target, text, params
+
+
+def _eval_file_weight(job: tuple) -> dict | None:
+    """Best letter-spacing for one (file, weight): coarse grid, then a +-refine step around the best."""
+    entry, weight = job
+    f, xh = entry["file"], _TARGET["x_height"]
+    try:
+        # Size from the glyph "x" (robust); the exact x-height fit happens in score_candidate.
+        # FR : taille estimée depuis le glyphe x ; l'ajustement exact se fait dans score_candidate.
+        bx = load_font(f, 100, weight).getbbox("x")
+        ratio = (bx[3] - bx[1]) / 100.0
+        if not 0.25 <= ratio <= 0.8:
+            return {"family": entry["family"], "file": f, "weight": weight, "error": f"x/em ratio {ratio}",
+                    "score": float("inf")}
+        size = _PARAMS["oversample"] * xh / ratio
+        font = load_font(f, size, weight, opsz=size / _PARAMS["oversample"])
+        results = {}
+
+        def run(tr: float):
+            tr = round(tr, 3)
+            if tr not in results:
+                r = score_candidate(render_line(_TEXT, f, size, weight, tracking_em=tr, font=font), _TARGET, _PARAMS)
+                results[tr] = r
+            return results[tr]
+
+        for tr in _PARAMS["tracking_coarse"]:
+            run(tr)
+        valid = {k: v for k, v in results.items() if v}
+        if not valid:
+            return None
+        best_tr = min(valid, key=lambda k: valid[k]["score"])
+        for d in (-_PARAMS["tracking_refine"], _PARAMS["tracking_refine"]):
+            run(best_tr + d)
+        valid = {k: v for k, v in results.items() if v}
+        best_tr = min(valid, key=lambda k: valid[k]["score"])
+        r = dict(valid[best_tr])
+        return {"family": entry["family"], "style": "Variable" if entry.get("variable") else entry["style"], "file": f, "weight": weight,
+                "tracking_em": best_tr, "size_px": round(size * r["scale_to_target"], 2),
+                "score": r.pop("score"), "detail": {k: v for k, v in r.items() if k != "scale_to_target"}}
+    except Exception as exc:  # a broken file must not stop the ranking, but stays visible
+        return {"family": entry["family"], "file": f, "weight": weight, "error": str(exc), "score": float("inf")}
+
+
+def weights_for(entry: dict, params: dict = PARAMS) -> list[float]:
+    wght = next((a for a in entry.get("axes", []) if a["tag"] == "wght"), None)
+    if wght is None:
+        return [float(entry.get("weight_class") or 400)]
+    lo = max(wght["min"], params["weight_range"][0])
+    hi = min(wght["max"], params["weight_range"][1])
+    start = int(np.ceil(lo / params["weight_step"]) * params["weight_step"])
+    return [float(w) for w in range(start, int(hi) + 1, params["weight_step"])] or [float(wght["default"])]
+
+
+def load_index(families: list[str] | None = None, index_path: Path = INDEX) -> list[dict]:
+    entries = json.loads(Path(index_path).read_text())
+    if families:
+        wanted = {f.lower() for f in families}
+        entries = [e for e in entries if e["family"].lower() in wanted]
+    return entries
+
+
+def match_font(image, text: str, families: list[str] | None = None, index_path: Path = INDEX,
+               params: dict | None = None, top: int = 20) -> list[dict]:
+    """Rank font files for a line image (array or path). Returns the best (weight, tracking) per file, sorted."""
+    p = dict(PARAMS, **(params or {}))
+    if isinstance(image, (str, Path)):
+        image = cv2.imread(str(image), cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise FileNotFoundError(image)
+    target = prepare_target(image, p)
+    entries = load_index(families, index_path)
+    jobs = [(e, w) for e in entries for w in weights_for(e, p)]
+    with ProcessPoolExecutor(p["workers"], initializer=_init, initargs=(target, text, p)) as pool:
+        rows = [r for r in pool.map(_eval_file_weight, jobs, chunksize=4) if r]
+    errors = [r for r in rows if "error" in r]
+    best: dict[str, dict] = {}
+    for r in rows:
+        if "error" in r:
+            continue
+        if r["file"] not in best or r["score"] < best[r["file"]]["score"]:
+            best[r["file"]] = r
+    ranked = sorted(best.values(), key=lambda r: r["score"])
+    for i, r in enumerate(ranked):
+        r["rank"] = i + 1
+    # Broken files stay visible through match_font.errors. FR : les fichiers en échec restent visibles.
+    match_font.errors = [{"file": e["file"], "weight": e["weight"], "error": e["error"]} for e in errors]
+    return ranked[:top] if top else ranked
+
+
+def target_summary(image) -> dict:
+    """Measured metrics of the target line, for reports. FR : mesures de la ligne cible."""
+    if isinstance(image, (str, Path)):
+        image = cv2.imread(str(image), cv2.IMREAD_GRAYSCALE)
+    t = prepare_target(image)
+    return {"x_height_px": t["x_height"], "ink_width_px": t["ink_width"], "metrics": t["metrics"]}
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+    import time
+    ap = argparse.ArgumentParser(description="Rank free fonts against a caption line image.")
+    ap.add_argument("image")
+    ap.add_argument("text")
+    ap.add_argument("--families", nargs="*")
+    ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--out")
+    a = ap.parse_args(argv)
+    t0 = time.time()
+    ranked = match_font(a.image, a.text, a.families, top=a.top)
+    out = {"date": DATE, "text": a.text, "target": target_summary(a.image), "seconds": round(time.time() - t0, 1),
+           "params": PARAMS, "ranking": ranked, "errors": match_font.errors}
+    s = json.dumps(out, indent=1, ensure_ascii=False, default=float)
+    if a.out:
+        Path(a.out).write_text(s)
+    print(s)
+
+
+if __name__ == "__main__":
+    main()

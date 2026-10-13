@@ -1,0 +1,113 @@
+// 12 October 2026, 11:25 CEST: the request queue in zenray-data for when the Mac sleeps (R06 section 6.3). The page
+// writes pages/ZenRayMotionDesign/_requests/<id>.json once; this service is the only writer of <id>.status.json.
+// Everything goes by git (one private sparse clone, out of the REST quota), one commit per batch of statuses, and a
+// refused push is recomputed from the freshest remote state. A request already carrying a status is never run twice.
+// FR : la file de demandes dans zenray-data quand le Mac dort ; la page cree la demande, le service seul ecrit l'etat.
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
+const run = promisify(execFile)
+const noPrompt = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+
+export function createGitClone({ remote, branch, folder, directory, author, exec = run }) {
+  const git = async (args) => {
+    try { return (await exec('git', ['-C', directory, ...args], { maxBuffer: 64 * 1024 * 1024, timeout: 180000, env: noPrompt })).stdout }
+    catch (error) { throw new Error(`git ${args[0]} failed: ${String(error.stderr || error.message).trim().split('\n').slice(0, 2).join(' ')}`) }
+  }
+  async function ensure() {
+    try { await stat(path.join(directory, '.git')); return } catch {}
+    await mkdir(path.dirname(directory), { recursive: true })
+    await exec('git', ['clone', '--quiet', '--filter=blob:none', '--sparse', '--branch', branch, remote, directory], { timeout: 300000, env: noPrompt })
+    await git(['sparse-checkout', 'set', folder])
+  }
+  async function sync() {
+    await ensure()
+    await git(['fetch', '--quiet', 'origin', branch])
+    await git(['reset', '--quiet', '--hard', `origin/${branch}`])
+  }
+  /** files: { relPath: string }; plan() is re-run from the freshest state after a refused push. */
+  async function commit(message, plan, attempts = 4) {
+    let failure
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      await sync()
+      const files = await plan()
+      const paths = Object.keys(files)
+      if (!paths.length) return { committed: false }
+      for (const rel of paths) {
+        const target = path.resolve(directory, rel)
+        if (!target.startsWith(path.resolve(directory, folder) + path.sep)) throw new Error(`refusing to write outside ${folder}: ${rel}`)
+        await mkdir(path.dirname(target), { recursive: true })
+        await writeFile(target, files[rel])
+      }
+      await git(['add', '--', ...paths])
+      if (!(await git(['status', '--porcelain', '--', ...paths])).trim()) return { committed: false }
+      await git(['-c', `user.name=${author.name}`, '-c', `user.email=${author.email}`, 'commit', '--quiet', '-m', message])
+      try { await git(['push', '--quiet', 'origin', `HEAD:${branch}`]); return { committed: true, commit: (await git(['rev-parse', 'HEAD'])).trim() } }
+      catch (error) { failure = error; await git(['reset', '--quiet', '--hard', `origin/${branch}`]).catch(() => {}) }
+    }
+    throw new Error(`push refused ${attempts} times: ${failure?.message}`)
+  }
+  const list = async () => { try { return await readdir(path.join(directory, folder)) } catch { return [] } }
+  const read = async (name) => JSON.parse(await readFile(path.join(directory, folder, name), 'utf8'))
+  return { sync, commit, list, read, directory, discard: () => rm(directory, { recursive: true, force: true }) }
+}
+
+/**
+ * poll() reads the pending requests and hands each to submit(request) (which validates and enqueues);
+ * report(job) writes the request's status file. Both commit by git, nothing by the REST API.
+ */
+export function createCloudQueue({ cfg, clone, submit, idPattern, now = () => new Date(), log = () => {} }) {
+  const seen = new Set()
+  const state = { lastPollAt: null, lastError: null, pending: 0, picked: 0 }
+  // One clone, one writer: poll and report never touch the clone at the same time (a report queued behind a poll
+  // lands after it, so the final state is always the last commit).
+  let chain = Promise.resolve()
+  const exclusive = (fn) => { const next = chain.then(fn, fn); chain = next.catch(() => {}); return next }
+  const statusName = (id) => `${id}.status.json`
+  const statusFile = (job, extra = {}) => JSON.stringify({
+    schemaVersion: 1, kind: 'zenray-motion-request-status', id: job.id, motionId: job.motionId || null, state: job.state,
+    version: job.result?.version || null, steps: job.steps || [], error: job.error || null, updatedAt: now().toISOString(), ...extra,
+  }, null, 1) + '\n'
+
+  const poll = () => exclusive(pollNow)
+  async function pollNow() {
+    try {
+      await clone.sync()
+      const names = await clone.list()
+      const statuses = new Set(names.filter((n) => n.endsWith('.status.json')).map((n) => n.slice(0, -'.status.json'.length)))
+      const pending = names.filter((n) => n.endsWith('.json') && !n.endsWith('.status.json')).map((n) => n.slice(0, -5))
+        .filter((id) => new RegExp(idPattern).test(id) && !statuses.has(id) && !seen.has(id))
+      state.pending = pending.length
+      const picked = []
+      for (const id of pending.sort()) {
+        seen.add(id)
+        let request
+        try { request = await clone.read(`${id}.json`) } catch { request = null }
+        const job = await submit({ ...(request || {}), id }, { origin: 'cloud' })
+        picked.push(job)
+      }
+      if (picked.length) {
+        await clone.commit(`motion requests: ${picked.length} picked`, async () =>
+          Object.fromEntries(picked.map((job) => [`${cfg.folder}/${statusName(job.id)}`, statusFile(job)])), cfg.pushAttempts)
+        state.picked += picked.length
+      }
+      state.lastPollAt = now().toISOString(); state.lastError = null
+      return picked
+    } catch (error) {
+      state.lastError = error.message; log(`cloud queue: ${error.message}`)
+      return []
+    }
+  }
+
+  const report = (job) => exclusive(() => reportNow(job))
+  async function reportNow(job) {
+    if (job.origin !== 'cloud') return
+    try {
+      await clone.commit(`motion request ${job.state}`, async () => ({ [`${cfg.folder}/${statusName(job.id)}`]: statusFile(job) }), cfg.pushAttempts)
+    } catch (error) { state.lastError = error.message; log(`cloud queue report: ${error.message}`) }
+  }
+
+  return { poll, report, state }
+}

@@ -1,0 +1,28 @@
+// 12 October 2026, 11:40 CEST: the HTTP surface of com.zenray.motion: POST <path> for actions behind the gate,
+// GET <mediaPath> for signed local media. Errors are JSON with a code; a refusal is 400 and names its cause.
+// FR : la surface HTTP du service : POST pour les actions derriere la porte, GET pour les medias signes.
+import http from 'node:http'
+import { gate, readBody, sendJson } from './gate.mjs'
+
+export function createServer({ config, actions, media }) {
+  const { bridge } = config
+  return http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1')
+    if (url.pathname === bridge.mediaPath && (req.method === 'GET' || req.method === 'HEAD')) {
+      const remote = req.socket?.remoteAddress || ''
+      if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) { res.statusCode = 403; return res.end() }
+      return media.serve(req, res)
+    }
+    if (url.pathname !== bridge.path) return sendJson(res, 404, { error: 'Not found', code: 'not-found' })
+    const refused = gate(req, res, bridge)
+    if (refused) return refused.preflight ? (res.statusCode = 204, res.end()) : sendJson(res, refused.status, { error: refused.error, code: refused.code })
+    let body
+    try { body = await readBody(req, bridge.bodyLimitBytes) } catch (error) { return sendJson(res, error.status || 400, { error: error.message, code: error.code || 'bad-request' }) }
+    try {
+      sendJson(res, 200, { ok: true, ...(await actions.handle(body)) })
+    } catch (error) {
+      const status = error.status || (error.code === 'refused' ? 400 : error.code === 'assets-unavailable' ? 503 : 500)
+      sendJson(res, status, { error: error.message, code: error.code || 'motion-failed', checkedAt: new Date().toISOString() })
+    }
+  })
+}

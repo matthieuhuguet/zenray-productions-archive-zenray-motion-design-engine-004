@@ -1,0 +1,14 @@
+{
+  "name": "zrmd-tooling",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "hyperframes": "0.8.149"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}

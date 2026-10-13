@@ -1,0 +1,105 @@
+{
+  "_doc": "12 October 2026: the single parameter interface of the local service com.zenray.motion (HDA law). Patron of the Assets (3100) and Freelance (3101) bridges, R06 section 6. FR : interface unique de parametres du service local.",
+  "schemaVersion": 1,
+  "bridge": {
+    "host": "127.0.0.1",
+    "port": 3102,
+    "path": "/api/motion",
+    "mediaPath": "/api/motion/media",
+    "clientHeader": "x-zr-motion-client",
+    "clientValue": "1",
+    "allowedOrigins": [
+      "http://localhost:3100",
+      "http://127.0.0.1:3100",
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://localhost:5199",
+      "http://127.0.0.1:5199",
+      "http://localhost:5173",
+      "http://127.0.0.1:5173",
+      "https://zenray-progress.pages.dev"
+    ],
+    "bodyLimitBytes": 262144,
+    "mediaUrlTtlMs": 600000
+  },
+  "engine": {
+    "python": "/Users/zenray/.venvs/zenray-motion/bin/python",
+    "root": "/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayMotionDesign",
+    "workshop": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design",
+    "quickTimeoutMs": 60000,
+    "renderTimeoutMs": 1800000,
+    "env": {
+      "OMP_NUM_THREADS": "1"
+    },
+    "_montageRoot_doc": "12 October 2026: the montage root is read from params/montage.json (single truth), ZRMD_PATH_MONTAGES in engine.env overrides it for tests."
+  },
+  "requests": {
+    "motionIdPattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$",
+    "versionPattern": "^V_[0-9]{3}$",
+    "requestIdPattern": "^req-[0-9]{8}-[0-9]{6}-[a-z0-9]{6}$",
+    "modes": [
+      "params",
+      "format",
+      "instruction"
+    ],
+    "maxOverrides": 24,
+    "maxInstructionChars": 2000,
+    "formats": [
+      "16x9",
+      "9x16",
+      "1x1"
+    ],
+    "fits": [
+      "contain",
+      "cover"
+    ],
+    "maxMontageClips": 64,
+    "fileClipRoots": [
+      "/Users/zenray/.claude/tmp/tmp-zenray-motion-design/motions",
+      "/Users/zenray/Movies",
+      "/Users/zenray/.claude/tmp"
+    ],
+    "fileClipExtensions": [
+      ".mp4",
+      ".mov",
+      ".m4v",
+      ".webm"
+    ],
+    "fileClipDeny": [
+      "/Users/zenray/.claude/tmp/tmp-zenray-motion-design-refcache"
+    ],
+    "_fileClipDeny_doc": "12 October 2026: reference media never enter a montage, even a local one (rights doctrine)."
+  },
+  "jobs": {
+    "stateFile": "/Users/zenray/Library/Application Support/ZenRayMotion/jobs.json",
+    "keepFinished": 60
+  },
+  "cloudQueue": {
+    "enabled": true,
+    "repo": "matthieuhuguet/zenray-data",
+    "branch": "main",
+    "folder": "pages/ZenRayMotionDesign/_requests",
+    "clone": "/Users/zenray/Library/Application Support/ZenRayMotion/data-clone",
+    "pollSeconds": 300,
+    "pushAttempts": 4,
+    "author": {
+      "name": "ZenRay Motion",
+      "email": "motion@zenray.local"
+    }
+  },
+  "assets": {
+    "url": "http://127.0.0.1:3100/api/assets-workspace",
+    "clientHeader": "x-zr-assets-client",
+    "clientValue": "2",
+    "projectId": "zenray-motion-design",
+    "sourceId": "workshop",
+    "timeoutMs": 30000
+  },
+  "publisher": {
+    "script": "/Users/zenray/.claude/tmp/tmp-zenray-motion-design-site/scripts/Motion/PublishMotions.mjs",
+    "timeoutMs": 1800000
+  },
+  "studio": {
+    "port": 3002
+  }
+}

@@ -1,0 +1,68 @@
+# 12 October 2026: low-end family (impact, boom, subdrop, trigger).
+# FR : famille des graves ; corps sinus a hauteur descendante, bruit grave, reverberation synthetique.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from . import common as c
+from . import noise as n
+
+
+def _impact_body(p: dict, seed: int, sr: int) -> np.ndarray:
+    tail = p["tail"]
+    t = c.axis(tail, sr)
+    freq = c.glide(p["fStart"], p["fEnd"], t, min(tail, 0.25))
+    body = np.sin(c.phase_of(freq, sr)) * np.exp(-t / (tail / 4.0))
+    rng = np.random.default_rng(seed)
+    burst_n = int(c.syn()["clickBurstMs"] * sr / 1000.0)
+    clk = np.zeros(len(t))
+    clk[:burst_n] = rng.standard_normal(burst_n) * np.exp(-np.arange(burst_n) / (0.25 * burst_n))
+    nz = c.lowpass(rng.standard_normal(len(t)), sr, p["noiseLp"]) * np.exp(-t / (tail / 6.0))
+    x = c.unit_energy(body) + p["clickLevel"] * c.unit_energy(clk) + p["noiseLevel"] * c.unit_energy(nz)
+    return c.synth_reverb(x, sr, tail, p["reverbMix"])
+
+
+def impact(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Broadband click + sine body falling fStart -> fEnd + decaying low noise, through our synthetic room."""
+    return c.out32(c.set_level(c.fade(_impact_body(p, seed, sr), sr), sr, p["gainDb"]))
+
+
+def boom(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Very low long impact: falling sine + sub-harmonic + low noise, soft tanh drive for presence."""
+    s = c.syn()
+    T = p["duration"]
+    t = c.axis(T, sr)
+    freq = c.glide(p["fStart"], p["fStart"] * p["dropRatio"], t, T)
+    phase = c.phase_of(freq, sr)
+    env = np.exp(-t / (T / 3.0)) * np.clip(t / 0.004, 0.0, 1.0)
+    rng = np.random.default_rng(seed)
+    nz = c.lowpass(rng.standard_normal(len(t)), sr, 200.0) * np.exp(-t / (T / 5.0))
+    x = (np.sin(phase) + p["subLevel"] * np.sin(s["subHarmonicRatio"] * phase)) * env + p["noiseLevel"] * c.unit_energy(nz) * math.sqrt(len(t)) * 0.1
+    drive = 10 ** (p["driveDb"] / 20.0)
+    x = np.tanh(drive * x / (np.abs(x).max() or 1.0))
+    return c.out32(c.set_level_long(c.fade(x, sr), sr, p["gainDb"]))
+
+
+def subdrop(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Single sine falling fStart -> fEnd with curve sweepCurve, long envelope."""
+    T = p["duration"]
+    t = c.axis(T, sr)
+    freq = c.glide(p["fStart"], p["fEnd"], t, T, p["sweepCurve"])
+    env = np.clip(t / 0.005, 0.0, 1.0) * (1.0 - np.clip(t / T, 0.0, 1.0)) ** 1.5
+    return c.out32(c.set_level_long(c.fade(np.sin(c.phase_of(freq, sr)) * env, sr), sr, p["gainDb"]))
+
+
+def trigger(p: dict, seed: int, sr: int) -> np.ndarray:
+    """Short riser resolving on an impact aligned with its end (whoosh-to-hit); balance = impact share."""
+    rp = {"duration": p["riserDuration"], "cutoffStart": 400.0, "cutoffEnd": p["cutoffEnd"], "pitchStart": 220.0,
+          "pitchRiseSemis": 12.0, "sawMix": 0.0, "envCurve": 2.0, "gainDb": 0.0}
+    rise = n.riser(rp, seed, sr).astype(np.float64)
+    ip = {"fStart": p["fStart"], "fEnd": p["fEnd"], "tail": p["tail"], "reverbMix": 0.15, "clickLevel": 0.5, "noiseLevel": 0.3,
+          "noiseLp": 2000.0}
+    hit = _impact_body(ip, seed + 1, sr)
+    out = np.zeros(len(rise) + len(hit))
+    out[:len(rise)] += math.sqrt(1.0 - p["balance"]) * c.unit_energy(rise)
+    out[len(rise):] += math.sqrt(p["balance"]) * c.unit_energy(hit)
+    return c.out32(c.set_level(c.fade(out, sr), sr, p["gainDb"]))

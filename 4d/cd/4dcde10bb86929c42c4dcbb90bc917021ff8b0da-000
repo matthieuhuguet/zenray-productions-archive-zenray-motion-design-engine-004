@@ -1,0 +1,75 @@
+// 12 October 2026, 11:15 CEST: signed, expiring local media URLs (render, poster, montage) for the montage view, on
+// the model of the Assets preview capabilities (HMAC, ten minutes, regular files inside the known roots only, no
+// symlink). A <video src> cannot carry a header, hence the signature. Range requests are honoured for seeking.
+// FR : URL locales signees et ephemeres (rendu, affiche, montage), avec les requetes Range pour la lecture.
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createReadStream, realpathSync, statSync } from 'node:fs'
+import path from 'node:path'
+
+const MIME = { '.mp4': 'video/mp4', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webm': 'video/webm' }
+const SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/
+
+export function createMedia({ bridge, engine, secret = randomBytes(32), now = () => Date.now() }) {
+  const sign = (fields) => createHmac('sha256', secret).update(fields.join('\n')).digest('hex')
+
+  /** kind: render | poster (motion + version) or montage (id + format). */
+  function resolve({ kind, motion, version, format }) {
+    if (kind === 'render' || kind === 'poster') {
+      if (!SEGMENT_RE.test(motion || '') || !/^V_\d{3}$/.test(version || '')) return null
+      return path.join(engine.workshop, 'motions', motion, version, kind === 'render' ? 'render.mp4' : 'poster.jpg')
+    }
+    if (kind === 'montage') {
+      if (!SEGMENT_RE.test(motion || '') || !/^(16x9|9x16|1x1)$/.test(format || '')) return null
+      return path.join(engine.montageRoot, motion, `${format}.mp4`)
+    }
+    return null
+  }
+
+  function url(params, origin = `http://${bridge.host}:${bridge.port}`) {
+    const expires = String(now() + bridge.mediaUrlTtlMs)
+    const fields = [params.kind, params.motion || '', params.version || '', params.format || '', expires]
+    const q = new URLSearchParams({ ...params, expires, token: sign(fields) })
+    return `${origin}${bridge.mediaPath}?${q}`
+  }
+
+  function serve(req, res) {
+    const fail = (status) => { res.statusCode = status; res.end() }
+    try {
+      const u = new URL(req.url, 'http://127.0.0.1')
+      const p = Object.fromEntries(u.searchParams)
+      const expires = Number(p.expires)
+      const expected = Buffer.from(sign([p.kind, p.motion || '', p.version || '', p.format || '', p.expires || '']))
+      const given = Buffer.from(p.token || '')
+      if (!expires || expires < now() || expires > now() + bridge.mediaUrlTtlMs || given.length !== expected.length || !timingSafeEqual(given, expected)) return fail(403)
+      const file = resolve(p)
+      if (!file) return fail(400)
+      const root = p.kind === 'montage' ? engine.montageRoot : path.join(engine.workshop, 'motions')
+      let real
+      try { real = realpathSync(file) } catch { return fail(404) }
+      // No symlink at the file itself, and the real file inside the real root (/var is /private/var on macOS).
+      let rootReal
+      try { rootReal = realpathSync(root) } catch { return fail(404) }
+      if (real !== path.join(realpathSync(path.dirname(file)), path.basename(file)) || !real.startsWith(rootReal + path.sep)) return fail(404)
+      const size = statSync(real).size
+      res.setHeader('content-type', MIME[path.extname(real).toLowerCase()] || 'application/octet-stream')
+      res.setHeader('accept-ranges', 'bytes')
+      res.setHeader('cache-control', 'private, max-age=60')
+      res.setHeader('x-content-type-options', 'nosniff')
+      const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '')
+      if (range) {
+        let start = range[1] === '' ? size - Number(range[2]) : Number(range[1])
+        let end = range[1] === '' || range[2] === '' ? size - 1 : Math.min(Number(range[2]), size - 1)
+        if (!(start >= 0 && start <= end && end < size)) { res.setHeader('content-range', `bytes */${size}`); return fail(416) }
+        res.statusCode = 206
+        res.setHeader('content-range', `bytes ${start}-${end}/${size}`)
+        res.setHeader('content-length', end - start + 1)
+        return createReadStream(real, { start, end }).pipe(res)
+      }
+      res.statusCode = 200
+      res.setHeader('content-length', size)
+      return createReadStream(real).pipe(res)
+    } catch { if (!res.headersSent) fail(500); else res.destroy() }
+  }
+
+  return { url, serve, resolve }
+}

@@ -1,0 +1,84 @@
+# 12 October 2026: two-way checks of the B2 bible helpers (zrmd.bible).
+# Green: an eye cut snaps to the nearest local peak of the luma difference (not the window maximum), a removed cut
+#   disappears, review entries land on the shot that contains their time, palette roles find a flat background and
+#   an accent; the deliverable verifier passes on the real references.
+# Red: two eye cuts close together do not collapse onto one peak; a copy of a storyboard with a long dash and an
+#   image path into the workshop makes the verifier fail.
+# Run: OMP_NUM_THREADS=1 /Users/zenray/.venvs/zenray-motion/bin/python -I tests/test_bible.py
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from zrmd import bible as B  # noqa: E402
+
+PY = "/Users/zenray/.venvs/zenray-motion/bin/python"
+
+
+def fake_det():
+    mad = [0.001] * 300
+    for f, v in ((100, 0.5), (140, 0.3), (146, 0.6), (200, 0.4)):
+        mad[f] = v
+    return {"fps": 30.0, "frames": 300, "curves": {"mad": mad, "luma": [0.5] * 300},
+            "cuts": [{"frame": 100, "t": 100 / 30, "kind": "hard"}, {"frame": 200, "t": 200 / 30, "kind": "hard"}]}
+
+
+def test_cuts():
+    det = fake_det()
+    out = B.apply_cuts(det, {"add_cuts": [{"t": 140 / 30, "kind": "whip"}, {"t": 146 / 30}], "remove_cuts": [{"t": 200 / 30}]}, 0.3)
+    frames = [c["frame"] for c in out["cuts"]]
+    assert frames == [100, 140, 146], frames  # red side: 140 did not snap onto the larger 146
+    assert [s["start_frame"] for s in out["shots"]] == [0, 100, 140, 146], out["shots"]
+    assert out["shots"][2]["enter"] == "whip" and out["shots"][2]["cut_source"] == "review"
+    shots = [dict(s, content="plate", family="plate", plate_kind="image") for s in out["shots"]]
+    cfg = B.cfg_default()
+    unmatched = B.apply_shot_review(shots, {"shots": [{"t": 4.0, "content": "graphic", "text": "x"}, {"t": 99.0, "text": "y"}]}, cfg)
+    assert shots[1]["description"] == "x" and shots[1]["content"] == "graphic" and shots[1]["content_measured"] == "plate"
+    assert len(unmatched) == 1
+    return {"frames": frames, "shots": len(out["shots"])}
+
+
+def test_palette():
+    img = np.zeros((90, 160, 3), np.uint8)
+    img[:] = (20, 22, 30)
+    img[30:60, 60:100] = (230, 60, 40)  # small saturated patch = accent
+    pal = B.palette([img] * 3, B.cfg_default())
+    roles = B.assign_roles(pal, [], B.cfg_default())
+    assert roles["background"] in [c["hex"] for c in pal["colours"]]
+    bg = next(c for c in pal["colours"] if c["role"] == "background")
+    assert bg["lab"][0] < 20, bg
+    assert "accent" in roles, roles
+    return roles
+
+
+def test_verifier_both_ways():
+    ok = subprocess.run([PY, "-I", str(REPO / "Scripts" / "CheckReferenceBooks.py")], capture_output=True, text=True)
+    tmp = Path(tempfile.mkdtemp(prefix="b2-red-", dir="/private/tmp/claude-501"))
+    src = B.REFERENCES / "fin-4"
+    dst = tmp / "references" / "fin-4"
+    dst.mkdir(parents=True)
+    for name in ("bible.json", "bible.md", "storyboard.html"):
+        shutil.copy(src / name, dst / name)
+    html = (dst / "storyboard.html").read_text(encoding="utf-8")
+    html = html.replace("Storyboard fin-4", "Storyboard — fin-4", 1).replace("../../../tmp-zenray-motion-design-refcache/", "./", 1)
+    (dst / "storyboard.html").write_text(html, encoding="utf-8")
+    (tmp / "references" / "INDEX.md").write_text("| fin-4 |\n", encoding="utf-8")
+    bad = subprocess.run([PY, "-I", str(REPO / "Scripts" / "CheckReferenceBooks.py"), "--root", str(tmp / "references")],
+                         capture_output=True, text=True)
+    shutil.rmtree(tmp)
+    print(json.dumps({"real_exit": ok.returncode, "broken_exit": bad.returncode, "broken_out": bad.stdout.strip()[:300]}))
+    assert ok.returncode == 0, ok.stdout[-800:]
+    assert bad.returncode == 1 and "long dash" in bad.stdout and "outside the cache" in bad.stdout, bad.stdout
+    return {"real": ok.returncode, "broken": bad.returncode}
+
+
+if __name__ == "__main__":
+    print(json.dumps({"cuts": test_cuts(), "palette": test_palette(), "verifier": test_verifier_both_ways()}, ensure_ascii=False))

@@ -1,0 +1,448 @@
+# 12 October 2026: gradient fitter of the sound bank (task A0). Target window -> best chain of bank blocks.
+# 1. Random pre-screen: dfit.screenSamples points drawn uniformly in the unit cube of every parameter (fixed seed),
+#    plus the declared defaults, scored without gradient; the dfit.starts best become the starts
+#    (ranked by ploss.guide_loss at dfit.screenBlurOct, whose basins are wide, 12 October 2026).
+# 2. Adam on the unconstrained parameters from each start, cosine learning rate from dfit.lr to dfit.lrMin, early stop
+#    when the score reaches dfit.targetScore or the loss has not improved by dfit.minDelta for dfit.patience steps.
+# 3. Polish: basin-hopping kicks around the best state (dfit.polishRounds), kept only when they improve.
+# 4. The best state over every start is returned with its loss curve, its ploss score and the B1 score
+#    (describe.compare on the same window), so both metrics are always visible side by side.
+# Device: dfit.device "auto" uses MPS when available, else CPU; any MPS failure falls back to CPU and says so.
+# Discrete choices (which block, how many) are outside the gradient: the caller tries chains and keeps the best.
+# FR : ajustement par gradient ; pré-tri aléatoire, Adam multi-départs, arrêt anticipé, deux scores rendus.
+from __future__ import annotations
+
+import math
+import time
+
+import numpy as np
+import torch
+
+from . import bank, config, ploss
+
+
+def pick_device(name: str | None = None) -> str:
+    name = name or config.get("dfit.device")
+    if name == "auto":
+        return "mps" if torch.backends.mps.is_available() else "cpu"
+    return name
+
+
+def _raws(mods):
+    return [p for m in mods for p in m.raw.values()]
+
+
+def _snapshot(mods):
+    return [{k: v.detach().clone() for k, v in m.raw.items()} for m in mods]
+
+
+def _restore(mods, snap):
+    with torch.no_grad():
+        for m, s in zip(mods, snap):
+            for k, v in s.items():
+                m.raw[k].copy_(v)
+
+
+def b1_score(ours: np.ndarray, target: np.ndarray, cfg: dict) -> dict | None:
+    """describe.compare of B1 on the same window (summary descriptors, JND units, same score formula)."""
+    try:
+        from . import describe as D
+        c = D.compare(D.describe(np.asarray(target, np.float64), cfg), D.describe(np.asarray(ours, np.float64), cfg), cfg)
+        return {"score": round(c["score"], 3), "E": round(c["E"], 4), "errors": c["errors"]}
+    except Exception as exc:  # a degenerate window (silence) has no descriptors; report why instead of hiding it
+        return {"score": None, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def cma_es(f, x0, sigma, iters, lam, seed, lo=0.001, hi=0.999, stop_value=None):
+    """12 October 2026 (A1): (mu/mu_w, lambda) CMA-ES on a box (points clipped to [lo, hi]), minimising f.
+    Derived from the update equations of N. Hansen, "The CMA Evolution Strategy: A Tutorial" (arXiv:1604.00772);
+    no code copied. Returns (best value, best point). Deterministic for a given seed.
+    FR : CMA-ES (adaptation de la covariance), écrit depuis les équations du tutoriel de Hansen."""
+    n = len(x0)
+    rng = np.random.RandomState(seed)
+    mu = lam // 2
+    w = np.log(mu + 0.5) - np.log(np.arange(1, mu + 1))
+    w /= w.sum()
+    mueff = 1.0 / np.sum(w ** 2)
+    cc = (4 + mueff / n) / (n + 4 + 2 * mueff / n)
+    cs = (mueff + 2) / (n + mueff + 5)
+    c1 = 2 / ((n + 1.3) ** 2 + mueff)
+    cmu = min(1 - c1, 2 * (mueff - 2 + 1 / mueff) / ((n + 2) ** 2 + mueff))
+    damps = 1 + 2 * max(0.0, math.sqrt((mueff - 1) / (n + 1)) - 1) + cs
+    chin = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n * n))
+    m = np.array(x0, float)
+    C, B, D = np.eye(n), np.eye(n), np.ones(n)
+    pc, ps = np.zeros(n), np.zeros(n)
+    best = (f(m), m.copy())
+    for g in range(iters):
+        z = rng.randn(lam, n)
+        X = np.clip(m + sigma * (z @ (B * D).T), lo, hi)
+        fx = np.array([f(x) for x in X])
+        o = np.argsort(fx)
+        if fx[o[0]] < best[0]:
+            best = (float(fx[o[0]]), X[o[0]].copy())
+        if stop_value is not None and best[0] <= stop_value:
+            break
+        old = m
+        yw = (w[:, None] * ((X[o[:mu]] - old) / sigma)).sum(0)
+        m = old + sigma * yw
+        ps = (1 - cs) * ps + math.sqrt(cs * (2 - cs) * mueff) * (B @ np.diag(1 / D) @ B.T) @ yw
+        hs = np.linalg.norm(ps) / math.sqrt(1 - (1 - cs) ** (2 * (g + 1))) / chin < 1.4 + 2 / (n + 1)
+        pc = (1 - cc) * pc + hs * math.sqrt(cc * (2 - cc) * mueff) * yw
+        Y = (X[o[:mu]] - old) / sigma
+        C = (1 - c1 - cmu) * C + c1 * (np.outer(pc, pc) + (1 - hs) * cc * (2 - cc) * C) + cmu * (Y.T * w) @ Y
+        sigma *= math.exp((cs / damps) * (np.linalg.norm(ps) / chin - 1))
+        C = (C + C.T) / 2
+        ev, B = np.linalg.eigh(C)
+        D = np.sqrt(np.maximum(ev, 1e-20))
+        if sigma * D.max() < 1e-7:
+            break
+    return best
+
+
+def _fit_on(target: np.ndarray, sr: int, chain: dict, device: str, cfg: dict, overrides: dict) -> dict:
+    t0 = time.time()
+    tgt = ploss.Target(target, sr, device, cfg)
+    n = len(target)
+    mods = bank.chain_modules(chain, device)
+    # 12 October 2026 (A1): a block may carry FIT hints (class attribute FIT, e.g. a time blur for stroke patterns);
+    # they sit between the global dfit settings and the caller overrides. FR : indications d'ajustement par bloc.
+    hints = {}
+    for m in mods:
+        hints.update(getattr(m, "FIT", {}) or {})
+    d = {**cfg["dfit"], **hints, **overrides}
+    names = [(i, p["name"]) for i, m in enumerate(mods) for p in m.PARAMS]
+    rng = np.random.RandomState(d["seed"])
+
+    def evaluate():
+        # 12 October 2026: the screen ranks starts by E2 plus the blurred-spectrum guide at dfit.screenBlurOct, so a
+        # start whose partials are near (not on) the target partials is preferred. FR : tri guidé par le flou.
+        with torch.no_grad():
+            y = bank.mix_modules(mods, chain, n, sr)
+            e2 = ploss.guide_loss(y, tgt, d["screenBlurOct"], d.get("screenBlurMs", 0.0)) if d["blurWeight"] > 0 else ploss.loss(y, tgt)[0]
+        return float(e2)
+
+    # Pre-screen. FR : pré-tri sans gradient.
+    candidates = [None] + [rng.uniform(0.0, 1.0, len(names)) for _ in range(d["screenSamples"])]
+    fixed = [{k: float(m.to_unit(k, v)) for k, v in m.values().items()} for m in mods]  # start values given in chain
+    scored = []
+    for c in candidates:
+        if c is None:
+            for m, f in zip(mods, fixed):
+                m.set_unit(f)
+        else:
+            for (i, k), u in zip(names, c):
+                mods[i].set_unit({k: u})
+        e2 = evaluate()
+        scored.append((e2 if math.isfinite(e2) else float("inf"), _snapshot(mods)))
+    scored.sort(key=lambda s: s[0])
+    starts = scored[: d["starts"]]
+
+    def adam(snap, steps, blur_start, lr0):
+        """One Adam run from a snapshot; returns (best official E2, its snapshot, loss curve)."""
+        _restore(mods, snap)
+        params = _raws(mods)
+        opt = torch.optim.Adam(params, lr=lr0)
+        curve, run_best, run_snap, since = [], float("inf"), snap, 0
+        blur_steps = int(d["blurFraction"] * steps) if d["blurWeight"] > 0 and blur_start > 0 else 0
+        for step in range(steps):
+            lr = d["lrMin"] + 0.5 * (lr0 - d["lrMin"]) * (1.0 + math.cos(math.pi * step / max(1, steps - 1)))
+            for g in opt.param_groups:
+                g["lr"] = lr
+            opt.zero_grad()
+            y = bank.mix_modules(mods, chain, n, sr)
+            e2, _ = ploss.loss(y, tgt)
+            objective = e2
+            if step < blur_steps:
+                # Geometric sigma schedule, quantised to dfit.blurLevels values (cached matrices). FR : flou décroissant.
+                k = math.floor(d["blurLevels"] * step / blur_steps) / max(1, d["blurLevels"] - 1)
+                sigma = blur_start * (d["blurEndOct"] / blur_start) ** min(k, 1.0)
+                # 12 October 2026 (A1): optional time blur, annealed the same way from blurStartMs to blurEndMs.
+                ms0 = d.get("blurStartMs", 0.0)
+                sigma_ms = ms0 * (d.get("blurEndMs", 1.0) / ms0) ** min(k, 1.0) if ms0 > 0 else 0.0
+                objective = d["blurWeight"] * ploss.guide_loss(y, tgt, sigma, sigma_ms)
+            v = float(e2.detach())
+            curve.append(round(v, 6))
+            if v < run_best - d["minDelta"]:
+                run_best, run_snap, since = v, _snapshot(mods), 0
+            elif step >= blur_steps:
+                since += 1
+            if ploss.score_from_e2(run_best, cfg) >= d["targetScore"] or since >= d["patience"] or not math.isfinite(v):
+                break
+            objective.backward()
+            for prm in params:
+                if prm.grad is not None:
+                    prm.grad.nan_to_num_(0.0)
+            opt.step()
+        return run_best, run_snap, curve
+
+    def done():
+        return ploss.score_from_e2(best["e2"], cfg) >= d["targetScore"]
+
+    best = {"e2": float("inf"), "snap": None, "start": None}
+    curves = []
+    for si, (_, snap) in enumerate(starts):
+        e2, sn, curve = adam(snap, d["steps"], d["blurStartOct"], d["lr"])
+        curves.append(curve)
+        if e2 < best["e2"]:
+            best = {"e2": e2, "snap": sn, "start": si}
+        if done():
+            break
+    # 12 October 2026 (A1): coordinate scan. Many misses of A0 style fits are one parameter stuck in a wrong basin
+    # while every other one is right (a release click 100 ms early, a sine pitch two octaves off, an LFO rate halved):
+    # Adam cannot cross the ridge and a Gaussian kick rarely lands in a narrow basin. Each parameter in turn is swept
+    # over dfit.scanPoints values of its whole range with the others fixed (no gradient): the best point under the
+    # official E2 and the best under the guide (spectral and time blur, wide basins) are each refined by a zoomed sweep
+    # of dfit.scanZoomPoints values under the official E2; the parameter moves only if E2 drops. A short Adam run then
+    # settles the continuous coupling. dfit.scanRounds sweeps, skipped once the target score is reached. This is the
+    # "random restarts for discrete choices" part of the fitter, made systematic. FR : balayage coordonnée par
+    # coordonnée, puis zoom, pour sortir un paramètre coincé dans un mauvais bassin.
+    scan = {"rounds": 0, "moves": 0}
+    tx_energy = float(torch.sum(tgt.x * tgt.x))
+    # 12 October 2026 (A1): level-matched scans. A level parameter compensates any change of brightness, decay or
+    # layer balance, so a scanned parameter at its true value looks wrong while the level is still the old one (a
+    # hi-hat pitch is invisible until its partials AND the overall level are right). With dfit.scanLevelParam present
+    # in the chain, every scan point is evaluated after the energy-matching gain, and an accepted move also shifts the
+    # level parameter by that gain (clipped to its bounds), then is confirmed on the plain official E2.
+    # FR : balayages à niveau apparié ; le paramètre de niveau suit chaque déplacement accepté.
+    lvl = next(((i, k) for i, k in names if k == d.get("scanLevelParam")), None)
+
+    def render():
+        with torch.no_grad():
+            return bank.mix_modules(mods, chain, n, sr)
+
+    def official():
+        with torch.no_grad():
+            return float(ploss.loss(render(), tgt)[0])
+
+    def evaluate(kind, matched):
+        """(E2 of the official loss or of the guide, gain in dB that matched the energy, 0 when not matched)."""
+        with torch.no_grad():
+            y = render()
+            gdb = 0.0
+            if matched and lvl is not None:
+                e = float(torch.sum(y * y))
+                if e > 1e-20 and tx_energy > 1e-20:
+                    gdb = max(-40.0, min(40.0, 10.0 * math.log10(tx_energy / e)))
+                    y = y * 10.0 ** (gdb / 20.0)
+            v = ploss.loss(y, tgt)[0] if kind == "official" else ploss.guide_loss(y, tgt, d["screenBlurOct"], d.get("screenBlurMs", 0.0))
+            v = float(v)
+            return (v if math.isfinite(v) else float("inf")), gdb
+
+    def apply_level(gdb):
+        if lvl is None or gdb == 0.0:
+            return
+        i, k = lvl
+        spec = mods[i].spec(k)
+        cur_v = float(mods[i].value(k).detach())
+        mods[i].set_values({k: min(max(cur_v + gdb, spec["min"] + 1e-6), spec["max"] - 1e-6)})
+
+    def try_points(points, setter, cur_v, kind="official"):
+        """Evaluate points (level matched), return (best point, its matched E2, its gain) among those under cur_v."""
+        best_p, best_v, best_g = None, cur_v, 0.0
+        for pt in points:
+            setter(pt)
+            v, g = evaluate(kind, d.get("scanLevelMatch", True))
+            if v < best_v:
+                best_p, best_v, best_g = pt, v, g
+        return best_p, best_v, best_g
+
+    def commit(setter, pt, gdb, base, cur_v):
+        """Set the point, shift the level, keep it only if the plain official E2 drops; return the new E2."""
+        _restore(mods, base)
+        setter(pt)
+        apply_level(gdb)
+        v = official()
+        if v < cur_v - d["minDelta"]:
+            scan["moves"] += 1
+            return v
+        _restore(mods, base)
+        return cur_v
+
+    # 12 October 2026 (A1): joint evolution strategy over parameter groups (default: every parameter of the chain).
+    # A (1 + lambda) elitist search samples dfit.esSamples Gaussian points of radius r in the unit cube of the group,
+    # keeps the best, shrinks r by dfit.esShrink for dfit.esIters iterations; while r is large the points are ranked by
+    # the guide with a blur that shrinks with r (spectral screenBlurOct, time screenBlurMs), below dfit.esOfficialBelow
+    # by the official E2. Kept only if the official E2 drops. Fixed seed. FR : recherche évolutionnaire conjointe.
+    es_rng = np.random.RandomState(int(d["seed"]) + 2)
+    groups = [[k for _, k in names] if g == "*" else g for g in (d.get("scanGroups") or ["*"])]  # "*" = every parameter
+
+    def es_group(group):
+        idx = [(i, k) for i, k in names if k in group]
+        if not idx:
+            return
+        c = np.array([float(torch.sigmoid(mods[i].raw[k]).detach()) for i, k in idx])
+        r0 = r = d["esRadius"]
+        for _ in range(d["esIters"]):
+            frac = r / r0
+            use_official = r < d["esOfficialBelow"]
+            pts = [c] + [np.clip(c + r * es_rng.randn(len(c)), 0.002, 0.998) for _ in range(d["esSamples"])]
+            vals = []
+            for u in pts:
+                for (i, k), x in zip(idx, u):
+                    mods[i].set_unit({k: float(x)})
+                with torch.no_grad():
+                    y = render()
+                    v = float(ploss.loss(y, tgt)[0] if use_official else
+                              ploss.guide_loss(y, tgt, max(d["screenBlurOct"] * frac, 0.02), d.get("screenBlurMs", 0.0) * frac))
+                vals.append(v if math.isfinite(v) else float("inf"))
+            c = pts[int(np.argmin(vals))]
+            r *= d["esShrink"]
+        for (i, k), x in zip(idx, c):
+            mods[i].set_unit({k: float(x)})
+
+    while not done() and scan["rounds"] < d.get("scanRounds", 0):
+        scan["rounds"] += 1
+        _restore(mods, best["snap"])
+        cur = start_e2 = official()
+        if d.get("esIters", 0) > 0:
+            for g in groups:
+                pre_es = _snapshot(mods)
+                es_group(g)
+                v = official()
+                if v < cur:
+                    cur = v
+                else:
+                    _restore(mods, pre_es)
+        # Joint 2-D scans of the coupled pairs a block names (FIT scanPairs): grid of dfit.pairPoints under the official
+        # E2 and under the guide (both level matched), the best of each zoomed on a dfit.pairZoom square, then the move
+        # is committed with its level shift if the plain official E2 drops. FR : balayage conjoint de paires couplées.
+        for pa, pb in d.get("scanPairs") or []:
+            ia = next((i for i, k in names if k == pa), None)
+            ib = next((i for i, k in names if k == pb), None)
+            if ia is None or ib is None:
+                continue
+            base = _snapshot(mods)
+
+            def set_ab(pt, ia=ia, ib=ib, pa=pa, pb=pb):
+                mods[ia].set_unit({pa: float(pt[0])})
+                mods[ib].set_unit({pb: float(pt[1])})
+            ga = np.linspace(0.005, 0.995, d["pairPoints"][0])
+            gb = np.linspace(0.005, 0.995, d["pairPoints"][1])
+            grid = [(a, b) for a in ga for b in gb]
+            cands = []
+            for kind in ("official", "guide"):
+                vals = []
+                for pt in grid:
+                    set_ab(pt)
+                    vals.append(evaluate(kind, d.get("scanLevelMatch", True))[0])
+                cands.append(grid[int(np.argmin(vals))])
+            _restore(mods, base)
+            pick, pick_v, pick_g = None, evaluate("official", d.get("scanLevelMatch", True))[0], 0.0
+            for c in set(cands):
+                za = np.clip(np.linspace(c[0] - (ga[1] - ga[0]), c[0] + (ga[1] - ga[0]), d["pairZoom"]), 0.001, 0.999)
+                zb = np.clip(np.linspace(c[1] - (gb[1] - gb[0]), c[1] + (gb[1] - gb[0]), d["pairZoom"]), 0.001, 0.999)
+                p_, v_, g_ = try_points([(a, b) for a in za for b in zb], set_ab, pick_v)
+                if p_ is not None:
+                    pick, pick_v, pick_g = p_, v_, g_
+            _restore(mods, base)
+            if pick is not None:
+                cur = commit(set_ab, pick, pick_g, base, cur)
+        # Coordinate scan: every parameter over dfit.scanPoints values (level matched, official and guide), the best of
+        # each zoomed over dfit.scanZoomPoints values, committed with its level shift if the official E2 drops.
+        # FR : balayage coordonnée par coordonnée, à niveau apparié.
+        for i, k in names:
+            if lvl is not None and (i, k) == lvl:
+                continue
+            base = _snapshot(mods)
+
+            def set_k(u, i=i, k=k):
+                mods[i].set_unit({k: float(u)})
+            grid = np.linspace(0.005, 0.995, d["scanPoints"])
+            step = grid[1] - grid[0]
+            cands = []
+            for kind in ("official", "guide"):
+                vals = []
+                for u in grid:
+                    set_k(u)
+                    vals.append(evaluate(kind, d.get("scanLevelMatch", True))[0])
+                cands.append(float(grid[int(np.argmin(vals))]))
+            _restore(mods, base)
+            pick, pick_v, pick_g = None, evaluate("official", d.get("scanLevelMatch", True))[0], 0.0
+            for c in set(cands):
+                zoom = np.clip(np.linspace(c - step, c + step, d["scanZoomPoints"]), 0.001, 0.999)
+                p_, v_, g_ = try_points(list(zoom), set_k, pick_v)
+                if p_ is not None:
+                    pick, pick_v, pick_g = p_, v_, g_
+            _restore(mods, base)
+            if pick is not None:
+                cur = commit(set_k, pick, pick_g, base, cur)
+        scan.setdefault("gain", []).append(round(start_e2 - cur, 4))
+        pre = _snapshot(mods)
+        e2, sn, curve = adam(pre, d["polishSteps"], d["polishBlurStartOct"], d["polishLr"])
+        curves.append(curve)
+        if min(e2, cur) < best["e2"] - d["minDelta"]:
+            best = {"e2": e2, "snap": sn, "start": len(curves) - 1} if e2 <= cur else {"e2": cur, "snap": pre, "start": len(curves) - 1}
+        else:
+            break
+    # 12 October 2026 (A1): CMA-ES on the official E2 from the best state, once per sigma of dfit.cmaSigmas (unit cube
+    # of every parameter), dfit.cmaIters generations of dfit.cmaPopulation. CMA adapts a full covariance, so it walks
+    # the rotated valleys that coordinate moves and isotropic kicks cannot (measured: a typing pattern 99.37 to 99.94,
+    # a crackle 67 to 99.99, a UI click 95.6 to 99.87). Derived from the mathematics of Hansen's CMA-ES tutorial
+    # (arXiv:1604.00772), no code copied. Kept only if the official E2 drops. FR : CMA-ES depuis le meilleur point.
+    cma = {"runs": 0, "improved": 0}
+    for s0 in d.get("cmaSigmas", []):
+        if done():
+            break
+        _restore(mods, best["snap"])
+        x0 = np.array([float(torch.sigmoid(mods[i].raw[k]).detach()) for i, k in names])
+
+        def f_cma(x):
+            for (i, k), u in zip(names, x):
+                mods[i].set_unit({k: float(u)})
+            return official()
+        fb, xb = cma_es(f_cma, x0, s0, d["cmaIters"], d["cmaPopulation"], int(d["seed"]) + 3 + cma["runs"],
+                        stop_value=-math.log(d["targetScore"] / 100.0) / -math.log(cfg["score"]["base"]))
+        cma["runs"] += 1
+        f_cma(xb)
+        if fb < best["e2"] - d["minDelta"]:
+            pre = _snapshot(mods)
+            e2, sn, curve = adam(pre, d["polishSteps"], 0.0, d["polishLr"] * 0.3)
+            curves.append(curve)
+            best = {"e2": e2, "snap": sn, "start": len(curves) - 1} if e2 <= fb else {"e2": fb, "snap": pre, "start": len(curves) - 1}
+            cma["improved"] += 1
+    scan["cma"] = cma
+    # 12 October 2026: polish by basin hopping (random restarts around the best): Gaussian kicks of dfit.polishSigma in
+    # the unconstrained space, short Adam runs with a narrow blur; kept only when the official E2 improves.
+    # FR : sauts de bassin autour du meilleur point, gardés seulement s'ils améliorent.
+    polish = {"rounds": 0, "improved": 0}
+    kick = torch.Generator().manual_seed(int(d["seed"]) + 1)
+    while not done() and polish["rounds"] < d["polishRounds"]:
+        polish["rounds"] += 1
+        kicked = [{k: v + d["polishSigma"] * torch.randn(v.shape, generator=kick).to(v.device) for k, v in s.items()} for s in best["snap"]]
+        e2, sn, curve = adam(kicked, d["polishSteps"], d["polishBlurStartOct"], d["polishLr"])
+        curves.append(curve)
+        if e2 < best["e2"] - d["minDelta"]:
+            best = {"e2": e2, "snap": sn, "start": len(curves) - 1}
+            polish["improved"] += 1
+    _restore(mods, best["snap"])
+    with torch.no_grad():
+        ours = bank.mix_modules(mods, chain, n, sr).detach().cpu().numpy().astype(np.float32)
+    _, e = ploss.loss(torch.as_tensor(ours, device=device), tgt)
+    out_chain = {**chain, "sr": sr, "seconds": n / sr,
+                 "blocks": [{**b, "params": {k: round(v, 6) for k, v in m.values().items()}} for m, b in zip(mods, chain["blocks"])]}
+    return {"chain": out_chain, "params": [b["params"] for b in out_chain["blocks"]],
+            "score": round(ploss.score_from_e2(best["e2"], cfg), 4), "E": round(math.sqrt(best["e2"]), 4),
+            "errors": {k: round(float(v), 4) for k, v in e.items()}, "b1": b1_score(ours, target, cfg),
+            "lossCurve": curves[best["start"]] if curves else [], "startsRun": len(curves), "polish": polish, "scan": scan,
+            "screenBestScore": round(ploss.score_from_e2(starts[0][0], cfg), 4), "device": device,
+            "seconds": round(time.time() - t0, 2), "audio": ours}
+
+
+def fit(target: np.ndarray, blocks: list[str] | dict, sr: int | None = None, device: str | None = None,
+        overrides: dict | None = None, cfg: dict | None = None) -> dict:
+    """Fit a chain to a target window. `blocks` is a list of block ids (defaults as the first start, no offset, 0 dB)
+    or a full chain dict. Returns chain, params, score (ploss), b1 score, loss curve, device, seconds and the audio."""
+    cfg = cfg or config.cfg()
+    sr = sr or cfg["bank"]["sampleRate"]
+    chain = blocks if isinstance(blocks, dict) else {"sr": sr, "blocks": [{"block": b, "params": {}, "gainDb": 0.0, "offsetS": 0.0,
+                                                                            "seed": cfg["bank"]["noiseSeedDefault"]} for b in blocks]}
+    dev = pick_device(device)
+    try:
+        return _fit_on(target, sr, chain, dev, cfg, overrides or {})
+    except Exception as exc:
+        if dev == "cpu":
+            raise
+        res = _fit_on(target, sr, chain, "cpu", cfg, overrides or {})
+        res["deviceFallback"] = f"{dev} failed ({type(exc).__name__}: {exc}); ran on cpu"
+        return res

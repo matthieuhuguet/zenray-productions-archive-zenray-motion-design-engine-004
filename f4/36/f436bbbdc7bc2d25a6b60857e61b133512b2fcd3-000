@@ -1,0 +1,112 @@
+# 12 October 2026: final mix (R03 section 9). Stem gains taken from the reference stem loudness, per-section
+# correction toward the reference short-term loudness, ducking of the music under low SFX at the depth measured in
+# the reference, a look-ahead true-peak limiter (4x oversampled), and integrated loudness brought to the reference.
+# Every input here is our own synthesis; the reference only provides numbers (loudness values, depths).
+# FR : mixage final ; gains par piste et par section, ducking mesure, limiteur crete vraie, sonie de la reference.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from scipy import ndimage, signal
+
+from . import config, loudness
+
+
+def db_gain(db: float) -> float:
+    return 10 ** (db / 20.0)
+
+
+def pan_stereo(x: np.ndarray, pan0: float, pan1: float) -> np.ndarray:
+    """Constant-power pan moving linearly from pan0 to pan1 (-1 left, +1 right)."""
+    p = np.linspace(pan0, pan1, len(x))
+    theta = (p + 1.0) * math.pi / 4.0
+    return np.stack([x * np.cos(theta), x * np.sin(theta)], axis=1)
+
+
+def to_stereo(x: np.ndarray) -> np.ndarray:
+    return np.stack([x, x], axis=1) if x.ndim == 1 else x
+
+
+def measure_reference(ref_stems: dict, sr: int, events: list[dict], cfg: dict | None = None) -> dict:
+    """Numbers the mix will aim at: stem loudness, integrated loudness and curve, music dip under low SFX."""
+    cfg = cfg or config.cfg()
+    m = cfg["mix"]
+    mix = sum(ref_stems[k] for k in m["stemNames"])
+    curve, times = loudness.short_term(mix, sr, m["shortTermWindowS"], m["shortTermHopS"])
+    dips = []
+    for ev in events:
+        if ev.get("kind") in m["duckKinds"]:
+            t = ev["anchorS"]
+            before = ref_stems["bass"][max(0, int((t - m["duckMeasureS"]) * sr)):int(t * sr)]
+            after = ref_stems["bass"][int(t * sr):int((t + m["duckMeasureS"]) * sr)]
+            if len(before) and len(after):
+                dips.append(10 * np.log10((np.mean(before ** 2) + 1e-12) / (np.mean(after ** 2) + 1e-12)))
+    return {"integratedLufs": loudness.integrated(mix, sr),
+            "stemLufs": {k: loudness.integrated(ref_stems[k], sr) for k in m["stemNames"]},
+            "shortTerm": {"times": times.tolist(), "lufs": curve.tolist()},
+            "duckDb": float(np.clip(np.median(dips), 0.0, m["duckMaxDb"])) if dips else 0.0,
+            "truePeakDbtp": loudness.true_peak_db(mix, sr, m["oversample"])}
+
+
+def limiter(x: np.ndarray, sr: int, ceiling_db: float, cfg: dict) -> np.ndarray:
+    """Look-ahead limiter on the true peak: 4x oversampled peak envelope, sliding max over the look-ahead,
+    instant attack, exponential release, gain applied to the delayed signal."""
+    m = cfg["mix"]
+    x = to_stereo(x)
+    up = signal.resample_poly(x, m["oversample"], 1, axis=0)
+    peak = np.abs(up).max(axis=1).reshape(-1, m["oversample"]).max(axis=1)[: len(x)]
+    look = max(1, int(m["lookaheadMs"] * sr / 1000))
+    peak = ndimage.maximum_filter1d(peak, size=2 * look + 1)
+    ceiling = db_gain(ceiling_db)
+    target = np.minimum(1.0, ceiling / np.maximum(peak, 1e-12))
+    rel = math.exp(-1.0 / (m["releaseMs"] * sr / 1000))
+    g = signal.lfilter([1 - rel], [1, -rel], target)
+    g = np.minimum(g, target)
+    return x * g[:, None]
+
+
+def section_gains(curve_ref: np.ndarray, curve_gen: np.ndarray, cfg: dict) -> np.ndarray:
+    m = cfg["mix"]
+    k = min(len(curve_ref), len(curve_gen))
+    diff = np.clip(curve_ref[:k] - curve_gen[:k], -m["sectionGainMaxDb"], m["sectionGainMaxDb"])
+    silent = curve_gen[:k] < -60
+    diff[silent] = 0.0
+    return diff
+
+
+def mix(music_stems: dict, sfx: np.ndarray, sr: int, ref: dict, sfx_events: list[dict], cfg: dict | None = None) -> dict:
+    """music_stems: generated mono stems; sfx: stereo SFX bus (n, 2). Returns stereo mix, music bus and gains."""
+    cfg = cfg or config.cfg()
+    m = cfg["mix"]
+    gains = {}
+    music = np.zeros(len(sfx))
+    for k in m["stemNames"]:
+        g_lufs = loudness.integrated(music_stems[k], sr)
+        gains[k] = ref["stemLufs"][k] - g_lufs if g_lufs > -100 else 0.0
+        music = music + music_stems[k][: len(music)] * db_gain(gains[k])
+    curve_g, times = loudness.short_term(music, sr, m["shortTermWindowS"], m["shortTermHopS"])
+    diff = section_gains(np.asarray(ref["shortTerm"]["lufs"]), curve_g, cfg)
+    env = np.interp(np.arange(len(music)) / sr, times[: len(diff)], diff) if len(diff) > 1 else np.zeros(len(music))
+    ramp = max(1, int(m["sectionRampS"] * sr))
+    env = np.convolve(env, np.ones(ramp) / ramp, mode="same")
+    music = music * db_gain(1.0) ** env
+    duck = np.ones(len(music))
+    if ref["duckDb"] > 0:
+        for ev in sfx_events:
+            if ev["kind"] in m["duckKinds"]:
+                a = int(ev["anchorS"] * sr)
+                n = int(m["duckReleaseMs"] * sr / 1000)
+                shape = 1.0 - (1.0 - db_gain(-ref["duckDb"])) * np.exp(-np.arange(n) / (n / 3.0))
+                duck[a:a + n] = np.minimum(duck[a:a + n], shape[: len(duck[a:a + n])])
+    music_st = to_stereo(music * duck)
+    out = music_st + sfx[: len(music_st)]
+    target = ref["integratedLufs"] if m["targetFromReference"] else m["fallbackLufs"]
+    for _ in range(m["maxIterations"]):
+        out = out * db_gain(target - loudness.integrated(out, sr))
+        out = limiter(out, sr, m["truePeakCeilingDbtp"] - 0.1, cfg)
+        if abs(loudness.integrated(out, sr) - target) < 0.1 and loudness.true_peak_db(out, sr, m["oversample"]) <= m["truePeakCeilingDbtp"]:
+            break
+    music_gain = db_gain(target - loudness.integrated(to_stereo(music * duck), sr))
+    return {"mix": out, "music": music_st * min(music_gain, 1.0), "stemGainsDb": gains, "duckDb": ref["duckDb"],
+            "integratedLufs": loudness.integrated(out, sr), "truePeakDbtp": loudness.true_peak_db(out, sr, m["oversample"])}

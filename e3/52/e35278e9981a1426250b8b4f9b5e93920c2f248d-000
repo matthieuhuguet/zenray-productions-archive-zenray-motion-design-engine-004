@@ -1,0 +1,97 @@
+# 12 October 2026, 12:20 CEST: caption overlays on plates (text over photographic or 3D content).
+# A flat-background difference cannot isolate ink on a photo, so positions come from OCR word boxes (tesseract
+# TSV, measurement only: the words are never emitted), grouped into lines; then the presence and light of each
+# line are followed frame by frame inside its box with a white top-hat (thin bright strokes, large bright areas
+# removed). Output per line: box, active frame window, per-frame ink mass, and the lit frame.
+from __future__ import annotations
+
+import subprocess
+import tempfile
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from ..media import frame_at, read_frames
+
+
+def ocr_boxes(rgb: np.ndarray, min_conf: float = 70.0) -> list[dict]:
+    from PIL import Image
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "f.png"
+        Image.fromarray(rgb).save(p)
+        out = subprocess.run(["tesseract", str(p), "-", "--psm", "11", "tsv"], capture_output=True, text=True).stdout
+    words = []
+    for line in out.splitlines()[1:]:
+        cols = line.split("\t")
+        if len(cols) < 12 or not cols[11].strip():
+            continue
+        try:
+            conf = float(cols[10])
+        except ValueError:
+            continue
+        if conf < min_conf or len(cols[11].strip()) < 2:
+            continue
+        x, y, w, h = map(int, cols[6:10])
+        words.append({"x": x, "y": y, "w": w, "h": h, "conf": conf})
+    return words
+
+
+def group_lines(words: list[dict], gap: float = 1.6) -> list[list[int]]:
+    """Words on one baseline band, horizontally close, form a line box [x, y, w, h]."""
+    words = sorted(words, key=lambda w: (w["y"] + w["h"] / 2, w["x"]))
+    lines = []
+    for w in words:
+        cy = w["y"] + w["h"] / 2
+        for L in lines:
+            lcy = L[1] + L[3] / 2
+            if abs(cy - lcy) < 0.5 * max(L[3], w["h"]) and w["x"] - (L[0] + L[2]) < gap * w["h"] and w["x"] + w["w"] > L[0] - gap * w["h"]:
+                x0, y0 = min(L[0], w["x"]), min(L[1], w["y"])
+                x1, y1 = max(L[0] + L[2], w["x"] + w["w"]), max(L[1] + L[3], w["y"] + w["h"])
+                L[:] = [x0, y0, x1 - x0, y1 - y0]
+                break
+        else:
+            lines.append([w["x"], w["y"], w["w"], w["h"]])
+    return [L for L in lines if L[2] > 2 * L[3]]
+
+
+def tophat_ink(gray: np.ndarray, size: int = 25) -> np.ndarray:
+    return cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (size, size)))
+
+
+def overlay_lines(video: str, start: float, end: float, samples: int = 6, pad: int = 14) -> list[dict]:
+    """Caption lines over a plate shot, with their active window and light curve."""
+    times = np.linspace(start + 0.2 * (end - start), end - 0.1 * (end - start), samples)
+    boxes = []
+    for t in times:
+        boxes += group_lines(ocr_boxes(frame_at(video, float(t), 1920, 1080)))
+    merged = []
+    for b in boxes:
+        for m in merged:
+            ix = max(0, min(m["box"][0] + m["box"][2], b[0] + b[2]) - max(m["box"][0], b[0]))
+            iy = max(0, min(m["box"][1] + m["box"][3], b[1] + b[3]) - max(m["box"][1], b[1]))
+            if ix * iy > 0.3 * min(m["box"][2] * m["box"][3], b[2] * b[3]):
+                x0, y0 = min(m["box"][0], b[0]), min(m["box"][1], b[1])
+                x1, y1 = max(m["box"][0] + m["box"][2], b[0] + b[2]), max(m["box"][1] + m["box"][3], b[1] + b[3])
+                m["box"] = [x0, y0, x1 - x0, y1 - y0]; m["hits"] += 1
+                break
+        else:
+            merged.append({"box": list(b), "hits": 1})
+    lines = [m for m in merged if m["hits"] >= 2]
+    if not lines:
+        return []
+    frames = read_frames(video, 1920, 1080, gray=True, start=start, duration=end - start)
+    fps = len(frames) / (end - start)
+    out = []
+    for m in lines:
+        x, y, w, h = m["box"]
+        x0, y0, x1, y1 = max(0, x - pad), max(0, y - pad), min(1920, x + w + pad), min(1080, y + h + pad)
+        mass = np.array([float(tophat_ink(f[y0:y1, x0:x1]).astype(np.float32).sum()) for f in frames])
+        on = mass > 0.25 * mass.max()
+        idx = np.nonzero(on)[0]
+        if not len(idx):
+            continue
+        out.append({"box": [x0, y0, x1 - x0, y1 - y0], "first_frame": int(idx[0]), "last_frame": int(idx[-1]),
+                    "start": round(start + idx[0] / fps, 4), "end": round(start + (idx[-1] + 1) / fps, 4),
+                    "lit_frame": int(np.argmax(mass)), "mass": [round(v, 1) for v in mass.tolist()]})
+    return out

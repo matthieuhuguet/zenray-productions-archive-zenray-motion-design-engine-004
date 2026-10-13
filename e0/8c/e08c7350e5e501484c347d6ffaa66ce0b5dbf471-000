@@ -1,0 +1,107 @@
+# 12 October 2026, 13:10 CEST: measured text effects shared by reproduction and verification.
+from __future__ import annotations
+
+import numpy as np
+
+
+def fit_band_map(bmap: np.ndarray, base: float, peak: float, min_excess: float = 0.12) -> list[dict]:
+    """Per frame, the triangular band (centre c %, half width w %, strength a) that best explains the measured
+    brightness map row: value(u) = base + (peak - base) * a * max(0, 1 - |u - c| / w). Least squares, closed form
+    for a given (c, w) and a coarse-to-fine search over (c, w)."""
+    bins = bmap.shape[1]
+    u = (np.arange(bins) + 0.5) / bins * 100
+    out = []
+    prev = None
+    for i, row in enumerate(bmap):
+        ok = ~np.isnan(row)
+        if ok.sum() < bins // 2:
+            out.append(None); continue
+        y = (row[ok] - base) / max(peak - base, 1e-6)
+        if (row[ok] - base).max() < min_excess * base:
+            out.append({"c": prev["c"] if prev else -50.0, "w": prev["w"] if prev else 20.0, "a": 0.0}); continue
+        best = None
+        for c in np.arange(-40, 141, 2.0):
+            for w in np.arange(4, 81, 2.0):
+                k = np.clip(1 - np.abs(u[ok] - c) / w, 0, None)
+                kk = float((k * k).sum())
+                if kk < 1e-9:
+                    continue
+                a = max(0.0, float((k * y).sum()) / kk)
+                err = float(((a * k - y) ** 2).sum())
+                if best is None or err < best[0]:
+                    best = (err, c, w, a)
+        _, c, w, a = best
+        prev = {"c": float(c), "w": float(w), "a": round(float(a), 4)}
+        out.append(prev)
+    return out
+
+
+
+
+def band_series(bmap: np.ndarray) -> dict:
+    """Relative brightness map -> per-frame band (c, w, a) after removing each bin's settled value and the global gain."""
+    settled = np.nanmedian(bmap[-max(1, len(bmap) // 5):], axis=0)
+    rel = bmap / settled
+    with np.errstate(all="ignore"):
+        gain = np.nanmedian(np.where(rel <= np.nanpercentile(rel, 60, axis=1, keepdims=True), rel, np.nan), axis=1)
+    resid = rel - gain[:, None]
+    base = float(np.nanmedian(settled))
+    peak_rel = float(np.nanmax(resid))
+    return {"base": base, "peak_rel": peak_rel, "gain": gain,
+            "frames": fit_band_map(resid * base + base, base, base * (1 + max(peak_rel, 1e-3)))}
+
+
+def sweep_model(params: np.ndarray, u: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """One highlight pass: centre c(t) eased from c0 to c1 between t0 and t1 (cubic-bezier x1,x2 with y1=0,y2=1
+    simplified to a power curve p), half width w, strength A with a sine bump envelope over [t0, t1]."""
+    t0, t1, c0, c1, w, amp, p = params
+    span = max(t1 - t0, 1e-3)
+    s = np.clip((t - t0) / span, 0, 1)
+    eased = np.where(s < 0.5, 0.5 * (2 * s) ** p, 1 - 0.5 * (2 * (1 - s)) ** p)
+    c = c0 + (c1 - c0) * eased
+    env = np.ones_like(t)
+    k = np.clip(1 - np.abs(u[None, :] - c[:, None]) / max(w, 1e-3), 0, None)
+    return amp * env[:, None] * k
+
+
+def fit_sweep(resid: np.ndarray, fps: float) -> dict:
+    """Least-squares fit of sweep_model to a relative brightness residual map (frames x slices, in % excess)."""
+    from scipy.optimize import least_squares
+    n, bins = resid.shape
+    u = (np.arange(bins) + 0.5) / bins * 100
+    t = np.arange(n) / fps
+    y = np.nan_to_num(resid, nan=0.0)
+    strong = np.nonzero(y.max(axis=1) > 0.3 * y.max())[0]
+    if len(strong):
+        # Fit only over the pass itself (+-6 frames): before it the text is still scaling and the residual is noise.
+        keep = slice(max(0, strong[0] - 6), min(n, strong[-1] + 7))
+        y = y[keep]; t = t[keep]
+    t0g, t1g = (t[strong[0]], t[strong[-1]]) if len(strong) else (t[0], t[-1])
+    x0 = np.array([t0g - 0.05, t1g + 0.05, -20.0, 120.0, 30.0, float(y.max()), 2.0])
+    lo = np.array([t[0] - 0.5, t[0], -100.0, 0.0, 3.0, 0.0, 0.6]); hi = np.array([t[-1], t[-1] + 0.5, 100.0, 200.0, 100.0, 2.0, 6.0])
+    res = least_squares(lambda q: (sweep_model(q, u, t) - y).ravel(), x0, bounds=(lo, hi))
+    q = res.x
+    fitted = sweep_model(q, u, t)
+    ss_res = float(((fitted - y) ** 2).sum()); ss_tot = float(((y - y.mean()) ** 2).sum())
+    return {"t0": float(q[0]), "t1": float(q[1]), "c0": float(q[2]), "c1": float(q[3]), "w": float(q[4]),
+            "amp": float(q[5]), "power": float(q[6]), "r2": round(1 - ss_res / max(ss_tot, 1e-12), 4)}
+
+
+def light_map(bmap: np.ndarray, plateau_tol: float = 0.04) -> dict:
+    """Text light as data: per frame and slice, brightness relative to the slice's plateau level.
+    The plateau is the set of frames whose median brightness stays within plateau_tol of the steadiest high level,
+    so fades in and out at either end do not bias it (a caption may fade out before the cut)."""
+    med = np.nanmedian(bmap, axis=1)
+    finite = np.isfinite(med)
+    if not finite.any():
+        return {"ok": False}
+    top = np.nanpercentile(med[finite], 60)
+    plateau = finite & (np.abs(med - top) <= plateau_tol * top)
+    if plateau.sum() < 3:
+        plateau = finite & (med >= np.nanpercentile(med[finite], 50))
+    per_bin = np.nanmedian(bmap[plateau], axis=0)
+    rel = bmap / per_bin
+    valid = np.isfinite(per_bin)
+    rel = np.where(np.isfinite(rel), rel, 0.0)  # no ink in that slice at that frame: dark
+    return {"ok": True, "level": float(np.nanmedian(per_bin)), "rel": rel, "valid_bins": valid,
+            "plateau_frames": np.nonzero(plateau)[0].tolist()}

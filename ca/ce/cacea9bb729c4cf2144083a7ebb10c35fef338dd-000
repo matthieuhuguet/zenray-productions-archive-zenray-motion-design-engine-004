@@ -1,0 +1,51 @@
+// 12 October 2026, 12:00 CEST: request and montage validation, green and red cases.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { loadConfig } from '../lib/config.mjs'
+import { validateMontage, validateRequest } from '../lib/validate.mjs'
+
+const rules = loadConfig().requests
+
+test('iteration requests', () => {
+  const ok = validateRequest({ mode: 'params', motionId: 'onekey-s02-caption-shine', baseVersion: 'V_008', overrides: { 'layers.@caption.font.size': 100 } }, rules)
+  assert.equal(ok.mode, 'params')
+  assert.equal(validateRequest({ mode: 'format', motionId: 'a1', formats: ['9x16', '9x16'] }, rules).formats.length, 1)
+  assert.equal(validateRequest({ mode: 'instruction', motionId: 'a1', instructions: ' plus lent ' }, rules).instructions, 'plus lent')
+  assert.equal(validateRequest({ mode: 'params', motionId: 'a1', overrides: { k: 1 }, id: 'req-20261012-101500-abc123' }, rules).id, 'req-20261012-101500-abc123')
+  const refused = [
+    { mode: 'shell', motionId: 'a1' },
+    { mode: 'params', motionId: '../etc', overrides: { k: 1 } },
+    { mode: 'params', motionId: 'a1', overrides: {} },
+    { mode: 'params', motionId: 'a1', overrides: { 'a;rm': 1 } },
+    { mode: 'params', motionId: 'a1', overrides: { k: { nested: 1 } } },
+    { mode: 'params', motionId: 'a1', baseVersion: 'V_1', overrides: { k: 1 } },
+    { mode: 'format', motionId: 'a1', formats: ['4x3'] },
+    { mode: 'instruction', motionId: 'a1', instructions: '' },
+    { mode: 'params', motionId: 'a1', overrides: { k: 1 }, id: 'nope' },
+  ]
+  for (const body of refused) assert.throws(() => validateRequest(body, rules), { code: 'refused' }, JSON.stringify(body))
+})
+
+test('montage clips', () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'zrmd-validate-'))
+  const allowed = path.join(root, 'ok'); mkdirSync(allowed)
+  const clip = path.join(allowed, 'a.mp4'); writeFileSync(clip, 'x')
+  const r = { ...rules, fileClipRoots: [allowed], fileClipDeny: [path.join(root, 'deny')] }
+  const spec = validateMontage({ id: 'demo-1', formats: ['1x1'], clips: [{ kind: 'motion', motion: 'm1' }, { kind: 'file', path: clip, in: 0.5 }] }, r)
+  assert.equal(spec.clips[1].path, realpathSync(clip))
+  mkdirSync(path.join(root, 'deny')); writeFileSync(path.join(root, 'deny', 'b.mp4'), 'x'); writeFileSync(path.join(root, 'c.mp4'), 'x')
+  const bad = [
+    { id: 'Demo', clips: [{ kind: 'motion', motion: 'm1' }] },
+    { id: 'demo', clips: [] },
+    { id: 'demo', clips: [{ kind: 'file', path: 'a.mp4' }] },
+    { id: 'demo', clips: [{ kind: 'file', path: path.join(root, 'deny', 'b.mp4') }] },
+    { id: 'demo', clips: [{ kind: 'file', path: path.join(root, 'c.mp4') }] },
+    { id: 'demo', clips: [{ kind: 'file', path: path.join(allowed, 'a.txt') }] },
+    { id: 'demo', clips: [{ kind: 'motion', motion: 'm1', in: -1 }] },
+    { id: 'demo', formats: ['16x10'], clips: [{ kind: 'motion', motion: 'm1' }] },
+  ]
+  for (const body of bad) assert.throws(() => validateMontage(body, r), { code: 'refused' }, JSON.stringify(body))
+})

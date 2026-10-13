@@ -1,0 +1,124 @@
+# 12 October 2026: soundtrack summary of a reference for its graphic bible.
+# Two detectors as R03 recommends: transients from zrmd.audio.events (HPSS percussive onsets) and a swell detector
+# (whooshes, risers) ported from R03-lab/SegmentTest.py: per-bin excess over a running median, vertical median that
+# keeps sustained excess, smoothed energy, peak picking, onset at the 15 percent crossing. Plus tempo and beats,
+# integrated loudness (ffmpeg ebur128), energy sections and the share of cuts that land on a beat or an attack.
+# Numbers only: no sample of the reference is stored. FR : resume sonore d'une reference, nombres seulement.
+from __future__ import annotations
+
+import re
+import subprocess
+
+import librosa
+import numpy as np
+import scipy.ndimage as ndi
+
+from .. import settings
+from ..media import load_audio
+from .events import detect_events
+
+
+def swells(y: np.ndarray, sr: int, cfg: dict) -> list[dict]:
+    hop = cfg["hop"]
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
+    f = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    lo, hi = cfg["swell_band_hz"]
+    Sb = S[(f >= lo) & (f <= hi)]
+    med = ndi.median_filter(Sb, size=(1, max(3, int(cfg["swell_median_s"] * sr / hop))))
+    excess = np.maximum(Sb - cfg["swell_excess"] * med, 0.0)
+    sustained = ndi.median_filter(excess, size=(1, cfg["swell_vertical"]))
+    win = np.hanning(cfg["swell_smooth"])
+    sw = np.convolve((sustained ** 2).sum(axis=0), win / win.sum(), mode="same")
+    swdb = 10 * np.log10(sw + 1e-12)
+    fr = sr / hop
+    pk = librosa.util.peak_pick(swdb, pre_max=int(cfg["swell_pre_s"] * fr), post_max=int(cfg["swell_pre_s"] * fr),
+                                pre_avg=int(cfg["swell_avg_s"] * fr), post_avg=int(cfg["swell_avg_s"] * fr),
+                                delta=cfg["swell_delta_db"], wait=int(cfg["swell_wait_s"] * fr))
+    out = []
+    for k in pk:
+        j = k
+        while j > 0 and sw[j] > cfg["swell_onset_frac"] * sw[k]:
+            j -= 1
+        if (k - j) / fr < cfg["swell_min_rise_s"]:
+            continue  # 12 October 2026: a rise of a few frames is a drum hit, not a whoosh or a riser.
+        out.append({"t": round(j / fr, 3), "peak_t": round(k / fr, 3), "rise_s": round((k - j) / fr, 3),
+                    "level_db": round(float(swdb[k]), 1)})
+    return out
+
+
+def loudness_lufs(path: str) -> float | None:
+    r = subprocess.run(["ffmpeg", "-v", "info", "-nostats", "-i", str(path), "-vn", "-af", "ebur128=framelog=quiet",
+                        "-f", "null", "-"], capture_output=True, text=True)
+    m = re.findall(r"I:\s+(-?[\d.]+) LUFS", r.stderr)
+    return float(m[-1]) if m else None
+
+
+def classify_event(e: dict, cfg: dict) -> str:
+    if e["flatness"] >= cfg["noise_flatness"]:
+        return "bruit ou souffle bref"
+    if e["centroid_hz"] <= cfg["impact_low_hz"]:
+        return "impact grave"
+    if e["centroid_hz"] >= cfg["click_high_hz"] and e["dur"] <= cfg["click_max_s"]:
+        return "clic aigu"
+    return "attaque médium"
+
+
+def sections(loud_db: np.ndarray, step_s: float, cfg: dict) -> list[dict]:
+    """Energy sections: boundaries where the smoothed loudness jumps by section_jump_db."""
+    k = max(1, int(cfg["section_smooth_s"] / step_s))
+    sm = np.convolve(loud_db, np.ones(k) / k, mode="same")
+    jump = np.abs(sm[k:] - sm[:-k]) if len(sm) > k else np.zeros(0)
+    bounds = [0]
+    min_gap = int(cfg["section_min_s"] / step_s)
+    for i in np.argsort(-jump):
+        if jump[i] < cfg["section_jump_db"]:
+            break
+        c = int(i + k // 2)
+        if all(abs(c - b) >= min_gap for b in bounds) and len(sm) - c >= min_gap:
+            bounds.append(c)
+    bounds = sorted(bounds) + [len(sm)]
+    out = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        if b > a:
+            out.append({"start": round(a * step_s, 2), "end": round(b * step_s, 2), "level_db": round(float(np.median(loud_db[a:b])), 1)})
+    return out
+
+
+def summarize(video: str, cut_times: list[float], cfg: dict | None = None) -> dict:
+    cfg = cfg or settings.get("analysis.sound")
+    acfg = settings.get("analysis.audio")
+    ev = detect_events(video, acfg)
+    y, sr = load_audio(video, acfg["sample_rate"], mono=True)
+    sw = swells(y, sr, cfg)
+    for e in ev["events"]:
+        e["kind"] = classify_event(e, cfg)
+    main = sorted(ev["events"], key=lambda e: -e["strength"])[: cfg["main_events"]]
+    beats = np.array(ev["beats"])
+    onsets = np.array([e["t"] for e in ev["events"]])
+    tol = cfg["sync_tolerance_s"]
+
+    def share(ref):
+        if not len(cut_times) or not len(ref):
+            return None
+        return round(float(np.mean([np.min(np.abs(ref - c)) <= tol for c in cut_times])), 3)
+
+    ibi = np.diff(beats) if len(beats) > 2 else np.array([])
+    step = 0.05
+    loud = np.array(ev["loudness_db"])
+    harmonic_share = None
+    try:
+        h, p = librosa.effects.hpss(y, margin=acfg["hpss_margin"])
+        harmonic_share = round(float(np.sum(h ** 2) / max(np.sum(h ** 2) + np.sum(p ** 2), 1e-12)), 3)
+    except Exception:
+        pass
+    centroid = float(np.median(librosa.feature.spectral_centroid(y=y, sr=sr, n_fft=4096, hop_length=4096)))
+    return {"duration": round(ev["duration"], 3), "tempo_bpm": round(ev["tempo"], 2), "beats": len(beats),
+            "beat_regularity": round(float(np.std(ibi) / np.mean(ibi)), 3) if len(ibi) else None,
+            "loudness_lufs": loudness_lufs(video), "harmonic_share": harmonic_share,
+            "centroid_hz": round(centroid, 1),
+            "events": [{k: e[k] for k in ("id", "t", "dur", "peak_db", "strength", "centroid_hz", "flatness",
+                                           "percussive_ratio", "kind")} for e in ev["events"]],
+            "main_events": [e["id"] for e in main], "swells": sw,
+            "cuts_on_beat": share(beats), "cuts_on_attack": share(onsets),
+            "sections": sections(loud, step, cfg), "loudness_curve_1s": [round(float(v), 1) for v in loud[:: int(1 / step)]],
+            "beats_t": [round(float(b), 3) for b in beats]}

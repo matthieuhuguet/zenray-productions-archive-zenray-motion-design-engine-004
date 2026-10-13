@@ -1,0 +1,160 @@
+# 12 October 2026, 11:00 CEST (render_line tracking and opsz added 12 October 2026, 10:45 CEST): content-independent typography metrics of a text line.
+# The x-height band is where lowercase ink is densest; its height, the stroke weight (ink per x-height area)
+# and the line's vertical position do not depend on which words are written, so a caption with replaced
+# words can still be compared to the reference. Fonts are matched by rendering candidates at the measured
+# x-height and comparing stroke weight and letter width per x-height.
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+
+def x_height_components(ink: np.ndarray) -> float | None:
+    """Median height of the components that look like x-height letters (between 30 and 75 percent of the line's
+    full height, wider than a third of their height), the content-independent x-height estimate."""
+    import cv2
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8), connectivity=8)
+    if n < 3:
+        return None
+    ys = np.nonzero(ink.any(axis=1))[0]
+    full = float(ys.max() - ys.min() + 1)
+    hs = [float(h) for x, y, w, h, a in st[1:] if 0.3 * full <= h <= 0.75 * full and w >= h / 3 and a > 8]
+    if len(hs) < 2:
+        return None
+    hs = np.array(hs)
+    mode = np.median(hs)
+    near = hs[np.abs(hs - mode) <= 0.15 * mode]
+    return float(np.median(near)) if near.size else float(mode)
+
+
+def line_metrics(gray: np.ndarray, threshold: float = 0.35) -> dict | None:
+    """gray: crop of one text line, float 0..1 ink (light text on dark already inverted to ink=1)."""
+    ink = gray >= threshold
+    if ink.sum() < 20:
+        return None
+    rows = ink.mean(axis=1)
+    cols = ink.any(axis=0)
+    ys = np.nonzero(rows > 0)[0]
+    top, bottom = int(ys.min()), int(ys.max())
+    peak = rows.max()
+    band = np.nonzero(rows >= 0.5 * peak)[0]
+    # The x band is the longest run of dense rows.
+    runs, start = [], band[0]
+    for a, b in zip(band[:-1], band[1:]):
+        if b != a + 1:
+            runs.append((start, a)); start = b
+    runs.append((start, band[-1]))
+    x_top, baseline = max(runs, key=lambda r: r[1] - r[0])
+    x_height = float(baseline - x_top + 1)
+    cc = x_height_components(ink)
+    if cc:
+        # Lowercase letters without ascenders or descenders are the most common component height: robust x-height.
+        x_height = cc
+    xs = np.nonzero(cols)[0]
+    width = float(xs.max() - xs.min() + 1)
+    weight = float(gray[x_top:baseline + 1].sum() / max(width * x_height, 1))
+    return {"x_height": x_height, "baseline": float(baseline), "x_top": float(x_top), "ascender": float(top),
+            "descender": float(bottom), "width": width, "stroke_density": round(weight, 4)}
+
+
+def load_font(font_file: str, size_px: float, weight: float | None = None, opsz: float | None = None):
+    """Pillow font at size_px with the weight axis (and opsz, default = size) set when the file is variable."""
+    font = ImageFont.truetype(font_file, max(1, int(round(size_px))))
+    axes = font_axes(font_file)
+    if axes:
+        values = []
+        for axis in axes:
+            name = axis["name"].decode() if isinstance(axis["name"], bytes) else axis["name"]
+            if name.lower().startswith("weight") and weight is not None:
+                values.append(min(axis["maximum"], max(axis["minimum"], weight)))
+            elif name.lower().startswith("optical"):
+                values.append(min(axis["maximum"], max(axis["minimum"], opsz if opsz is not None else size_px)))
+            else:
+                values.append(axis["default"])
+        font.set_variation_by_axes(values)
+    return font
+
+
+def render_line(text: str, font_file: str, size_px: float, weight: float | None = None, pad: int = 20,
+                tracking_em: float = 0.0, opsz: float | None = None, font=None) -> np.ndarray:
+    """Pillow raster of a line (white on black, float 0..1) for calibration.
+    12 October 2026: tracking_em adds letter-spacing (em units, CSS letter-spacing) between characters,
+    keeping pair kerning through prefix advances; opsz overrides the optical-size axis; font reuses a loaded font."""
+    font = font or load_font(font_file, size_px, weight, opsz)
+    if not tracking_em:
+        left, top, right, bottom = font.getbbox(text)
+        image = Image.new("L", (right - left + 2 * pad, bottom - top + 2 * pad), 0)
+        ImageDraw.Draw(image).text((pad - left, pad - top), text, fill=255, font=font)
+        return np.asarray(image, np.float32) / 255.0
+    step = tracking_em * font.size
+    xs = [font.getlength(text[:i]) + i * step for i in range(len(text))]
+    boxes = [font.getbbox(ch) for ch in text]
+    left = min(x + b[0] for x, b in zip(xs, boxes))
+    right = max(x + b[2] for x, b in zip(xs, boxes))
+    top = min(b[1] for b in boxes)
+    bottom = max(b[3] for b in boxes)
+    image = Image.new("L", (int(np.ceil(right - left)) + 2 * pad, bottom - top + 2 * pad), 0)
+    draw = ImageDraw.Draw(image)
+    for x, ch in zip(xs, text):
+        if not ch.isspace():
+            draw.text((pad - left + x, pad - top), ch, fill=255, font=font)
+    return np.asarray(image, np.float32) / 255.0
+
+
+def size_for_x_height(text: str, font_file: str, x_height_px: float, weight: float | None = None) -> float:
+    """Font size whose rendered x-height equals x_height_px (two-step secant on the measured ratio)."""
+    size = x_height_px / 0.53
+    for _ in range(3):
+        m = line_metrics(render_line(text, font_file, size, weight))
+        if not m:
+            break
+        size *= x_height_px / m["x_height"]
+    return round(size, 2)
+
+
+def font_axes(font_file: str) -> list[dict]:
+    try:
+        return ImageFont.truetype(font_file, 20).get_variation_axes()
+    except Exception:
+        return []
+
+
+def match_weight(stroke_density: float, text: str, font_file: str, x_height_px: float, lo: int = 300, hi: int = 800) -> dict:
+    """Variable-font weight whose stroke density matches the measured one."""
+    best = None
+    for wgt in range(lo, hi + 1, 25):
+        size = size_for_x_height(text, font_file, x_height_px, wgt)
+        m = line_metrics(render_line(text, font_file, size, wgt))
+        if not m:
+            continue
+        err = abs(m["stroke_density"] - stroke_density)
+        if best is None or err < best["error"]:
+            best = {"weight": wgt, "size": size, "error": round(err, 4), "density": m["stroke_density"]}
+    return best or {}
+
+
+def stroke_width(gray: np.ndarray, threshold: float = 0.5) -> float | None:
+    """Median stroke thickness in pixels, content-independent: twice the distance-transform value on ridge pixels."""
+    import cv2
+    ink = (gray >= threshold).astype(np.uint8)
+    if ink.sum() < 50:
+        return None
+    dt = cv2.distanceTransform(ink, cv2.DIST_L2, 5)
+    ridge = (dt >= cv2.dilate(dt, np.ones((3, 3), np.uint8))) & (dt > 0.75)
+    vals = dt[ridge]
+    return float(2 * np.median(vals)) if vals.size else None
+
+
+def core_colour(rgb_crop: np.ndarray, ink_gray: np.ndarray, threshold: float = 0.5, depth: float = 1.5):
+    """Ink colour inside the strokes (distance to the edge >= depth px), free of antialiasing."""
+    import cv2
+    ink = (ink_gray >= threshold).astype(np.uint8)
+    dt = cv2.distanceTransform(ink, cv2.DIST_L2, 5)
+    core = dt >= depth
+    if core.sum() < 20:
+        core = dt >= 1.0
+    if core.sum() < 5:
+        return None
+    return [float(v) for v in np.median(rgb_crop[core], axis=0)]

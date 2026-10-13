@@ -1,0 +1,81 @@
+# 12 October 2026, 18:20 CEST: the self-learning loop of the zenray-motion-design skill.
+# Every reproduction appends what it measured and what worked (family, recipe, key parameters, scores per
+# dimension, pitfalls) to datasets/learnings.jsonl, append only. `python -I -m zrmd.learn render` rebuilds
+# ~/.claude/skills/zenray-motion-design/references/LEARNED.md from it (grouped by family, best scores, recurrent
+# pitfalls), so the skill grows from measured runs instead of from memory.
+from __future__ import annotations
+
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+from . import settings, versions
+
+LOG = settings.REPO / "datasets" / "learnings.jsonl"
+SKILL_REF = Path.home() / ".claude" / "skills" / "zenray-motion-design" / "references" / "LEARNED.md"
+
+
+def record(entry: dict) -> None:
+    """Append one learning (dict with at least family, motion, score); stamped with the house date."""
+    entry = {"date": versions.today(), "stamp": versions.stamp(), **entry}
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False, default=float) + "\n")
+
+
+def record_motion(motion_dir: str | Path, pitfalls: list[str] | None = None) -> dict | None:
+    """Record the best version of a motion folder (by fidelity score)."""
+    motion_dir = Path(motion_dir)
+    meta = versions.read_json(motion_dir / "motion.json", {}) or {}
+    best = None
+    for v in versions.list_versions(motion_dir):
+        fid = versions.read_json(motion_dir / v / "fidelity.json")
+        if fid and (best is None or fid.get("score", 0) > best[1].get("score", 0)):
+            best = (v, fid)
+    if not best:
+        return None
+    v, fid = best
+    params = versions.read_json(motion_dir / v / "params.json", {}) or {}
+    fonts = [Path(f.get("file", "")).name for f in params.get("fonts", [])]
+    entry = {"motion": motion_dir.name, "family": meta.get("recipe"), "source": meta.get("source"), "best_version": v,
+             "versions": len(versions.list_versions(motion_dir)), "score": fid.get("score"), "dimensions": fid.get("dimensions"),
+             "fonts": fonts, "layers": [l.get("type") for l in params.get("layers", [])], "pitfalls": pitfalls or []}
+    record(entry)
+    return entry
+
+
+def render() -> Path:
+    rows = [json.loads(l) for l in LOG.read_text(encoding="utf-8").splitlines() if l.strip()] if LOG.exists() else []
+    latest = {}
+    for r in rows:
+        latest[r.get("motion")] = r
+    by_family = defaultdict(list)
+    for r in latest.values():
+        by_family[r.get("family") or "unknown"].append(r)
+    lines = [f"# Ce que le moteur a appris, mesuré ({versions.today()})", "",
+             "Généré par `python -I -m zrmd.learn render` depuis `datasets/learnings.jsonl` (append only) du dépôt "
+             f"`{settings.REPO}`. Ne pas éditer à la main. ({versions.today()})", ""]
+    for family, items in sorted(by_family.items()):
+        items.sort(key=lambda r: -(r.get("score") or 0))
+        lines += [f"## Famille {family} ({versions.today()})", "", "| Motion | Meilleure version | Score | Dimensions | Calques | Polices |",
+                  "|---|---|---|---|---|---|"]
+        for r in items:
+            dims = ", ".join(f"{k} {v:.3f}" for k, v in (r.get("dimensions") or {}).items())
+            lines.append(f"| {r['motion']} | {r.get('best_version')} | {r.get('score', 0):.4f} | {dims} | "
+                         f"{', '.join(r.get('layers') or [])} | {', '.join(r.get('fonts') or [])} |")
+        pits = sorted({p for r in items for p in (r.get("pitfalls") or [])})
+        if pits:
+            lines += ["", "Pièges consignés :", ""] + [f"- {p} ({versions.today()})" for p in pits]
+        lines.append("")
+    SKILL_REF.parent.mkdir(parents=True, exist_ok=True)
+    SKILL_REF.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return SKILL_REF
+
+
+if __name__ == "__main__":
+    command = sys.argv[1] if len(sys.argv) > 1 else "render"
+    if command == "motion":
+        print(json.dumps(record_motion(sys.argv[2], sys.argv[3:]), ensure_ascii=False, default=float))
+    else:
+        print(render())

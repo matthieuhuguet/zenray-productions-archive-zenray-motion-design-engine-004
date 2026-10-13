@@ -1,0 +1,111 @@
+// 12 October 2026, 11:05 CEST: the job queue of the motion service. One job at a time (a render saturates the CPU,
+// and two torch tasks never run together), states queued, running, done, error, cancelled, waiting-agent, named
+// steps with dates, persisted to disk so a restart shows what happened ("interrupted" for a job cut by the restart).
+// FR : la file des taches, une a la fois, avec des etapes datees, persistee sur disque.
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { randomBytes } from 'node:crypto'
+
+export const FINAL = new Set(['done', 'error', 'cancelled', 'interrupted', 'refused', 'waiting-agent'])
+
+export function newRequestId(now = new Date()) {
+  const p = (n) => String(n).padStart(2, '0')
+  const day = `${now.getUTCFullYear()}${p(now.getUTCMonth() + 1)}${p(now.getUTCDate())}`
+  const time = `${p(now.getUTCHours())}${p(now.getUTCMinutes())}${p(now.getUTCSeconds())}`
+  return `req-${day}-${time}-${randomBytes(4).toString('hex').slice(0, 6)}`
+}
+
+export function createJobQueue({ stateFile = null, keepFinished = 60, now = () => new Date() } = {}) {
+  const jobs = new Map()
+  const waiting = []
+  let running = null
+  const listeners = new Set()
+
+  if (stateFile) {
+    try {
+      for (const job of JSON.parse(readFileSync(stateFile, 'utf8')).jobs || []) {
+        if (!FINAL.has(job.state)) { job.state = 'interrupted'; job.error = 'service restarted before the job finished' }
+        jobs.set(job.id, job)
+      }
+    } catch {}
+  }
+
+  function persist() {
+    const finished = [...jobs.values()].filter((j) => FINAL.has(j.state)).sort((a, b) => a.createdAt < b.createdAt ? 1 : -1)
+    for (const job of finished.slice(keepFinished)) jobs.delete(job.id)
+    if (!stateFile) return
+    mkdirSync(path.dirname(stateFile), { recursive: true })
+    const tmp = `${stateFile}.tmp`
+    writeFileSync(tmp, JSON.stringify({ schemaVersion: 1, jobs: [...jobs.values()].map(view) }, null, 1))
+    renameSync(tmp, stateFile)
+  }
+
+  const view = (job) => { const { controller, work, ...rest } = job; return rest }
+  const emit = (job) => { persist(); for (const fn of listeners) fn(view(job)) }
+
+  function step(job, name, detail = {}) {
+    job.steps.push({ name, at: now().toISOString(), ...detail })
+    job.updatedAt = now().toISOString()
+    emit(job)
+  }
+
+  async function pump() {
+    if (running || !waiting.length) return
+    const job = waiting.shift()
+    if (job.state === 'cancelled') return pump()
+    running = job
+    job.state = 'running'; job.startedAt = now().toISOString()
+    emit(job)
+    try {
+      const outcome = await job.work({ step: (name, detail) => step(job, name, detail), signal: job.controller.signal, job: view(job) })
+      job.result = outcome?.result ?? outcome ?? null
+      job.state = outcome?.state || 'done'
+    } catch (error) {
+      job.state = error.code === 'cancelled' ? 'cancelled' : error.code === 'refused' ? 'refused' : 'error'
+      job.error = error.message
+      job.errorCode = error.code || 'job-failed'
+    }
+    job.finishedAt = now().toISOString()
+    running = null
+    emit(job)
+    pump()
+  }
+
+  /** enqueue({ id?, kind, motionId?, origin, payload }, work) -> job view */
+  function enqueue(meta, work) {
+    const id = meta.id || newRequestId(now())
+    if (jobs.has(id)) return view(jobs.get(id))
+    const job = { ...meta, id, state: 'queued', createdAt: now().toISOString(), steps: [], controller: new AbortController(), work }
+    jobs.set(id, job)
+    waiting.push(job)
+    emit(job)
+    queueMicrotask(pump)
+    return view(job)
+  }
+
+  function cancel(id) {
+    const job = jobs.get(id)
+    if (!job) return null
+    if (job.state === 'queued') { job.state = 'cancelled'; job.finishedAt = now().toISOString(); emit(job) }
+    else if (job.state === 'running') job.controller.abort()
+    return view(job)
+  }
+
+  /** A job that ends at once with a final state (refused, waiting-agent), never run. */
+  function record(meta, state, extra = {}) {
+    const id = meta.id || newRequestId(now())
+    if (jobs.has(id)) return view(jobs.get(id))
+    const job = { ...meta, id, state, createdAt: now().toISOString(), finishedAt: now().toISOString(), steps: [], ...extra }
+    jobs.set(id, job)
+    emit(job)
+    return view(job)
+  }
+
+  return {
+    enqueue, cancel, record,
+    get: (id) => (jobs.has(id) ? view(jobs.get(id)) : null),
+    list: () => [...jobs.values()].map(view).sort((a, b) => a.createdAt < b.createdAt ? 1 : -1),
+    busy: () => !!running || waiting.length > 0,
+    onChange: (fn) => { listeners.add(fn); return () => listeners.delete(fn) },
+  }
+}

@@ -1,0 +1,56 @@
+// 12 October 2026, 12:20 CEST: the zenray-data request queue against a LOCAL bare repository (no network): a request
+// written by "the page" is picked once, its status file is committed by the service only, a malformed request is
+// recorded as refused, and a second poll never runs a request twice.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { createCloudQueue, createGitClone } from '../lib/cloudQueue.mjs'
+import { createJobQueue } from '../lib/jobs.mjs'
+
+const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' })
+const FOLDER = 'pages/ZenRayMotionDesign/_requests'
+
+test('cloud queue over git', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'zrmd-queue-'))
+  const remote = path.join(root, 'remote.git')
+  execFileSync('git', ['init', '--quiet', '--bare', '--initial-branch', 'main', remote])
+  const page = path.join(root, 'page')
+  execFileSync('git', ['clone', '--quiet', remote, page])
+  mkdirSync(path.join(page, FOLDER), { recursive: true })
+  const id = 'req-20261012-101500-abc123', badId = 'req-20261012-101501-def456'
+  writeFileSync(path.join(page, FOLDER, `${id}.json`), JSON.stringify({ schemaVersion: 1, kind: 'zenray-motion-request', mode: 'params', motionId: 'm1', overrides: { k: 1 } }))
+  writeFileSync(path.join(page, FOLDER, `${badId}.json`), JSON.stringify({ mode: 'shell', motionId: 'm1' }))
+  writeFileSync(path.join(page, 'README.md'), 'other data')
+  git(page, 'add', '-A'); git(page, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--quiet', '-m', 'page requests'); git(page, 'push', '--quiet', 'origin', 'HEAD:main')
+
+  const cfg = { folder: FOLDER, pushAttempts: 3 }
+  const clone = createGitClone({ remote, branch: 'main', folder: FOLDER, directory: path.join(root, 'service-clone'), author: { name: 'ZenRay Motion', email: 'm@z' } })
+  const jobs = createJobQueue()
+  const ran = []
+  const submit = (req) => req.mode === 'params'
+    ? jobs.enqueue({ id: req.id, kind: 'request', motionId: req.motionId, origin: 'cloud' }, async () => { ran.push(req.id); return { result: { version: 'V_002' } } })
+    : jobs.record({ id: req.id, kind: 'request', origin: 'cloud' }, 'refused', { error: 'mode attendu' })
+  const queue = createCloudQueue({ cfg, clone, submit, idPattern: '^req-[0-9]{8}-[0-9]{6}-[a-z0-9]{6}$' })
+  jobs.onChange((job) => { if (job.state === 'done') queue.report(job) })
+
+  const picked = await queue.poll()
+  assert.equal(picked.length, 2, queue.state.lastError)
+  await new Promise((r) => setTimeout(r, 1500))
+  assert.deepEqual(ran, [id])
+  git(page, 'pull', '--quiet', 'origin', 'main')
+  const status = JSON.parse(readFileSync(path.join(page, FOLDER, `${id}.status.json`), 'utf8'))
+  assert.equal(status.state, 'done')
+  assert.equal(status.version, 'V_002')
+  assert.equal(JSON.parse(readFileSync(path.join(page, FOLDER, `${badId}.status.json`), 'utf8')).state, 'refused')
+  assert.ok(existsSync(path.join(page, 'README.md')))
+  assert.equal((await queue.poll()).length, 0)
+  assert.equal(ran.length, 1)
+  assert.equal(queue.state.lastError, null)
+  // Red: a clone that cannot reach its remote reports the error instead of claiming success.
+  const lost = createCloudQueue({ cfg, clone: createGitClone({ remote: path.join(root, 'missing.git'), branch: 'main', folder: FOLDER, directory: path.join(root, 'c2'), author: { name: 'a', email: 'b' } }), submit, idPattern: '^req-' })
+  assert.equal((await lost.poll()).length, 0)
+  assert.match(lost.state.lastError, /git|clone|fatal/i)
+})

@@ -1,0 +1,53 @@
+// 12 October 2026, 11:50 CEST: shared helpers of the service tests (temporary workshop, server on a free port).
+// FR : aides communes des tests du service.
+import { cpSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { loadConfig } from '../lib/config.mjs'
+
+export const REAL_WORKSHOP = '/Users/zenray/.claude/tmp/tmp-zenray-motion-design'
+export const SOURCE_MOTION = path.join(REAL_WORKSHOP, 'motions', 'onekey-s02-caption-shine', 'V_008')
+
+/** A throwaway workshop with one motion 'selftest' (V_001 copied from a real version, no reference source). */
+export function tempWorkshop() {
+  const root = mkdtempSync(path.join(tmpdir(), 'zrmd-service-'))
+  const workshop = path.join(root, 'workshop')
+  const v1 = path.join(workshop, 'motions', 'selftest', 'V_001')
+  mkdirSync(v1, { recursive: true })
+  for (const f of ['params.json', 'render.mp4', 'poster.jpg', 'fidelity.json']) cpSync(path.join(SOURCE_MOTION, f), path.join(v1, f))
+  writeFileSync(path.join(v1, 'version.json'), JSON.stringify({ version: 'V_001', parent: null, created: '12 October 2026', note: 'test copy' }))
+  writeFileSync(path.join(workshop, 'motions', 'selftest', 'motion.json'), JSON.stringify({ id: 'selftest', title: 'Self test', recipe: 'textcard', latest: 'V_001', versions: ['V_001'], tags: ['test'] }))
+  return { root, workshop, montageRoot: path.join(root, 'montages') }
+}
+
+export function testConfig(ws, overrides = {}) {
+  const config = loadConfig()
+  config.engine.workshop = ws.workshop
+  config.engine.env = { ...config.engine.env, ZRMD_PATH_WORKSHOP: ws.workshop, ZRMD_PATH_MONTAGES: ws.montageRoot }
+  config.jobs.stateFile = path.join(ws.root, 'jobs.json')
+  config.cloudQueue.enabled = false
+  config.requests.fileClipRoots = [...config.requests.fileClipRoots, ws.root]
+  return Object.assign(config, overrides)
+}
+
+export async function listen(server) {
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return `http://127.0.0.1:${server.address().port}`
+}
+
+export function post(base, config, body, headers = {}) {
+  return fetch(`${base}${config.bridge.path}`, {
+    method: 'POST', body: typeof body === 'string' ? body : JSON.stringify(body),
+    headers: { 'content-type': 'application/json', [config.bridge.clientHeader]: config.bridge.clientValue, ...headers },
+  })
+}
+
+export async function waitJob(base, config, id, timeoutMs = 240000) {
+  const end = Date.now() + timeoutMs
+  for (;;) {
+    const { job } = await (await post(base, config, { action: 'job', id })).json()
+    if (['done', 'error', 'refused', 'cancelled', 'interrupted', 'waiting-agent'].includes(job.state)) return job
+    if (Date.now() > end) throw new Error(`job ${id} still ${job.state}`)
+    await new Promise((r) => setTimeout(r, 500))
+  }
+}

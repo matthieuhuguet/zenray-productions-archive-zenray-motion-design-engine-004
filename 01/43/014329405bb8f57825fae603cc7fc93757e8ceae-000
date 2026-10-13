@@ -1,0 +1,59 @@
+// 12 October 2026, 10:55 CEST: the security gate of the local motion bridge, same model as the Assets and Freelance
+// bridges (R06 section 6.2): loopback only, origin allow list, no cross-site browser call without origin, client
+// header, constant-time secret when ZENRAY_API_SECRET is set, bounded body, private network preflight.
+// FR : la porte de securite du pont local, meme modele que les ponts Assets et Freelance.
+import { timingSafeEqual } from 'node:crypto'
+
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+
+export function sendJson(res, status, value) {
+  res.statusCode = status
+  res.setHeader('content-type', 'application/json; charset=utf-8')
+  res.end(JSON.stringify(value))
+}
+
+/** Returns null when the request may go on, else { status, error, code } (already applied CORS headers stay). */
+export function gate(req, res, bridge, { secret = process.env.ZENRAY_API_SECRET } = {}) {
+  const remote = req.socket?.remoteAddress || ''
+  if (!LOOPBACK.has(remote)) return { status: 403, error: 'Local bridge accepts loopback clients only', code: 'not-loopback' }
+  const origin = req.headers.origin
+  if (origin && !bridge.allowedOrigins.includes(origin)) return { status: 403, error: 'Origin refused', code: 'origin-refused' }
+  if (!origin && req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') {
+    return { status: 403, error: 'Browser origin required', code: 'origin-required' }
+  }
+  if (origin) { res.setHeader('access-control-allow-origin', origin); res.setHeader('vary', 'Origin') }
+  res.setHeader('cache-control', 'no-store')
+  if (req.method === 'OPTIONS') {
+    res.setHeader('access-control-allow-methods', 'POST, OPTIONS')
+    res.setHeader('access-control-allow-headers', `content-type, x-zr-auth, ${bridge.clientHeader}`)
+    res.setHeader('access-control-allow-private-network', 'true')
+    return { status: 204, preflight: true }
+  }
+  if (req.method !== 'POST') return { status: 405, error: 'POST required', code: 'method-refused' }
+  if (!String(req.headers['content-type'] || '').startsWith('application/json') || req.headers[bridge.clientHeader] !== bridge.clientValue) {
+    return { status: 403, error: 'Motion client header required', code: 'client-required' }
+  }
+  if (secret) {
+    const given = Buffer.from(String(req.headers['x-zr-auth'] || '')), expected = Buffer.from(secret)
+    if (given.length !== expected.length || !timingSafeEqual(given, expected)) return { status: 401, error: 'Authentication required', code: 'auth-required' }
+  }
+  return null
+}
+
+/** Reads a JSON body under the byte limit; throws an Error with .status 413 or 400. */
+export async function readBody(req, limit) {
+  const chunks = []
+  let bytes = 0
+  for await (const chunk of req) {
+    bytes += chunk.length
+    if (bytes > limit) { const error = new Error('Request too large'); error.status = 413; error.code = 'body-limit'; throw error }
+    chunks.push(chunk)
+  }
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')
+    if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.action !== 'string') throw new Error('Action required')
+    return body
+  } catch (cause) {
+    const error = new Error(cause.message === 'Action required' ? 'Action required' : 'Invalid JSON body'); error.status = 400; error.code = 'bad-request'; throw error
+  }
+}

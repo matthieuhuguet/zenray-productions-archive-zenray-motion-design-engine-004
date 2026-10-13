@@ -1,0 +1,173 @@
+# 12 October 2026, 17:10 CEST: verifier of the F0 vector harness (zrmd.vector).
+# Green expectations: a glyph line rendered from a font and measured against itself gives soft IoU 1 and edge
+# distance 0, renders are byte-identical, and an exported editable SVG re-rendered by resvg lands on the Skia
+# raster. Red expectations: the same line with the wrong font, the wrong weight or the wrong size is measured as
+# a mismatch. The sweep repeats self (green) and neighbour family (red) over every family of the font dataset on
+# 16 workers. Exit code 0 only when every case lands on its expectation; --json prints the full report.
+# Usage: ~/.venvs/zenray-motion/bin/python -I Scripts/VerifyVector.py [--json] [--no-sweep] [--out FILE]
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from zrmd import settings  # noqa: E402
+from zrmd.vector import metrics as M  # noqa: E402
+from zrmd.vector import render as R  # noqa: E402
+
+INDEX = REPO / "datasets" / "fonts" / "index.json"
+
+
+def _cfg() -> dict:
+    return settings.get("vector.verify")
+
+
+def is_match(cmp: dict, cfg: dict) -> bool:
+    """The single match rule: soft IoU at or above iou_min, mean and p95 chamfer distances at or below their caps."""
+    return (cmp["iou"]["soft"] >= cfg["iou_min"] and cmp["edge"]["mean"] <= cfg["edge_mean_max_px"]
+            and cmp["edge"]["p95"] <= cfg["edge_p95_max_px"])
+
+
+def font_file(family: str) -> str:
+    """Regular (upright) file of a family from the dataset index; a missing family is an error that names it."""
+    rows = [e for e in json.loads(INDEX.read_text()) if e["family"] == family]
+    if not rows:
+        raise KeyError(f"family '{family}' is not in {INDEX}")
+    rows.sort(key=lambda e: ("italic" in e["file"].lower(), abs(e.get("weight_class", 400) - 400)))
+    return rows[0]["file"]
+
+
+def _axes_for(file: str, weight: float | None) -> dict:
+    tags = {a["tag"] for a in R.font_axes(file)}
+    return {"wght": weight} if weight is not None and "wght" in tags else {}
+
+
+def case(name: str, expect: bool, a_spec: dict, b_spec: dict, cfg: dict) -> dict:
+    """Render two specs ({file, size, weight}) and compare them under the match rule."""
+    ra = R.render_text(cfg["text"], a_spec["file"], a_spec["size"], _axes_for(a_spec["file"], a_spec.get("weight")))
+    rb = R.render_text(cfg["text"], b_spec["file"], b_spec["size"], _axes_for(b_spec["file"], b_spec.get("weight")))
+    cmp = M.compare(ra.mask, rb.mask)
+    got = is_match(cmp, cfg)
+    return {"case": name, "expect": "match" if expect else "mismatch", "got": "match" if got else "mismatch",
+            "ok": got == expect, "iou": cmp["iou"], "edge": {k: cmp["edge"][k] for k in ("mean", "p95", "max")},
+            "delta": cmp["delta"], "a": {**a_spec, "file": Path(a_spec["file"]).name, "sha256": ra.sha256[:16]},
+            "b": {**b_spec, "file": Path(b_spec["file"]).name, "sha256": rb.sha256[:16]}}
+
+
+def _sweep_job(job: tuple) -> dict:
+    name, expect, a, b, cfg = job
+    try:
+        return case(name, expect, a, b, cfg)
+    except Exception as exc:  # A font that cannot be shaped is reported, never dropped.
+        return {"case": name, "expect": "match" if expect else "mismatch", "got": "error", "ok": False,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+def run(sweep: bool = True, overrides: dict | None = None) -> dict:
+    cfg = {**_cfg(), **(overrides or {})}
+    inter = font_file(cfg["cases_font"])
+    alt = font_file(cfg["alt_font"])
+    base = {"file": inter, "size": cfg["size_px"], "weight": cfg["weight"]}
+    cases = [
+        case("self identity", True, base, dict(base), cfg),
+        case("wrong font", False, base, {"file": alt, "size": cfg["size_px"], "weight": cfg["weight"]}, cfg),
+        case("wrong weight", False, base, {**base, "weight": cfg["wrong_weight"]}, cfg),
+        case("wrong size", False, base, {**base, "size": cfg["wrong_size_px"]}, cfg),
+    ]
+    # Determinism: two renders, same bytes.
+    r1 = R.render_text(cfg["text"], inter, cfg["size_px"], {"wght": cfg["weight"]})
+    r2 = R.render_text(cfg["text"], inter, cfg["size_px"], {"wght": cfg["weight"]})
+    cases.append({"case": "deterministic bytes", "expect": "match", "got": "match" if r1.sha256 == r2.sha256 else "mismatch",
+                  "ok": r1.sha256 == r2.sha256, "sha256": r1.sha256})
+    # Editable SVG round trip through an independent renderer (resvg).
+    svg = R.export_text_svg(r1, {"version": "V_001"})
+    for engine, rule in (("skia", cfg), ("resvg", {**cfg, **cfg["cross_renderer"]})):
+        cmp = M.compare(r1.mask, R.svg_mask(svg, engine=engine))
+        got = is_match(cmp, rule)
+        cases.append({"case": f"editable svg round trip ({engine})", "expect": "match", "got": "match" if got else "mismatch",
+                      "ok": got, "iou": cmp["iou"], "edge": {k: cmp["edge"][k] for k in ("mean", "p95", "max")},
+                      "rule": {k: rule[k] for k in ("iou_min", "edge_mean_max_px", "edge_p95_max_px")}})
+    # The same SVG with one glyph path shifted by 1 px must fail the strict rule (the round trip can turn red).
+    broken = svg.replace('d="M', 'transform="translate(1 0)" d="M', 1)
+    cmp = M.compare(r1.mask, R.svg_mask(broken, engine="skia"))
+    got = is_match(cmp, cfg)
+    cases.append({"case": "editable svg, one glyph moved 1 px", "expect": "mismatch", "got": "match" if got else "mismatch",
+                  "ok": not got, "iou": cmp["iou"], "edge": {k: cmp["edge"][k] for k in ("mean", "p95", "max")}})
+    # Kerning read from the ink profile against HarfBuzz's own kern values.
+    kt = cfg.get("kerning_text", "AVATAR To")
+    k = R.render_text(kt, inter, cfg["size_px"], {"wght": cfg["weight"]})
+    p = R.render_text(kt, inter, cfg["size_px"], {"wght": cfg["weight"]}, kerning=False)
+    measured = M.kerning_from_profiles(k.mask, p.mask)
+    font_kern = [g["kern"] for g in k.outline.glyphs if g["name"] != "space"]
+    font_pairs = font_kern[:-1]
+    err = None if measured is None or len(measured) != len(font_pairs) else max(abs(a - b) for a, b in zip(measured, font_pairs))
+    kern_ok = err is not None and err <= cfg.get("kerning_max_err_px", 1.0)
+    cases.append({"case": "kerning from ink profile", "expect": "match", "got": "match" if kern_ok else "mismatch",
+                  "ok": kern_ok, "measured": measured, "font": font_pairs, "max_err_px": err})
+    out = {"date": "12 October 2026", "versions": R.versions(), "rule": {k: cfg[k] for k in ("iou_min", "edge_mean_max_px", "edge_p95_max_px")},
+           "text": cfg["text"], "cases": cases}
+    if sweep:
+        families = sorted({e["family"] for e in json.loads(INDEX.read_text())})
+        files = {f: font_file(f) for f in families}
+        jobs = []
+        # The red expectation comes from the vectors, not from the names: two families whose default outlines of
+        # the test line are identical (measured: Lexend and Lexend Deca) are expected to match, and are listed.
+        import hashlib
+        outline = {f: hashlib.sha256(R.shape_text(cfg["text"], files[f], cfg["size_px"]).path_d().encode()).hexdigest()
+                   for f in families}
+        duplicates = []
+        for i, fam in enumerate(families):
+            spec = {"file": files[fam], "size": cfg["size_px"], "weight": None}
+            jobs.append((f"sweep self {fam}", True, spec, dict(spec), cfg))
+            nxt = families[(i + 1) % len(families)]
+            same = outline[fam] == outline[nxt]
+            if same:
+                duplicates.append([fam, nxt])
+            jobs.append((f"sweep {fam} vs {nxt}", same, spec, {"file": files[nxt], "size": cfg["size_px"], "weight": None}, cfg))
+        with ProcessPoolExecutor(max_workers=cfg["workers"]) as pool:
+            res = list(pool.map(_sweep_job, jobs, chunksize=2))
+        green = [r for r in res if r["case"].startswith("sweep self")]
+        red = [r for r in res if not r["case"].startswith("sweep self")]
+        out["sweep"] = {"families": len(families), "self_ok": sum(r["ok"] for r in green), "self_total": len(green),
+                        "neighbour_ok": sum(r["ok"] for r in red), "neighbour_total": len(red),
+                        "worst_neighbour_iou": max((r["iou"]["soft"] for r in red if "iou" in r and r["expect"] == "mismatch"), default=None),
+                        "duplicate_outlines": duplicates,
+                        "failures": [r for r in res if not r["ok"]]}
+    ok = all(c["ok"] for c in cases) and (not sweep or not out["sweep"]["failures"])
+    out["ok"] = ok
+    return out
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-sweep", action="store_true")
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--sabotage", action="store_true",
+                    help="12 October 2026: disable the match rule (everything matches); the verifier must then exit 1")
+    args = ap.parse_args(argv)
+    loose = {"iou_min": 0.0, "edge_mean_max_px": 1e9, "edge_p95_max_px": 1e9}
+    rep = run(sweep=not args.no_sweep, overrides=loose if args.sabotage else None)
+    if args.out:
+        args.out.write_text(json.dumps(rep, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    if args.json:
+        print(json.dumps(rep, indent=1, ensure_ascii=False))
+    else:
+        for c in rep["cases"]:
+            print(f"{'OK ' if c['ok'] else 'BAD'} {c['case']}: expect {c['expect']}, got {c['got']}",
+                  c.get("iou", ""), c.get("edge", ""))
+        if "sweep" in rep:
+            s = rep["sweep"]
+            print(f"sweep {s['families']} families: self {s['self_ok']}/{s['self_total']}, neighbour red "
+                  f"{s['neighbour_ok']}/{s['neighbour_total']}, worst neighbour IoU {s['worst_neighbour_iou']}")
+        print("GREEN" if rep["ok"] else "RED")
+    return 0 if rep["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

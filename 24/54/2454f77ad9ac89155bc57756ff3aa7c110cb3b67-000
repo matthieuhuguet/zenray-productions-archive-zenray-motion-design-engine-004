@@ -1,0 +1,507 @@
+# 12 October 2026: sound matching of one measured event (R03 section 6).
+# Objective = cloud E^2 (bias of the recipe mean against the reference, spread of the recipe removed), so the recipe
+# is never asked to copy the noise realisation of the reference. Search: several starts (descriptors, centre, CMA-ES
+# seeds), each a compact CMA-ES (Hansen's tutorial defaults) then a Nelder-Mead polish; the best wins. The event
+# instant is fitted too (one extra dimension, the offset inside the reference window). Jobs run in parallel, one
+# process per core, with OMP_NUM_THREADS=1 (R03 section 6.4: without it, 9 times slower).
+# FR : ajustement par CMA-ES multi-departs puis Nelder-Mead ; l'instant est ajuste aussi ; 16 processus.
+from __future__ import annotations
+
+import math
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+import numpy as np
+from scipy.optimize import minimize
+
+from . import config
+from . import describe as D
+from .recipes import REGISTRY, render_padded
+
+FREQ_FROM_PEAK = ("f0", "freq", "fMode", "toneHz")
+START_KEYS = ("fStart", "cutoffStart", "pitchStart")
+END_KEYS = ("fEnd", "cutoffEnd")
+
+
+def desc_of(kind: str, params: dict, seed: int, shift_ms: float = 0.0, background=None) -> dict:
+    """Descriptors of a rendered event; with `background` (the music alone at the same place, measurement only),
+    the recipe is described inside that background, like the reference event inside its music."""
+    sr = config.cfg()["audio"]["sampleRate"]
+    x = render_padded(kind, params, seed, sr, shift_ms)
+    if background is not None and len(background):
+        n = len(background)
+        x = np.pad(x, (0, max(0, n - len(x))))[: max(len(x), n)]
+        x[:n] += background
+        x = x[:n]
+    return D.describe(x)
+
+
+def _split(kind: str, unit: np.ndarray, base: dict) -> tuple[dict, float]:
+    lo, hi = config.cfg()["fit"]["offsetRange"]
+    params = REGISTRY[kind].schema.to_physical(unit[:-1], base)
+    return params, lo + float(np.clip(unit[-1], 0, 1)) * (hi - lo)
+
+
+def cloud(ref: dict, kind: str, params: dict, offset_s: float, seeds, background=None) -> dict:
+    return D.compare_cloud(ref, [desc_of(kind, params, s, offset_s * 1000.0, background) for s in seeds])
+
+
+def cma_es(f, x0, sigma, budget, seed, stop_f=0.0):
+    """Compact CMA-ES on the box [0, 1]^n by clipping (Hansen, The CMA Evolution Strategy: A Tutorial)."""
+    rng = np.random.default_rng(seed)
+    n = len(x0)
+    lam = 4 + int(3 * math.log(n))
+    mu = lam // 2
+    w = np.log(mu + 0.5) - np.log(np.arange(1, mu + 1))
+    w /= w.sum()
+    mueff = 1.0 / (w ** 2).sum()
+    cc = (4 + mueff / n) / (n + 4 + 2 * mueff / n)
+    cs = (mueff + 2) / (n + mueff + 5)
+    c1 = 2 / ((n + 1.3) ** 2 + mueff)
+    cmu = min(1 - c1, 2 * (mueff - 2 + 1 / mueff) / ((n + 2) ** 2 + mueff))
+    damps = 1 + 2 * max(0, math.sqrt((mueff - 1) / (n + 1)) - 1) + cs
+    chin = math.sqrt(n) * (1 - 1 / (4 * n) + 1 / (21 * n * n))
+    m, C, pc, ps = np.array(x0, float), np.eye(n), np.zeros(n), np.zeros(n)
+    best_x, best_f, evals = m.copy(), f(m), 1
+    while evals + lam <= budget and best_f > stop_f:
+        vals, vecs = np.linalg.eigh(C)
+        Dd = np.sqrt(np.maximum(vals, 1e-20))
+        z = rng.standard_normal((lam, n))
+        x = np.clip(m + sigma * (z @ (vecs * Dd).T), 0, 1)
+        fx = np.array([f(xi) for xi in x])
+        evals += lam
+        order = np.argsort(fx)
+        if fx[order[0]] < best_f:
+            best_f, best_x = float(fx[order[0]]), x[order[0]].copy()
+        ysel = (x[order[:mu]] - m) / sigma
+        yw = w @ ysel
+        m = m + sigma * yw
+        invsqrt = vecs @ np.diag(1 / Dd) @ vecs.T
+        ps = (1 - cs) * ps + math.sqrt(cs * (2 - cs) * mueff) * invsqrt @ yw
+        hs = np.linalg.norm(ps) / math.sqrt(1 - (1 - cs) ** (2 * evals / lam)) < (1.4 + 2 / (n + 1)) * chin
+        pc = (1 - cc) * pc + hs * math.sqrt(cc * (2 - cc) * mueff) * yw
+        C = (1 - c1 - cmu) * C + c1 * (np.outer(pc, pc) + (1 - hs) * cc * (2 - cc) * C) + cmu * (ysel.T * w) @ ysel
+        sigma *= math.exp((cs / damps) * (np.linalg.norm(ps) / chin - 1))
+        if sigma < 1e-4:
+            break
+    return best_x, best_f, evals
+
+
+def descriptor_init(kind: str, ref: dict) -> tuple[dict, float]:
+    """Physical first guess read off the reference descriptors only, and the offset of its onset in the window."""
+    schema = REGISTRY[kind].schema
+    p = schema.defaults()
+    traj = ref["centroidTraj"]
+    for name in schema.fit_names:
+        if name == "gainDb":
+            p[name] = ref["levelDb"]
+        elif name in ("duration", "riserDuration"):
+            p[name] = ref["spanS"] * 1.25
+        elif name == "tail":
+            p[name] = ref["spanS"]
+        elif name == "decay":
+            p[name] = ref["spanS"] / 2.0
+        elif name in FREQ_FROM_PEAK:
+            p[name] = ref["peakHz"]
+        elif name in START_KEYS:
+            p[name] = float(traj[0])
+        elif name in END_KEYS:
+            p[name] = float(traj[-1])
+        elif name == "fCenter":
+            p[name] = ref["centroidHz"]
+        elif name == "decayModeMs":
+            p[name] = 1000.0 * ref["spanS"] / 4.6
+        elif name == "inharm" and "harmonicity" in ref:
+            # Harmonic reference -> harmonic partials; otherwise bell ratios (12 October 2026, E005 of onekey-pro-2).
+            p[name] = 0.0 if ref["harmonicity"] >= config.cfg()["analysis"]["harmonicThreshold"] else 1.0
+    pre = config.cfg()["audio"]["preRollSeconds"]
+    return schema.clamp(p), ref["onsetS"] - pre
+
+
+def fit_job(job: dict) -> dict:
+    """One (event, kind, start) search. job: ref (descriptors), kind, start name, budget, seed."""
+    f_cfg = config.cfg()["fit"]
+    kind, ref = job["kind"], job["ref"]
+    schema = REGISTRY[kind].schema
+    base = schema.defaults()
+    lo, hi = f_cfg["offsetRange"]
+    t0 = time.time()
+    count = [0]
+
+    def f(unit):
+        count[0] += 1
+        params, off = _split(kind, np.clip(unit, 0, 1), base)
+        if f_cfg.get("objective") == "bestDraw":
+            # 12 October 2026: optimise what ships, the best single draw (no spread allowance).
+            return min(D.compare(ref, desc_of(kind, params, s_, off * 1000.0, job.get("background")))["E2"] for s_ in f_cfg["bestDrawSeeds"])
+        return cloud(ref, kind, params, off, f_cfg["fitSeeds"], job.get("background"))["E"] ** 2
+
+    init_p, init_off = descriptor_init(kind, ref)
+    off_unit = float(np.clip((init_off - lo) / (hi - lo), 0, 1))
+    if job["start"] == "descriptors":
+        x0, sigma = np.append(schema.to_unit(init_p), off_unit), f_cfg["cmaSigma0"] / 2
+    elif job["start"] == "centre":
+        x0, sigma = np.append(np.full(len(schema.fit_names), 0.5), off_unit), f_cfg["cmaSigma0"]
+    else:
+        rng = np.random.default_rng(job["seed"])
+        x0, sigma = np.append(rng.uniform(0.2, 0.8, len(schema.fit_names)), off_unit), f_cfg["cmaSigma0"]
+    stop = (math.log(f_cfg["stopScore"] / 100.0) / math.log(config.cfg()["score"]["base"]))
+    budget = int(job["budget"])
+    x1, f1, _ = cma_es(f, x0, sigma, budget, job["seed"], stop)
+    res = minimize(f, x1, method="Nelder-Mead", options={"maxfev": f_cfg["nelderMeadEval"], "xatol": f_cfg["polishTol"], "fatol": 1e-4})
+    best = np.clip(res.x, 0, 1) if res.fun < f1 else x1
+    params, off = _split(kind, best, base)
+    return {"event": job["event"], "kind": kind, "start": job["start"], "objective": float(min(res.fun, f1)),
+            "params": {k: round(float(v), 5) for k, v in params.items()}, "offsetS": round(off, 5), "evals": count[0],
+            "seconds": round(time.time() - t0, 1)}
+
+
+def shipped(ref: dict, kind: str, params: dict, offset_s: float, seeds, background=None) -> tuple[float, int, dict]:
+    """12 October 2026: the score of the draw we actually ship. The seed is a fitted choice: among `seeds`, draws
+    whose anchor stays within one frame plus the slack come first, then the smallest single-draw distance E.
+    No spread allowance: one draw against the one reference draw. Returns (score, seed, compare result).
+    FR : score du tirage livre ; la graine est choisie ; aucune tolerance de dispersion."""
+    v = config.cfg()["verify"]
+    tol = v["frameSeconds"] + v["timingSlackMs"] / 1000.0
+    best = None
+    for s_ in seeds:
+        d_ = desc_of(kind, params, s_, offset_s * 1000.0, background)
+        c_ = D.compare(ref, d_)
+        late = abs(D.anchor_of(d_, ref["anchorKind"]) - D.anchor_of(ref, ref["anchorKind"])) > tol
+        key = (late, c_["E"], s_)
+        if best is None or key < best[0]:
+            best = (key, c_)
+    (_, e_, seed), c_ = best
+    return c_["score"], seed, c_
+
+
+def evaluate(ref: dict, kind: str, params: dict, offset_s: float, background=None) -> dict:
+    """Shipped score (best draw, the official per-event score), its ceiling (the recipe's own target draw matched by
+    another seed), and the R03 cloud score (held-out seeds, capped spread) kept as a recipe-level diagnostic."""
+    f_cfg = config.cfg()["fit"]
+    ev = cloud(ref, kind, params, offset_s, f_cfg["evalSeeds"], background)
+    own = desc_of(kind, params, f_cfg["targetSeed"], offset_s * 1000.0, background)
+    ceil = cloud(own, kind, params, offset_s, f_cfg["evalSeeds"], background)
+    ship, seed, comp = shipped(ref, kind, params, offset_s, f_cfg["renderSeeds"], background)
+    ship_ceil, _, _ = shipped(own, kind, params, offset_s, [s_ for s_ in f_cfg["renderSeeds"] if s_ != f_cfg["targetSeed"]], background)
+    return {"score": round(ship, 2), "E": round(comp["E"], 3), "ceiling": round(ship_ceil, 2), "errors": comp["errors"],
+            "renderSeed": int(seed), "cloudScore": round(ev["score"], 2), "cloudCeiling": round(ceil["score"], 2),
+            "cloudErrors": ev["corrected"], "spread": ev["spread"]}
+    # 12 October 2026: the rendered track holds ONE draw; the seed is ours to choose, so keep the draw whose own
+    # single comparison with the reference is the smallest (timing and level of a noisy recipe depend on it).
+    # FR : la piste rendue ne contient qu'un tirage ; on choisit la graine dont le tirage est le plus proche.
+
+
+def _eval_job(a):
+    return evaluate(*a)
+
+
+def run(events: list[dict], refs: dict, workers: int | None = None, warm: dict | None = None, backgrounds: dict | None = None) -> list[dict]:
+    """events: [{'id', 'kind', 'alternatives'}]; refs: {id: descriptors}. warm: {id: previous result} adds a start
+    from the previous version's parameters (versions never restart from zero). Returns one result per event."""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    f_cfg = config.cfg()["fit"]
+    workers = workers or f_cfg["workers"]
+    jobs = []
+    for ev in events[: f_cfg["maxEventsFit"]]:
+        kinds = [ev["kind"]] + (ev.get("alternatives", []) if f_cfg["tryAlternatives"] else [])
+        for j, kind in enumerate(kinds):
+            budget = f_cfg["cmaBudget"] * (1.0 if j == 0 else f_cfg["alternativeBudgetFraction"])
+            starts = f_cfg["starts"] if j == 0 else ["descriptors"]
+            for st in starts:
+                seeds = f_cfg["cmaSeeds"] if st == "cma" else [f_cfg["cmaSeeds"][0]]
+                for sd in seeds:
+                    jobs.append({"event": ev["id"], "kind": kind, "start": st, "seed": sd, "budget": budget, "ref": refs[ev["id"]],
+                                 "background": (backgrounds or {}).get(ev["id"])})
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(fit_job, jobs))
+        # Second round: an event whose best search objective still means a score under allKindsBelow is tried
+        # with every other class from the descriptor start (a classification error is recovered by fitting).
+        base = config.cfg()["score"]["base"]
+        weak = []
+        for ev in events[: f_cfg["maxEventsFit"]]:
+            objs = [r["objective"] for r in results if r["event"] == ev["id"]]
+            if objs and 100 * base ** min(objs) < f_cfg["allKindsBelow"]:
+                tried = {r["kind"] for r in results if r["event"] == ev["id"]}
+                weak += [{"event": ev["id"], "kind": k, "start": "descriptors", "seed": f_cfg["cmaSeeds"][0],
+                          "budget": f_cfg["cmaBudget"] * f_cfg["allKindsBudgetFraction"], "ref": refs[ev["id"]],
+                          "background": (backgrounds or {}).get(ev["id"])} for k in REGISTRY if k not in tried]
+        results += list(pool.map(fit_job, weak))
+        if warm:
+            # The previous version's best parameters compete as one more candidate (no search, just evaluated).
+            for ev in events:
+                w = warm.get(ev["id"])
+                if w and w.get("params"):
+                    results.append({"event": ev["id"], "kind": w["kind"], "start": "previous", "objective": None,
+                                    "params": w["params"], "offsetS": w["offsetS"], "evals": 0, "seconds": 0.0})
+        evals = list(pool.map(_eval_job, [(refs[r["event"]], r["kind"], r["params"], r["offsetS"], (backgrounds or {}).get(r["event"]))
+                                          for r in results]))
+    for r, e in zip(results, evals):
+        r.update(e)
+    out = []
+    for ev in events:
+        cands = [r for r in results if r["event"] == ev["id"]]
+        if not cands:
+            continue
+        best = max(cands, key=lambda r: r["score"])
+        best = dict(best, candidates=[{k: c[k] for k in ("kind", "start", "score", "ceiling", "evals", "seconds")} for c in cands])
+        out.append(best)
+    return out
+
+
+# ----------------------------------------------------------------------------------------------------------------------
+# 12 October 2026 (A4): the differentiable sound bank as the default fitter of SFX events.
+# fit.fitter = "dfit" (default) fits every event 1:1 against its own reference window, cut from the stem it was
+# detected on, with chains of datasets/sound-bank blocks (zrmd/audio/dfit.py, perceptual loss zrmd/audio/ploss.py);
+# fit.fitter = "recipes" keeps the B1 path above (18 recipes, descriptor score) unchanged.
+# Discrete choices (which blocks, how many, which noise seed) are searched outside the gradient, in stages, every
+# stage parallel over fit.sfxDfit.workers processes with one thread each:
+#   1 screen : every mono source block alone, cheap settings (screenOverrides);
+#   2 chains : the best screenTop singles refitted, pairs of the pairTop best with the screenTop best, and the
+#              effectTop best singles followed by each insert effect (pairOverrides), warm-started from stage 1;
+#   3 grow   : the best stage 2 chains plus one more source block or effect, up to maxBlocks (pairOverrides);
+#   4 full   : the fullTop best chains, plus the previous version's chain when it exists, with the global dfit settings
+#              plus fullOverrides;
+#   5 seed   : the noise seed of the winner chosen among seedChoices (a discrete parameter, no refit).
+# The official event score is fit.sfxDfit.score: "ploss" (spectrogram 1:1, default), "b1" (descriptor score of
+# describe.compare, the V_017 metric) or "min" (the lower of the two); both are always stored side by side.
+# With keepRecipeCandidate, the previous version's recipe (B1 path) competes under the same score, so a version never
+# ships a chain that is worse than what the previous version shipped.
+# FR : la banque différentiable devient l'ajusteur par défaut des SFX ; chaque événement est ajusté 1:1 sur sa
+# fenêtre et sa piste ; choix discrets par étapes ; l'ancien chemin reste sélectionnable par fit.fitter.
+def fitter_name() -> str:
+    return config.cfg()["fit"].get("fitter", "recipes")
+
+
+def _sd() -> dict:
+    return config.cfg()["fit"]["sfxDfit"]
+
+
+def bank_sources() -> tuple[list[str], list[str]]:
+    """Mono source blocks and insert effects usable on an SFX event (stereo family and excluded blocks left out)."""
+    from . import bank
+    s = _sd()
+    src, fx = [], []
+    for bid in bank.list_blocks():
+        if bid in s["excludeBlocks"]:
+            continue
+        meta = bank.block_meta(bid)
+        if meta.get("family") in s["excludeFamilies"]:
+            continue
+        if getattr(bank.block_class(bid), "KIND", "source") == "effect":
+            if bid in s["effects"]:
+                fx.append(bid)
+        else:
+            src.append(bid)
+    return src, fx
+
+
+def _event_score(p: float, b1: float | None) -> float:
+    mode = _sd()["score"]
+    b1 = 0.0 if b1 is None else float(b1)
+    return float(p) if mode == "ploss" else b1 if mode == "b1" else min(float(p), b1)
+
+
+def _stoch() -> bool:
+    from . import ploss
+    return bool(ploss.stochastic(config.cfg()))
+
+
+def _active_ploss(sw: dict) -> float:
+    """12 October 2026 (A4): the ploss value of a score_window result under the metric the fits optimise: the seed
+    invariant variant when ploss.stochastic.enabled (set per run with --set), else the official one. dfit itself
+    scores with the same switch, so chain fits, seed draws and the recipe baseline compete on one metric.
+    FR : la valeur ploss sous la métrique que l'ajustement optimise, pour comparer sur une seule échelle."""
+    from . import ploss
+    return float(sw["plossStochastic"] if ploss.stochastic(config.cfg()) else sw["ploss"])
+
+
+def _dfit_job(job: dict) -> dict:
+    """One (event, chain) fit. job: event, target (numpy window), chain (ids or a chain dict), overrides, stage."""
+    import torch
+    torch.set_num_threads(1)
+    from . import dfit
+    t0 = time.time()
+    try:
+        r = dfit.fit(job["target"], job["chain"], config.cfg()["bank"]["sampleRate"], device="cpu", overrides=job["overrides"])
+    except Exception as exc:  # one broken fit becomes a named zero, never the loss of the whole pool
+        return {"event": job["event"], "stage": job["stage"], "ids": job["ids"], "score": 0.0, "b1": None, "chain": None,
+                "exception": f"{type(exc).__name__}: {exc}", "seconds": round(time.time() - t0, 1)}
+    return {"event": job["event"], "stage": job["stage"], "ids": job["ids"], "ploss": r["score"], "b1": (r["b1"] or {}).get("score"),
+            "errors": r["errors"], "chain": r["chain"], "seconds": r["seconds"], "starts": r["startsRun"]}
+
+
+def _chain(ids: list[str], fitted: dict[str, dict] | None, sr: int, seconds: float) -> dict:
+    """Chain dict of block ids, each source block starting from its stage-1 fitted values when known."""
+    fitted = fitted or {}
+    seed = config.cfg()["bank"]["noiseSeedDefault"]
+    return {"sr": sr, "seconds": seconds, "blocks": [{"block": b, "params": dict(fitted.get(b, {})), "gainDb": 0.0, "offsetS": 0.0, "seed": seed}
+                                                     for b in ids]}
+
+
+def _recipe_window(fit_r: dict, n: int, sr: int) -> np.ndarray:
+    """The B1 recipe of a previous version rendered inside the event window, exactly where ReproduceSound places it."""
+    body = REGISTRY[fit_r["kind"]].render(fit_r["params"], fit_r.get("renderSeed", config.cfg()["fit"]["targetSeed"]), sr).astype(np.float64)
+    a = int(round((config.cfg()["audio"]["preRollSeconds"] + fit_r["offsetS"]) * sr))
+    out = np.zeros(n)
+    if a < 0:
+        body, a = body[-a:], 0
+    body = body[: max(0, n - a)]
+    out[a:a + len(body)] = body
+    return out
+
+
+def score_window(ours: np.ndarray, target: np.ndarray, sr: int) -> dict:
+    """ploss and B1 scores of one rendered window against the reference window (both always reported)."""
+    from . import dfit, ploss
+    import copy
+    c0 = copy.deepcopy(config.cfg())
+    c0["ploss"]["stochastic"]["enabled"] = False  # 12 October 2026 (A4): "ploss" is always the official A0 metric
+    p = ploss.score(np.asarray(ours, np.float32), np.asarray(target, np.float32), sr, c0)
+    # 12 October 2026 (A4): the seed-invariant variant (A3) beside it, the metric that judges a noise by its expected
+    # spectrum rather than by its exact draw. FR : la variante invariante à la graine, à côté du score officiel.
+    c1 = copy.deepcopy(c0)
+    c1["ploss"]["stochastic"]["enabled"] = True
+    q = ploss.score(np.asarray(ours, np.float32), np.asarray(target, np.float32), sr, c1)
+    b = dfit.b1_score(np.asarray(ours, np.float64), np.asarray(target, np.float64), config.cfg())
+    return {"ploss": round(p["score"], 4), "plossStochastic": round(q["score"], 4), "b1": (b or {}).get("score"), "errors": p["errors"]}
+
+
+def _seed_job(job: dict) -> dict:
+    import torch
+    torch.set_num_threads(1)
+    from . import bank
+    ch = dict(job["chain"], blocks=[dict(b, seed=int(job["seed"])) for b in job["chain"]["blocks"]])
+    y = bank.render_chain(ch)
+    return {"event": job["event"], "seed": int(job["seed"]), **score_window(y, job["target"], ch["sr"]), "chain": ch}
+
+
+def run_dfit(events: list[dict], targets: dict, workers: int | None = None, warm: dict | None = None, log=None) -> list[dict]:
+    """events: [{'id', ...}]; targets: {id: reference window, mono float64, cut from the event's own stem}.
+    warm: {id: previous fit} (a previous dfit chain becomes a stage-4 start; a previous recipe competes when
+    keepRecipeCandidate). Returns one result per event: kind 'chain', chain, ploss, b1, score, stages."""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    s = _sd()
+    sr = config.cfg()["bank"]["sampleRate"]
+    workers = workers or s["workers"]
+    src, fx = bank_sources()
+    say = log or (lambda m: None)
+    evs = [e for e in events[: config.cfg()["fit"]["maxEventsFit"]] if e["id"] in targets]
+    results: dict[str, list[dict]] = {e["id"]: [] for e in evs}
+    singles: dict[str, dict[str, dict]] = {e["id"]: {} for e in evs}
+    t0 = time.time()
+
+    def run(jobs: list[dict]) -> list[dict]:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            out = list(pool.map(_dfit_job, jobs))
+        for r in out:
+            if r.get("chain"):
+                r["score"] = _event_score(r["ploss"], r["b1"])
+            results[r["event"]].append(r)
+        return out
+
+    def job(e, ids, stage, chain=None, over=None):
+        n = len(targets[e["id"]])
+        return {"event": e["id"], "target": np.asarray(targets[e["id"]], np.float32), "ids": list(ids), "stage": stage,
+                "chain": chain or _chain(ids, singles[e["id"]], sr, n / sr), "overrides": over if over is not None else s["pairOverrides"]}
+
+    def ranked(eid, stages=None):
+        rs = [r for r in results[eid] if r.get("chain") and (stages is None or r["stage"] in stages)]
+        best = {}
+        for r in rs:
+            k = "+".join(r["ids"])
+            if k not in best or r["score"] > best[k]["score"]:
+                best[k] = r
+        return sorted(best.values(), key=lambda r: -r["score"])
+
+    # Stage 1: every source block alone, cheap.
+    out = run([job(e, [b], "screen", over=s["screenOverrides"]) for e in evs for b in src])
+    for r in out:
+        if r.get("chain"):
+            singles[r["event"]][r["ids"][0]] = r["chain"]["blocks"][0]["params"]
+    say(f"dfit stage 1 screen: {len(out)} fits, {round(time.time() - t0)} s")
+
+    # Stage 2: refit the best singles, pairs, single plus effect.
+    jobs = []
+    for e in evs:
+        top = [r["ids"][0] for r in ranked(e["id"], {"screen"})][: s["screenTop"]]
+        combos = [[a] for a in top]
+        combos += [[a, b] for i, a in enumerate(top[: s["pairTop"]]) for b in top if b != a and [b, a] not in combos]
+        combos += [[a, f] for a in top[: s["effectTop"]] for f in fx]
+        jobs += [job(e, c, "chains") for c in combos]
+    out = run(jobs)
+    say(f"dfit stage 2 chains: {len(out)} fits, {round(time.time() - t0)} s")
+
+    # Stage 3: grow the best chains by one block (source or effect), up to maxBlocks.
+    jobs = []
+    for e in evs:
+        top_src = [r["ids"][0] for r in ranked(e["id"], {"screen"})][: s["growSources"]]
+        seen = set()
+        for r in ranked(e["id"], {"chains"})[: s["growTop"]]:
+            if len(r["ids"]) >= s["maxBlocks"]:
+                continue
+            base = r["chain"]
+            srcs = [b for b in r["ids"] if b not in fx]
+            effs = [b for b in r["ids"] if b in fx]
+            for add in [b for b in top_src if b not in r["ids"]] + [f for f in fx if f not in r["ids"]]:
+                ids = (srcs + [add] + effs) if add not in fx else (srcs + effs + [add])
+                if "+".join(ids) in seen:
+                    continue
+                seen.add("+".join(ids))
+                prev = {b["block"]: b["params"] for b in base["blocks"]}
+                ch = _chain(ids, {**singles[e["id"]], **prev}, sr, base["seconds"])
+                jobs.append(job(e, ids, "grow", chain=ch))
+    out = run(jobs)
+    say(f"dfit stage 3 grow: {len(out)} fits, {round(time.time() - t0)} s")
+
+    # Stage 4: full settings on the best chains, plus the previous version's chain.
+    jobs = []
+    for e in evs:
+        for r in ranked(e["id"])[: s["fullTop"]]:
+            jobs.append(job(e, r["ids"], "full", chain=r["chain"], over=s["fullOverrides"]))
+        w = (warm or {}).get(e["id"])
+        if w and w.get("chain"):
+            ch = dict(w["chain"], seconds=len(targets[e["id"]]) / sr)
+            jobs.append(job(e, [b["block"] for b in ch["blocks"]], "full", chain=ch, over=s["fullOverrides"]))
+    out = run(jobs)
+    say(f"dfit stage 4 full: {len(out)} fits, {round(time.time() - t0)} s")
+
+    # Stage 5: the noise seed of each event's best chain.
+    seed_jobs = []
+    for e in evs:
+        best = ranked(e["id"])[0]
+        seed_jobs += [{"event": e["id"], "seed": sd, "chain": best["chain"], "target": targets[e["id"]]} for sd in s["seedChoices"]]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        seeds = list(pool.map(_seed_job, seed_jobs))
+    out_rows = []
+    for e in evs:
+        best = ranked(e["id"])[0]
+        cand = [dict(r, ploss=_active_ploss(r), score=_event_score(_active_ploss(r), r["b1"])) for r in seeds if r["event"] == e["id"]]
+        top_seed = max(cand, key=lambda r: r["score"])
+        row = dict(best)
+        if top_seed["score"] > best["score"]:
+            row.update(chain=top_seed["chain"], ploss=top_seed["ploss"], b1=top_seed["b1"], errors=top_seed["errors"], score=top_seed["score"],
+                       seedChosen=top_seed["seed"])
+        row = {"event": e["id"], "kind": "chain", "chainIds": row["ids"], "chain": row["chain"], "score": round(row["score"], 2),
+               "ploss": row["ploss"], "b1": row["b1"], "errors": row["errors"], "stage": row["stage"], "ceiling": 100.0,
+               "ceilingNote": "a bank chain is deterministic: its own render scores 100", "offsetS": 0.0, "params": {},
+               "scoreMetric": s["score"], "plossVariant": "stochastic" if _stoch() else "official", "seedChosen": row.get("seedChosen"),
+               "candidates": [{"ids": "+".join(r["ids"]), "stage": r["stage"], "score": r["score"], "ploss": r["ploss"], "b1": r["b1"],
+                               "seconds": r["seconds"]} for r in ranked(e["id"])[: s["reportCandidates"]]],
+               "fits": len(results[e["id"]]), "exceptions": [r["exception"] for r in results[e["id"]] if r.get("exception")]}
+        # The previous version's recipe competes under the same score (never ship worse than before).
+        w = (warm or {}).get(e["id"])
+        if w and w.get("kind") in REGISTRY and w.get("params"):
+            base = score_window(_recipe_window(w, len(targets[e["id"]]), sr), targets[e["id"]], sr)
+            row["recipeBaseline"] = {"fromVersion": w.get("fromVersion"), "kind": w["kind"], "b1Shipped": w.get("score"), **base}
+            base["plossOfficial"], base["ploss"] = base["ploss"], _active_ploss(base)
+            if s["keepRecipeCandidate"] and _event_score(base["ploss"], base["b1"]) > row["score"]:
+                rec = {k: v for k, v in w.items() if k not in ("chain", "chainScore", "chainFrom")}
+                row = dict(rec, event=e["id"], recipeKeptOver=row, ploss=base["ploss"], b1=base["b1"], score=round(_event_score(base["ploss"], base["b1"]), 2),
+                           scoreMetric=s["score"])
+        out_rows.append(row)
+    say(f"dfit done: {round(time.time() - t0)} s")
+    return out_rows

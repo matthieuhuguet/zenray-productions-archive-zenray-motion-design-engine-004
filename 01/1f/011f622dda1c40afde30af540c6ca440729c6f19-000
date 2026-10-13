@@ -1,0 +1,144 @@
+# 12 October 2026, 08:15 CEST: fit animation curves to measured property tracks.
+# A property track (time, value) is cut into segments at holds and direction changes; each segment gets the GSAP
+# ease that explains it best (named families first, then a free cubic-bezier fit when no family is close).
+# Output tweens are ready to emit: start, duration, from, to, ease, rms error in the property's own unit.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from scipy.optimize import minimize
+
+
+def _bezier_y(t: np.ndarray, x1, y1, x2, y2) -> np.ndarray:
+    """CSS cubic-bezier(x1,y1,x2,y2) evaluated at progress t (solve x(s)=t by Newton, then y(s))."""
+    s = t.copy()
+    for _ in range(12):
+        x = 3 * (1 - s) ** 2 * s * x1 + 3 * (1 - s) * s ** 2 * x2 + s ** 3 - t
+        dx = 3 * (1 - s) ** 2 * x1 + 6 * (1 - s) * s * (x2 - x1) + 3 * s ** 2 * (1 - x2)
+        s = np.clip(s - x / np.where(np.abs(dx) < 1e-6, 1e-6, dx), 0, 1)
+    return 3 * (1 - s) ** 2 * s * y1 + 3 * (1 - s) * s ** 2 * y2 + s ** 3
+
+
+def _back_out(t, c=1.70158):
+    return 1 + (c + 1) * (t - 1) ** 3 + c * (t - 1) ** 2
+
+
+FAMILIES = {
+    "none": lambda t: t,
+    "sine.in": lambda t: 1 - np.cos(t * math.pi / 2), "sine.out": lambda t: np.sin(t * math.pi / 2),
+    "sine.inOut": lambda t: -(np.cos(math.pi * t) - 1) / 2,
+    **{f"power{p}.out": (lambda p: lambda t: 1 - (1 - t) ** (p + 1))(p) for p in (1, 2, 3, 4)},
+    **{f"power{p}.in": (lambda p: lambda t: t ** (p + 1))(p) for p in (1, 2, 3, 4)},
+    **{f"power{p}.inOut": (lambda p: lambda t: np.where(t < 0.5, 2 ** p * t ** (p + 1), 1 - (-2 * t + 2) ** (p + 1) / 2))(p) for p in (1, 2, 3, 4)},
+    "expo.out": lambda t: np.where(t >= 1, 1.0, 1 - 2 ** (-10 * t)),
+    "expo.in": lambda t: np.where(t <= 0, 0.0, 2 ** (10 * t - 10)),
+    "expo.inOut": lambda t: np.where(t < 0.5, 2 ** (20 * t - 10) / 2, (2 - 2 ** (-20 * t + 10)) / 2),
+    "circ.out": lambda t: np.sqrt(1 - (t - 1) ** 2),
+    "back.out": _back_out,
+}
+
+
+def fit_segment(times: np.ndarray, values: np.ndarray) -> dict:
+    """Best ease for one monotonic segment; returns progress-space and value-space errors."""
+    t0, t1 = times[0], times[-1]
+    v0, v1 = values[0], values[-1]
+    span = v1 - v0
+    u = (times - t0) / max(t1 - t0, 1e-9)
+    if abs(span) < 1e-9:
+        return {"start": float(t0), "duration": float(t1 - t0), "from": float(v0), "to": float(v1), "ease": "none", "rms": 0.0}
+    p = (values - v0) / span
+    best = None
+    for name, f in FAMILIES.items():
+        err = float(np.sqrt(np.mean((f(u) - p) ** 2)))
+        if best is None or err < best[1]:
+            best = (name, err)
+    name, err = best
+    if err > 0.02:
+        def loss(q):
+            x1, y1, x2, y2 = q
+            return float(np.mean((_bezier_y(u, np.clip(x1, 0, 1), y1, np.clip(x2, 0, 1), y2) - p) ** 2))
+        starts = [(0.25, 0.1, 0.25, 1.0), (0.42, 0, 0.58, 1), (0.0, 0.0, 0.2, 1.0), (0.6, 0.0, 0.9, 0.4)]
+        opt = min((minimize(loss, s0, method="Nelder-Mead", options={"xatol": 1e-4, "fatol": 1e-8, "maxiter": 800}) for s0 in starts),
+                  key=lambda r: r.fun)
+        berr = math.sqrt(opt.fun)
+        if berr < err * 0.8:
+            x1, y1, x2, y2 = opt.x
+            name, err = f"cubic-bezier({min(max(x1,0),1):.3f},{y1:.3f},{min(max(x2,0),1):.3f},{y2:.3f})", berr
+    return {"start": float(t0), "duration": float(t1 - t0), "from": float(v0), "to": float(v1), "ease": name,
+            "rms": round(err, 4), "rms_value": round(err * abs(span), 4)}
+
+
+def segment_track(times: np.ndarray, values: np.ndarray, hold_eps: float, min_len: int = 3) -> list[tuple[int, int]]:
+    """Split at holds and direction changes; returns index pairs (a, b) inclusive."""
+    dv = np.diff(values)
+    sign = np.where(np.abs(dv) <= hold_eps, 0, np.sign(dv))
+    segs, a = [], 0
+    for i in range(1, len(sign)):
+        if sign[i] != sign[i - 1]:
+            segs.append((a, i)); a = i
+    segs.append((a, len(values) - 1))
+    return [(a, b) for a, b in segs if b - a + 1 >= min_len]
+
+
+def clean_track(times, values, smooth: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """Drop repeated frames (doubled cadence) then smooth lightly (Savitzky-Golay) to remove pixel quantisation."""
+    from scipy.signal import savgol_filter
+    times, values = np.asarray(times, float), np.asarray(values, float)
+    keep = np.ones(len(values), bool)
+    keep[1:] = np.abs(np.diff(values)) > 1e-9
+    keep[0] = True
+    times, values = times[keep], values[keep]
+    if len(values) >= smooth + 2:
+        values = savgol_filter(values, smooth, 2)
+    return times, values
+
+
+def fit_track(times, values, hold_eps: float | None = None, rel_eps: float = 0.01) -> list[dict]:
+    times, values = clean_track(times, values)
+    if hold_eps is None:
+        hold_eps = max(1e-6, rel_eps * (values.max() - values.min()))
+    tweens = []
+    for a, b in segment_track(times, values, hold_eps):
+        if abs(values[b] - values[a]) <= hold_eps * 2:
+            continue
+        tweens.append(fit_segment(times[a:b + 1], values[a:b + 1]))
+    return tweens
+
+
+def selftest() -> dict:
+    """Both directions: a known ease is recovered (green), a wrong curve is not called that ease (red)."""
+    t = np.linspace(0, 0.8, 49)
+    v = 100 + 50 * (1 - (1 - t / 0.8) ** 4)  # power3.out
+    good = fit_segment(t, v)
+    v_bad = 100 + 50 * (t / 0.8) ** 2  # power1.in
+    bad = fit_segment(t, v_bad)
+    return {"recovers_power3_out": good["ease"] == "power3.out", "rejects_wrong": bad["ease"] != "power3.out",
+            "good": good, "bad": bad}
+
+
+def fit_track_exact(times, values, bounds: tuple[float, float] | None = None, min_rel: float = 0.02,
+                    cfg: dict | None = None) -> list[dict]:
+    """12 October 2026: same contract as fit_track (one tween per move) but every move is identified against the exact
+    GSAP 3.14.2 library with zrmd.analyze.easefit (R04 section 5): bounded window, ties and confidence per tween.
+    Moves smaller than min_rel of the track's range are skipped. FR : variante exacte de fit_track, eases GSAP mesurees."""
+    from . import easefit
+    cfg = cfg or easefit.cfg_default()
+    times, values = np.asarray(times, float), np.asarray(values, float)
+    if len(values) < cfg["min_points"] or np.ptp(values) <= 0:
+        return []
+    span = float(np.ptp(values))
+    tweens = []
+    for a, b in easefit.segments(times, values, cfg["rest_ratio"], cfg["min_rest"], cfg["pad"]):
+        if b - a + 1 < cfg["min_points"] or abs(values[b] - values[a]) < min_rel * span:
+            continue
+        tweens.append(easefit.identify_channel(times[a:b + 1], values[a:b + 1], bounds=bounds, cfg=cfg))
+    return tweens
+
+
+def fit_track_reportable(times, values, bounds=None, cfg: dict | None = None) -> tuple[list[dict], int]:
+    """12 October 2026: fit_track_exact then keep only the tweens that pass easefit.reportable; returns (kept, rejected)."""
+    from . import easefit
+    all_tw = fit_track_exact(times, values, bounds=bounds, cfg=cfg)
+    kept = [t for t in all_tw if easefit.reportable(t, cfg)]
+    return kept, len(all_tw) - len(kept)

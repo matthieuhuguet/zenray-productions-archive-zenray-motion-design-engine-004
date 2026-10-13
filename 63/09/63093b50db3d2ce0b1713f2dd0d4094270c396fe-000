@@ -1,0 +1,219 @@
+# 12 October 2026, 21:30 CEST: verifier of F1 (font dataset, matcher, parametric font creator).
+# Every case renders a synthetic reference crop from a KNOWN font with known parameters, so the truth is known.
+# Green expectations:
+#   dataset   at least vector.features.min_families usable families, every file measured, licence files present;
+#   matcher   on each matcher case the right family ranks first (or a family with identical outlines), the fit
+#             reaches the match rule (vector.fit.match) and recovers size and axes within tolerance;
+#   creator   a target built from a free font with known creator parameters is not matched by any family, and
+#             the creator rebuilds a .ttf that reaches the match rule through HarfBuzz; two builds of the same
+#             params give identical bytes; a parameter change gives a different, measurably bolder font.
+# Red expectations:
+#   matcher   the first matcher case with its family removed from the dataset must NOT reach the match rule;
+#   creator   the creator with every fitting stage switched off must NOT reach the match rule.
+# --sabotage switches off the matcher fine stage and the creator stages for every case: the green cases must
+# then fail and the verifier must exit 1 (proof that it can turn red). Exit 0 only when every case lands.
+# Usage: ~/.venvs/zenray-motion/bin/python -I Scripts/VerifyFonts.py [--json] [--out FILE] [--sabotage] [--only K]
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+import numpy as np  # noqa: E402
+
+from zrmd import settings  # noqa: E402
+from zrmd.vector import features as F  # noqa: E402
+from zrmd.vector import fontcreate as FC  # noqa: E402
+from zrmd.vector import fontfit as FF  # noqa: E402
+from zrmd.vector import metrics as M  # noqa: E402
+from zrmd.vector import render as R  # noqa: E402
+
+FONTS = REPO / "datasets" / "fonts"
+
+
+def _cfg() -> dict:
+    return settings.get("vector.verify_fonts")
+
+
+def family_file(family: str, name_hint: str | None = None) -> str:
+    rows = [e for e in json.loads((FONTS / "index.json").read_text()) if e["family"] == family]
+    if name_hint:
+        rows = [e for e in rows if name_hint in Path(e["file"]).name]
+    if not rows:
+        raise KeyError(f"family '{family}' ({name_hint}) is not in the dataset index")
+    rows.sort(key=lambda e: (not e["variable"], abs((e.get("weight_class") or 400) - 400)))
+    return rows[0]["file"]
+
+
+def render_case(c: dict) -> tuple[np.ndarray, str]:
+    f = family_file(c["family"], c.get("file_hint"))
+    n = len(R.shape_text(c["text"], f, c["size"]).glyphs)
+    deltas = [0.0] * n
+    for i, d in c.get("deltas", {}).items():
+        deltas[int(i)] = d
+    ref = R.render_text_at(c["text"], f, c["size"], tuple(c["origin"]), tuple(c["canvas"]), c.get("axes") or None,
+                           c.get("tracking_em", 0.0), deltas)
+    return ref, f
+
+
+def outline_twins(file: str, text: str, size: float, axes: dict) -> set:
+    """Families whose regular file draws the same raster as the truth (duplicates such as Lexend / Lexend Deca)."""
+    ref = R.render_text(text, file, size, axes or None).sha256
+    twins = set()
+    for r in FF.feature_records().values():
+        if not r.get("usable"):
+            continue
+        try:
+            ax = {k: v for k, v in (axes or {}).items() if k in {a["tag"] for a in R.font_axes(r["file"])}}
+            if R.render_text(text, r["file"], size, ax or None).sha256 == ref:
+                twins.add(r["family"])
+        except Exception:
+            pass
+    return twins
+
+
+def check_dataset(cfg: dict) -> dict:
+    idx = json.loads((FONTS / "features-index.json").read_text())
+    fams = idx["families"]
+    usable = [f for f in fams if any(x["usable"] for x in f["files"])]
+    no_licence = []
+    for f in fams:
+        d = Path(f["files"][0]["file"]).parent
+        src = json.loads((d / "source.json").read_text()) if (d / "source.json").exists() else {}
+        has = any((d / n).exists() for n in ("OFL.txt", "LICENSE.txt", "LICENCE.txt", "OFL-1.1.txt")) \
+            or bool(src.get("licence_files")) or src.get("license", "").startswith("ITF")
+        if not has and "Inter Display" != f["family"]:
+            no_licence.append(f["family"])
+    classes = {}
+    for f in fams:
+        classes[f.get("licence_class") or "unknown"] = classes.get(f.get("licence_class") or "unknown", 0) + 1
+    ok = len(usable) >= settings.get("vector.features.min_families") and not no_licence
+    return {"case": "dataset", "expect": "green", "ok": ok, "families": len(fams), "usable": len(usable),
+            "files": sum(len(f["files"]) for f in fams), "licence_classes": classes,
+            "missing_licence_file": no_licence}
+
+
+def check_match(c: dict, cfg: dict, overrides: dict | None, exclude: list | None = None, expect_match=True) -> dict:
+    t0 = time.time()
+    ref, f = render_case(c)
+    m = FF.match_font(ref, c["text"], exclude_families=exclude, overrides=overrides)
+    b = m["best"]
+    twins = outline_twins(f, c["text"], c["size"], c.get("axes") or {}) | {c["family"]}
+    rank1 = b["family"] in twins
+    out = {"case": c["name"], "expect": "match" if expect_match else "no match",
+           "truth": {k: c.get(k) for k in ("family", "size", "axes", "tracking_em", "deltas")},
+           "best": {k: b[k] for k in ("family", "iou", "edge_mean", "match")} | {"params": b["params"]},
+           "rank": [f_["family"] for f_ in m["fits"]][:5], "coarse_rank_of_truth":
+               next((i + 1 for i, x in enumerate(m["coarse"]) if x["family"] in twins), None),
+           "candidates": m["candidates"], "seconds": round(time.time() - t0, 1)}
+    if expect_match:
+        tol = cfg["tolerance"]
+        size_err = abs(b["params"]["size"] - c["size"]) / c["size"]
+        ax_err = {k: abs(b["params"]["axes"].get(k, v) - v) for k, v in (c.get("axes") or {}).items()}
+        ax_ok = all(e <= tol["axis_units"] for e in ax_err.values())
+        out.update({"size_rel_err": round(size_err, 5), "axis_err": ax_err,
+                    "ok": bool(rank1 and b["match"] and size_err <= tol["size_rel"] and ax_ok)})
+    else:
+        out["ok"] = not b["match"]
+    return out
+
+
+def check_creator(cfg: dict, overrides: dict | None, enable: dict | None, work: Path) -> list[dict]:
+    c = cfg["creator"]
+    f = family_file(c["family"])
+    work.mkdir(parents=True, exist_ok=True)
+    base = FC.instance_base(f, c["axes"], work / "target-base.ttf")
+    names, _, _ = FC.shape_names(str(base), c["text"])
+    P = {"schema": FC.SCHEMA, "date": "12 October 2026", "base": {"file": f, "axes": c["axes"]},
+         "global": dict(c["global"]),
+         "glyphs": {n: {"scale_x": 1.0, "advance_units": c.get("advance_units", {}).get(n, 0.0), "offsets": None}
+                    for n in dict.fromkeys(names)},
+         "layout": {"text": c["text"], "size": c["size"], "origin": c["origin"], "tracking_em": c["tracking_em"],
+                    "deltas": None}}
+    target = FC.build_font(P, work / "target.ttf", "ZRMD Verify Target")
+    canvas = tuple(c["canvas"])
+    ref = FC.render_built(target["file"], P, canvas)
+    t0 = time.time()
+    m = FF.match_font(ref, c["text"], overrides=overrides)
+    results = [{"case": "creator target is not matched by a free family", "expect": "no match",
+                "best": {k: m["best"][k] for k in ("family", "iou", "match")}, "ok": not m["match"]}]
+    # 12 October 2026: multi-start creator (fontcreate.create_font), first vector.create.starts matcher families.
+    r = FC.create_font(ref, c["text"], m, work / "fit", enable=enable)
+    built = FC.build_font(r["params"], work / "fit-a.ttf", "ZRMD Verify Fit")
+    again = FC.build_font(r["params"], work / "fit-b.ttf", "ZRMD Verify Fit")
+    s = FF.score(ref, FC.render_built(built["file"], r["params"], canvas))
+    results.append({"case": "creator rebuilds the target 1:1 (built .ttf through HarfBuzz)", "expect": "match",
+                    "ok": FF.is_match(s), "score": s, "start": r["start"], "starts": r["starts"],
+                    "truth_global": c["global"], "fitted_global": r["params"]["global"],
+                    "fitted_axes": r["params"]["base"]["axes"], "truth_axes": c["axes"],
+                    "trace": [{k: t[k] for k in ("stage", "iou", "edge_mean")} for t in r["trace"]],
+                    "seconds": round(time.time() - t0, 1)})
+    results.append({"case": "two builds of the same params are byte-identical", "expect": "green",
+                    "ok": built["sha256"] == again["sha256"], "sha256": built["sha256"][:16]})
+    var = json.loads(json.dumps(r["params"]))
+    var["global"]["weight_units"] = var["global"]["weight_units"] + cfg["variation_weight_units"]
+    vb = FC.build_font(var, work / "variation.ttf", "ZRMD Verify Variation")
+    mv = FC.render_built(vb["file"], var, canvas)
+    sv = FF.score(ref, mv)
+    st0 = M.stroke_widths(ref)["p50"]
+    st1 = M.stroke_widths(mv)["p50"]
+    results.append({"case": "a parameter change is a variation (weight_units +%g)" % cfg["variation_weight_units"],
+                    "expect": "different and bolder", "ok": (not FF.is_match(sv)) and st1 > st0,
+                    "iou_vs_target": sv["iou"], "stroke_p50": [st0, st1]})
+    off = FC.create_font(ref, c["text"], m, work / "fit-off",
+                         enable={"axes": False, "globals": False, "spacing": False, "offsets": False})
+    so = off["score"]
+    results.append({"case": "creator with every stage off does not reach the match rule", "expect": "no match",
+                    "ok": not FF.is_match(so), "score": so})
+    return results
+
+
+def run(sabotage: bool, only: str | None) -> dict:
+    cfg = _cfg()
+    overrides = {"sigmas": [], "alt_rounds": 0} if sabotage else None
+    enable = {"axes": False, "globals": False, "spacing": False, "offsets": False} if sabotage else None
+    cases = []
+    t0 = time.time()
+    if only in (None, "dataset"):
+        cases.append(check_dataset(cfg))
+    if only in (None, "matcher"):
+        for c in cfg["matcher_cases"]:
+            cases.append(check_match(c, cfg, overrides))
+        first = cfg["matcher_cases"][0]
+        red = check_match(dict(first, name=first["name"] + ", family removed"), cfg, overrides,
+                          exclude=cfg["red_exclude"], expect_match=False)
+        cases.append(red)
+    if only in (None, "creator"):
+        cases += check_creator(cfg, overrides, enable, Path(cfg["work_dir"]))
+    return {"schema": "zrmd/verify-fonts@1", "date": "12 October 2026", "sabotage": sabotage,
+            "ok": all(c["ok"] for c in cases), "seconds": round(time.time() - t0, 1),
+            "versions": R.versions(), "cases": cases}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--out")
+    ap.add_argument("--sabotage", action="store_true")
+    ap.add_argument("--only", choices=["dataset", "matcher", "creator"])
+    args = ap.parse_args()
+    rep = run(args.sabotage, args.only)
+    if args.out:
+        Path(args.out).write_text(json.dumps(rep, indent=1, ensure_ascii=False, default=str))
+    if args.json:
+        print(json.dumps(rep, indent=1, ensure_ascii=False, default=str))
+    else:
+        for c in rep["cases"]:
+            extra = c.get("best", {}).get("iou") or c.get("score", {}).get("iou") or ""
+            print(f"{'OK ' if c['ok'] else 'BAD'} {c['case']} (expect {c['expect']}) {extra}")
+        print(f"{'GREEN' if rep['ok'] else 'RED'} in {rep['seconds']} s")
+    return 0 if rep["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

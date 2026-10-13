@@ -1,0 +1,274 @@
+# 12 October 2026: global image motion of a shot measured as a 2D similarity (R04 section 3) and the 3D probe of
+# R04 section 10 with the appearance residual it asked for (decision 6).
+# Per pair of consecutive frames: corners (goodFeaturesToTrack), Lucas-Kanade with a forward-backward check, then
+# under the same RANSAC tolerance a similarity (pan, roll, zoom of a 2D camera), an affine, a homography (flat card in
+# perspective) and a fundamental matrix (rigid scene in depth). The similarity's dominant inlier layer is the camera;
+# when corners are missing (flat backgrounds) ECC with an affine model on an interior region takes over.
+# The similarity is chained frame after frame; each channel (x, y in % of the width, zoom in % of scale, roll in
+# degrees) is then explained by exact GSAP eases (zrmd.analyze.easefit) bounded to the shot.
+# Appearance residual: after warping the previous frame by the best homography, the remaining difference divided by
+# the local contrast stays low for a layer and grows when shading, faces or reflections change (3D render cue).
+# Numbers only: no picture is written.
+# FR : mouvement global par similarite, sonde 3D et residu d'apparence ; seuls des nombres sortent.
+from __future__ import annotations
+
+import math
+
+import cv2
+import numpy as np
+
+from .. import settings
+
+
+def cfg_default() -> dict:
+    return settings.get("analysis.camera")
+
+
+def to_gray(frame: np.ndarray) -> np.ndarray:
+    return frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+
+def track(prev: np.ndarray, cur: np.ndarray, cfg: dict):
+    """Forward-backward checked Lucas-Kanade tracks between two gray frames; (a, b) point arrays or (None, None)."""
+    pts = cv2.goodFeaturesToTrack(prev, maxCorners=cfg["max_corners"], qualityLevel=cfg["quality"],
+                                  minDistance=cfg["min_distance"], blockSize=cfg["block_size"])
+    if pts is None or len(pts) < cfg["min_points"]:
+        return None, None
+    win = (cfg["lk_win"], cfg["lk_win"])
+    nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev, cur, pts, None, winSize=win, maxLevel=cfg["lk_levels"])
+    back, st2, _ = cv2.calcOpticalFlowPyrLK(cur, prev, nxt, None, winSize=win, maxLevel=cfg["lk_levels"])
+    fb = np.linalg.norm((back - pts).reshape(-1, 2), axis=1)
+    ok = (st.ravel() == 1) & (st2.ravel() == 1) & (fb < cfg["fb_max_px"])
+    if ok.sum() < cfg["min_points"]:
+        return None, None
+    return pts.reshape(-1, 2)[ok], nxt.reshape(-1, 2)[ok]
+
+
+def similarity_params(M: np.ndarray) -> dict:
+    """2x3 similarity matrix to translation (px), roll (degrees) and scale."""
+    a, b = float(M[0, 0]), float(M[1, 0])
+    return {"tx": float(M[0, 2]), "ty": float(M[1, 2]), "roll": math.degrees(math.atan2(b, a)), "scale": math.hypot(a, b)}
+
+
+def _ratio_affine(M, a, b, tau):
+    return float(np.mean(np.linalg.norm(a @ M[:, :2].T + M[:, 2] - b, axis=1) < tau))
+
+
+def _ratio_h(Hm, a, b, tau):
+    return float(np.mean(np.linalg.norm(cv2.perspectiveTransform(a.reshape(-1, 1, 2), Hm).reshape(-1, 2) - b, axis=1) < tau))
+
+
+def _ratio_f(Fm, a, b, tau):
+    ah = np.hstack([a, np.ones((len(a), 1))])
+    bh = np.hstack([b, np.ones((len(b), 1))])
+    l2, l1 = ah @ Fm.T, bh @ Fm
+    num = np.abs(np.sum(bh * l2, axis=1))
+    d = num / np.maximum(np.hypot(l2[:, 0], l2[:, 1]), 1e-9) + num / np.maximum(np.hypot(l1[:, 0], l1[:, 1]), 1e-9)
+    return float(np.mean(d / 2 < tau))
+
+
+def _layers(a, b, cfg):
+    remaining = np.arange(len(a))
+    count = explained = 0
+    while count < cfg["max_layers"] and len(remaining) >= cfg["layer_min_points"]:
+        Hm, mask = cv2.findHomography(a[remaining], b[remaining], cv2.RANSAC, cfg["ransac_px"], maxIters=2000,
+                                      confidence=0.995)
+        if Hm is None:
+            break
+        inl = mask.ravel().astype(bool)
+        if inl.sum() < cfg["layer_min_points"]:
+            break
+        count += 1
+        explained += int(inl.sum())
+        remaining = remaining[~inl]
+        if explained >= cfg["layers_explained"] * len(a):
+            break
+    return count, explained / max(len(a), 1)
+
+
+def model_ratios(a, b, cfg) -> dict | None:
+    """R04 section 10 competition on the moving tracks of one pair."""
+    tau = cfg["ransac_px"]
+    flow = np.linalg.norm(b - a, axis=1)
+    moving = flow > cfg["moving_px"]
+    if moving.sum() < cfg["min_points"]:
+        return None
+    a, b = a[moving], b[moving]
+    S, _ = cv2.estimateAffinePartial2D(a, b, method=cv2.RANSAC, ransacReprojThreshold=tau, maxIters=2000)
+    A, _ = cv2.estimateAffine2D(a, b, method=cv2.RANSAC, ransacReprojThreshold=tau, maxIters=2000)
+    Hm, _ = cv2.findHomography(a, b, cv2.RANSAC, tau, maxIters=2000, confidence=0.995)
+    Fm, _ = cv2.findFundamentalMat(a, b, cv2.FM_RANSAC, tau, 0.995)
+    out = {"n": int(len(a)), "sim": _ratio_affine(S, a, b, tau) if S is not None else 0.0,
+           "aff": _ratio_affine(A, a, b, tau) if A is not None else 0.0,
+           "hom": _ratio_h(Hm, a, b, tau) if Hm is not None else 0.0,
+           "fun": _ratio_f(Fm[:3], a, b, tau) if Fm is not None and Fm.shape[0] >= 3 else 0.0}
+    out["layers"], out["layers_explained"] = _layers(a, b, cfg)
+    return out
+
+
+def ecc_similarity(prev: np.ndarray, cur: np.ndarray, cfg: dict) -> np.ndarray | None:
+    """Affine ECC on an interior region (flat backgrounds), reduced to the closest similarity."""
+    h, w = prev.shape
+    m = int(cfg["residual_interior"] * min(h, w))
+    a = prev[m:h - m, m:w - m].astype(np.float32) / 255.0
+    b = cur[m:h - m, m:w - m].astype(np.float32) / 255.0
+    if a.std() < 0.01 or b.std() < 0.01:
+        return None
+    warp = np.eye(2, 3, dtype=np.float32)
+    try:
+        _, warp = cv2.findTransformECC(a, b, warp, cv2.MOTION_AFFINE,
+                                       (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5), None, 3)
+    except cv2.error:
+        return None
+    # ECC maps cur->prev coordinates of the interior crop; invert to prev->cur and shift back to full-frame origin.
+    full = np.vstack([warp, [0, 0, 1]]).astype(np.float64)
+    shift = np.array([[1, 0, m], [0, 1, m], [0, 0, 1]], np.float64)
+    inv = np.linalg.inv(shift @ full @ np.linalg.inv(shift))[:2]
+    sc = 0.5 * (math.hypot(inv[0, 0], inv[1, 0]) + math.hypot(inv[0, 1], inv[1, 1]))
+    ang = math.atan2(inv[1, 0] - inv[0, 1], inv[0, 0] + inv[1, 1])
+    return np.array([[sc * math.cos(ang), -sc * math.sin(ang), inv[0, 2]],
+                     [sc * math.sin(ang), sc * math.cos(ang), inv[1, 2]]])
+
+
+def appearance_residual(prev: np.ndarray, cur: np.ndarray, Hm: np.ndarray | None, cfg: dict) -> float:
+    """Mean |cur - warp(prev)| on the interior, divided by the interior contrast of cur."""
+    h, w = prev.shape
+    warped = cv2.warpPerspective(prev, Hm, (w, h), flags=cv2.INTER_LINEAR) if Hm is not None else prev
+    m = int(cfg["residual_interior"] * min(h, w))
+    a = warped[m:h - m, m:w - m].astype(np.float32)
+    b = cur[m:h - m, m:w - m].astype(np.float32)
+    contrast = max(float(b.std()), 4.0)
+    return float(np.abs(a - b).mean() / contrast)
+
+
+def measure(frames, fps: float, cfg: dict | None = None) -> dict:
+    """Frames (gray or RGB, one shot, consecutive at fps). Returns the chained camera track and the 3D probe."""
+    cfg = cfg or cfg_default()
+    gray = [to_gray(f) for f in frames]
+    n = len(gray)
+    h, w = gray[0].shape
+    M = np.eye(3)
+    track_rows = [{"t": 0.0, "x": 0.0, "y": 0.0, "zoom": 1.0, "roll": 0.0}]
+    probes, residuals, ecc_used, pairs = [], [], 0, 0
+    for i in range(1, n):
+        pairs += 1
+        a, b = track(gray[i - 1], gray[i], cfg)
+        S = None
+        if a is not None:
+            S, inl = cv2.estimateAffinePartial2D(a, b, method=cv2.RANSAC, ransacReprojThreshold=cfg["ransac_px"],
+                                                 maxIters=2000)
+            if S is not None and inl is not None and inl.sum() < cfg["min_points"]:
+                S = None
+            stats = model_ratios(a, b, cfg)
+            if stats:
+                probes.append(stats)
+            Hm, _ = cv2.findHomography(a, b, cv2.RANSAC, cfg["ransac_px"], maxIters=2000, confidence=0.995)
+            residuals.append(appearance_residual(gray[i - 1], gray[i], Hm, cfg))
+        else:
+            residuals.append(appearance_residual(gray[i - 1], gray[i], None, cfg))
+        if S is None:
+            S = ecc_similarity(gray[i - 1], gray[i], cfg)
+            if S is not None:
+                ecc_used += 1
+        if S is None:
+            S = np.eye(2, 3)
+        M = np.vstack([S, [0, 0, 1]]) @ M
+        p = similarity_params(M[:2])
+        # Camera convention: content moving right = camera panning left; we report the content motion of the frame
+        # centre, in % of the width (x and y), zoom as content scale, roll in degrees.
+        cx, cy = w / 2.0, h / 2.0
+        centre = M[:2, :2] @ np.array([cx, cy]) + M[:2, 2]
+        track_rows.append({"t": i / fps, "x": 100.0 * (centre[0] - cx) / w, "y": 100.0 * (centre[1] - cy) / w,
+                           "zoom": p["scale"], "roll": p["roll"]})
+    moving_fraction = len(probes) / max(pairs, 1)
+    med = lambda k: float(np.median([r[k] for r in probes])) if probes else 0.0
+    probe = {"pairs": pairs, "moving_pairs_fraction": round(moving_fraction, 3), "sim": med("sim"), "aff": med("aff"),
+             "hom": med("hom"), "fun": med("fun"), "layers": med("layers"), "layers_explained": med("layers_explained"),
+             "residual": round(float(np.median(residuals)) if residuals else 0.0, 4),
+             "residual_p90": round(float(np.percentile(residuals, 90)) if residuals else 0.0, 4), "ecc_pairs": ecc_used}
+    probe["class"] = classify_3d(probe, cfg)
+    return {"track": track_rows, "probe": probe, "size": [w, h], "fps": fps}
+
+
+def classify_3d(s: dict, cfg: dict) -> str:
+    """R04 section 10.1 rules, plus the appearance residual for layer-like moves."""
+    if s["moving_pairs_fraction"] < cfg["static_pairs_fraction"]:
+        return "static"
+    r = cfg["model_ratio"]
+    if s["sim"] >= r:
+        return "layer_2d_lit" if s["residual"] >= cfg["residual_3d"] else "layer_2d"
+    if s["aff"] >= r:
+        return "layer_2d_affine"
+    if s["hom"] >= r and s["hom"] - s["aff"] >= cfg["hom_gain"]:
+        return "card_perspective"
+    if s["layers"] >= 2 and s["layers_explained"] >= cfg["layers_explained"]:
+        return "parallax_2_5d"
+    if s["fun"] >= cfg["fun_ratio"] and s["hom"] < cfg["hom_max_for_3d"]:
+        return "rigid_3d"
+    return "complex"
+
+
+CLASS_FR = {"static": "immobile", "layer_2d": "calque 2D", "layer_2d_lit": "calque 2D dont l'apparence change (rendu éclairé ou 3D possible)",
+            "layer_2d_affine": "calque 2D déformé (affine)", "card_perspective": "carte plane en perspective",
+            "parallax_2_5d": "plusieurs couches en parallaxe (2,5D)", "rigid_3d": "scène 3D rigide en profondeur",
+            "complex": "mouvement complexe (déformation, fluide ou rendu 3D éclairé)"}
+
+
+def summarize(result: dict, bounds: tuple[float, float], cfg: dict | None = None, fit: bool = True) -> dict:
+    """Totals of each channel and their eases. bounds are the shot limits in the track's own time base."""
+    from . import easefit
+    cfg = cfg or cfg_default()
+    tr = result["track"]
+    t = np.array([r["t"] for r in tr])
+    w = result["size"][0]
+    channels = {"x": np.array([r["x"] for r in tr]), "y": np.array([r["y"] for r in tr]),
+                "zoom": 100.0 * (np.array([r["zoom"] for r in tr]) - 1.0), "roll": np.array([r["roll"] for r in tr])}
+    limits = {"x": 100.0 * cfg["move_min_px"] / w, "y": 100.0 * cfg["move_min_px"] / w,
+              "zoom": 100.0 * cfg["zoom_min"], "roll": cfg["roll_min_deg"]}
+    out = {}
+    for k, v in channels.items():
+        total = float(v[-1] - v[0]) if len(v) else 0.0
+        span = float(np.ptp(v)) if len(v) else 0.0
+        row = {"total": round(total, 3), "range": round(span, 3), "moves": []}
+        if fit and span >= limits[k] and len(v) >= easefit.cfg_default()["min_points"]:
+            from .curves import fit_track_reportable
+            row["moves"], row["rejected_moves"] = fit_track_reportable(t, v, bounds=bounds)
+        out[k] = row
+    kind = []
+    if out["zoom"]["range"] >= limits["zoom"]:
+        kind.append("zoom avant" if out["zoom"]["total"] > 0 else "zoom arrière")
+    if max(out["x"]["range"], out["y"]["range"]) >= limits["x"]:
+        kind.append("panoramique" if abs(out["x"]["total"]) >= abs(out["y"]["total"]) else "travelling vertical")
+    if out["roll"]["range"] >= limits["roll"]:
+        kind.append("roulis")
+    return {"channels": out, "kind": kind or ["fixe"], "units": {"x": "% largeur", "y": "% largeur", "zoom": "% échelle",
+                                                                 "roll": "degrés"}}
+
+
+def selftest() -> dict:
+    """Both directions on a synthetic textured plate: a known zoom in power2.inOut and a pan are recovered (green);
+    a still sequence reports no move and the zoom is not called the wrong ease (red)."""
+    from . import easefit
+    rng = np.random.default_rng(3)
+    base = cv2.GaussianBlur((rng.random((540, 960)) * 255).astype(np.uint8), (0, 0), 2.0)
+    base = cv2.normalize(base, None, 0, 255, cv2.NORM_MINMAX)
+    lib = easefit.default_library()
+    fps, n = 30.0, 45
+    frames = []
+    for i in range(n):
+        u = lib.evaluate("power2.inOut", (i / fps - 0.2) / 1.0)
+        s = 1.0 + 0.15 * float(u)
+        dx = 40.0 * float(lib.evaluate("power1.out", (i / fps - 0.2) / 1.0))
+        M = cv2.getRotationMatrix2D((480, 270), 0.0, s)
+        M[0, 2] += dx
+        frames.append(cv2.warpAffine(base, M, (960, 540), borderMode=cv2.BORDER_REFLECT))
+    cfg = cfg_default()
+    res = measure([cv2.resize(f, (480, 270)) for f in frames], fps, cfg)
+    summ = summarize(res, (0.0, n / fps), cfg)
+    z = summ["channels"]["zoom"]
+    still = summarize(measure([cv2.resize(frames[0], (480, 270))] * 12, fps, cfg), (0.0, 12 / fps), cfg)
+    zoom_ok = abs(z["total"] - 15.0) < 0.6 and bool(z["moves"]) and z["moves"][0]["ease"] in ("power2.inOut", "sine.inOut",
+                                                                                                "css.ease-in-out")
+    return {"zoom_total_pct": z["total"], "zoom_ease": z["moves"][0]["ease"] if z["moves"] else None,
+            "x_total_pct": summ["channels"]["x"]["total"], "kind": summ["kind"], "probe": res["probe"]["class"],
+            "recovers_zoom": zoom_ok, "still_is_fixed": still["kind"] == ["fixe"]}

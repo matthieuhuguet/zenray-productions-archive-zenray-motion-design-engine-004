@@ -1,0 +1,42 @@
+// 12 October 2026, 11:20 CEST: LOAD and UNLOAD of a motion go through the existing ZenRay Assets bridge (port 3100),
+// never through a second loader (R06 section 5.3). A motion's files are the workshop files under motions/<id>/.
+// FR : LOAD et UNLOAD passent par le pont Assets existant, jamais par un second chargeur.
+export function createAssetsClient(assets, { fetchImpl = (...a) => fetch(...a) } = {}) {
+  async function request(action, payload = {}) {
+    let response
+    try {
+      response = await fetchImpl(assets.url, {
+        method: 'POST', headers: { 'content-type': 'application/json', [assets.clientHeader]: assets.clientValue },
+        body: JSON.stringify({ ...payload, action, projectId: assets.projectId }), signal: AbortSignal.timeout(assets.timeoutMs),
+      })
+    } catch (cause) {
+      throw Object.assign(new Error('Le service ZenRay Assets (port 3100) ne répond pas.'), { code: 'assets-unavailable', cause })
+    }
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || result.error) throw Object.assign(new Error(result.error || `Assets ${response.status}`), { code: 'assets-failed' })
+    return result
+  }
+
+  /** The Assets file ids of one motion (optionally one version), local and cloud-only alike. */
+  async function motionFiles(motionId, version = null) {
+    const prefix = `motions/${motionId}/${version ? `${version}/` : ''}`
+    const { project } = await request('status')
+    return (project?.files || []).filter((f) => f.sourceId === assets.sourceId && String(f.relativePath || '').startsWith(prefix))
+  }
+
+  async function load(motionId, version) {
+    const files = await motionFiles(motionId, version)
+    if (!files.length) throw Object.assign(new Error(`Aucun fichier de ${motionId} connu d'Assets`), { code: 'refused' })
+    return { files: files.length, job: await request('restore', { fileIds: files.map((f) => f.id) }) }
+  }
+
+  async function unload(motionId, version) {
+    const files = await motionFiles(motionId, version)
+    if (!files.length) throw Object.assign(new Error(`Aucun fichier de ${motionId} connu d'Assets`), { code: 'refused' })
+    const plan = await request('unload-plan', { fileIds: files.map((f) => f.id) })
+    if (plan.plan?.blockers?.length) throw Object.assign(new Error(`UNLOAD bloqué : ${plan.plan.blockers.map((b) => b.reason).join('; ')}`), { code: 'refused' })
+    return { files: files.length, job: await request('unload', { fileIds: files.map((f) => f.id) }) }
+  }
+
+  return { request, motionFiles, load, unload }
+}

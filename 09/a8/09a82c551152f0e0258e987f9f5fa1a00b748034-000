@@ -1,0 +1,203 @@
+# 12 October 2026, 03:20 CEST: frame-accurate shot segmentation of a reference video.
+# Several independent signals are measured on every source frame (luma difference, colour-histogram distance,
+# edge change) and a cut is kept only where they agree on a local peak; flashes (A, white, A) and dissolves
+# (A fading into B over several frames) are typed apart from hard cuts. Thresholds live in settings.json.
+from __future__ import annotations
+
+import numpy as np
+
+from .. import settings
+from ..media import iter_frames, probe
+
+
+def _histogram(frame_rgb: np.ndarray, bins: int = 8) -> np.ndarray:
+    q = (frame_rgb.astype(np.int32) * bins) // 256
+    index = q[..., 0] * bins * bins + q[..., 1] * bins + q[..., 2]
+    hist = np.bincount(index.ravel(), minlength=bins ** 3).astype(np.float64)
+    return hist / max(hist.sum(), 1.0)
+
+
+def _edges(gray: np.ndarray) -> np.ndarray:
+    g = gray.astype(np.float32)
+    gx = np.abs(np.diff(g, axis=1, prepend=g[:, :1]))
+    gy = np.abs(np.diff(g, axis=0, prepend=g[:1, :]))
+    return (gx + gy) > 24.0
+
+
+def signals(video: str, width: int, height: int) -> dict:
+    """Per-frame difference signals at the source frame rate (index i compares frame i-1 and i)."""
+    lumas, mad, chi, ecr, mean_luma = [], [], [], [], []
+    prev_rgb = prev_hist = prev_edges = None
+    for rgb in iter_frames(video, width, height):
+        gray = (0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]).astype(np.float32)
+        hist = _histogram(rgb)
+        edges = _edges(gray)
+        mean_luma.append(float(gray.mean() / 255.0))
+        if prev_rgb is None:
+            mad.append(0.0); chi.append(0.0); ecr.append(0.0)
+        else:
+            mad.append(float(np.abs(gray - prev_gray).mean() / 255.0))
+            denom = hist + prev_hist
+            mask = denom > 0
+            chi.append(float(0.5 * np.sum((hist[mask] - prev_hist[mask]) ** 2 / denom[mask])))
+            entering = np.logical_and(edges, ~prev_edges).sum() / max(edges.sum(), 1)
+            exiting = np.logical_and(prev_edges, ~edges).sum() / max(prev_edges.sum(), 1)
+            ecr.append(float(max(entering, exiting)))
+        lumas.append(gray)
+        prev_rgb, prev_gray, prev_hist, prev_edges = rgb, gray, hist, edges
+    return {"mad": np.array(mad), "chi": np.array(chi), "ecr": np.array(ecr), "luma": np.array(mean_luma),
+            "frames_gray": lumas}
+
+
+def _spread(before: np.ndarray, after: np.ndarray, cfg: dict) -> float:
+    """Share of the picture that changes: a cut rewrites most blocks, an element popping in rewrites a few."""
+    gx, gy = cfg["spread_grid"]
+    h, w = before.shape
+    bh, bw = h // gy, w // gx
+    active = changed = 0
+    for by in range(gy):
+        for bx in range(gx):
+            a = before[by * bh:(by + 1) * bh, bx * bw:(bx + 1) * bw]
+            b = after[by * bh:(by + 1) * bh, bx * bw:(bx + 1) * bw]
+            if max(a.mean(), b.mean()) < cfg["spread_dark"] and max(a.std(), b.std()) < cfg["spread_flat"]:
+                continue
+            active += 1
+            if np.abs(a - b).mean() >= cfg["spread_change"]:
+                changed += 1
+    return changed / active if active else 0.0
+
+
+def _unexplained(prev: np.ndarray, cur: np.ndarray, cfg: dict) -> float:
+    """Content-weighted share of `cur` that no small shift of `prev` explains (block matching, +-R px).
+    A cut leaves most of the picture unexplained; a camera move, a light sweep or a pop-in leaves little."""
+    gx, gy = cfg["spread_grid"]
+    radius = cfg["match_radius"]
+    h, w = cur.shape
+    bh, bw = h // gy, w // gx
+    padded = np.pad(prev.astype(np.float32), radius, mode="edge")
+    total = unexplained = 0.0
+    for by in range(gy):
+        for bx in range(gx):
+            y0, x0 = by * bh, bx * bw
+            block = cur[y0:y0 + bh, x0:x0 + bw].astype(np.float32)
+            ref = prev[y0:y0 + bh, x0:x0 + bw].astype(np.float32)
+            weight = max(block.mean(), ref.mean()) + 0.5 * max(block.std(), ref.std())
+            if weight < cfg["spread_dark"]:
+                continue
+            best = min(np.abs(padded[y0 + radius + dy:y0 + radius + dy + bh, x0 + radius + dx:x0 + radius + dx + bw] - block).mean()
+                       for dy in range(-radius, radius + 1) for dx in range(-radius, radius + 1))
+            total += weight
+            if best >= cfg["spread_change"]:
+                unexplained += weight
+    return unexplained / total if total else 0.0
+
+
+def _local_peak(values: np.ndarray, i: int, radius: int) -> bool:
+    lo, hi = max(0, i - radius), min(len(values), i + radius + 1)
+    return values[i] >= values[lo:hi].max() - 1e-12
+
+
+def effective_fps(mad: np.ndarray, chi: np.ndarray, fps: float, eps: float = 2e-4) -> dict:
+    """Content cadence: a 60 fps file made of doubled 30 fps frames shows every other difference at zero."""
+    changes = (mad > eps) | (chi > eps)
+    moving = changes[1:]
+    if moving.size == 0:
+        return {"fps": fps, "duplicate_ratio": 0.0}
+    # Look only where something moves at all, so long still holds do not count as duplicates.
+    window = np.convolve(moving.astype(float), np.ones(8), mode="same") > 0
+    active = moving[window]
+    duplicate_ratio = float(1.0 - active.mean()) if active.size else 0.0
+    factor = 1
+    for candidate in (2, 3, 4):
+        if abs(duplicate_ratio - (1 - 1 / candidate)) < 0.12:
+            factor = candidate
+    return {"fps": fps / factor, "factor": factor, "duplicate_ratio": round(duplicate_ratio, 3)}
+
+
+def detect(video: str, cfg: dict | None = None) -> dict:
+    """Shots with frame-exact boundaries, cut type and evidence."""
+    cfg = cfg or settings.get("analysis.shots")
+    info = probe(video)
+    fps = info["fps"]
+    width, height = cfg["width"], cfg["height"]
+    sig = signals(video, width, height)
+    mad, chi, ecr = sig["mad"], sig["chi"], sig["ecr"]
+    n = len(mad)
+    cadence = effective_fps(mad, chi, fps)
+    frames = sig["frames_gray"]
+    # Baseline from frames that actually change (duplicated frames would pull the median to zero).
+    window = int(cfg["baseline_window_s"] * fps) | 1
+    half = window // 2
+    changing = (mad > 2e-4) | (chi > 2e-4)
+
+    def ratio(values):
+        out = np.zeros(n)
+        for i in range(n):
+            lo, hi = max(0, i - half), min(n, i + half + 1)
+            local = np.concatenate([values[lo:i][changing[lo:i]], values[i + 1:hi][changing[i + 1:hi]]])
+            base = np.median(local) if local.size else 0.0
+            out[i] = values[i] / max(base, cfg["baseline_floor"])
+        return out
+
+    r_mad, r_chi = ratio(mad), ratio(chi)
+    score = (np.minimum(r_mad, cfg["ratio_cap"]) + np.minimum(r_chi, cfg["ratio_cap"])) / 2.0
+    radius = max(1, int(cfg["peak_radius_s"] * fps))
+    persist = max(2, int(cfg["persist_s"] * fps))
+    cuts = []
+    for i in range(1, n):
+        absolute = mad[i] >= cfg["mad_min"] or chi[i] >= cfg["chi_min"]
+        if not absolute or score[i] < cfg["score_min"] or not _local_peak(score, i, radius):
+            continue
+        # Persistence: the frames after the change stay unlike the frames before it (rejects one-frame glitches).
+        before = np.mean(frames[max(0, i - persist):i], axis=0)
+        after = np.mean(frames[i:min(n, i + persist)], axis=0)
+        jump = float(np.abs(after - before).mean() / 255.0)
+        spread = _unexplained(frames[i - 1], frames[i], cfg)
+        kind = "hard"
+        if i + 1 < n and np.abs(frames[i + 1] - frames[i - 1]).mean() / 255.0 < cfg["flash_return_max"] \
+                and sig["luma"][i] > sig["luma"][i - 1] + cfg["flash_luma_jump"]:
+            kind = "flash"
+        elif jump < cfg["persist_min"] or spread < cfg["spread_min"] or ecr[i] < cfg["ecr_min"]:
+            continue
+        cuts.append({"frame": i, "t": i / fps, "kind": kind, "score": round(float(score[i]), 3), "jump": round(jump, 4),
+                     "spread": round(spread, 3),
+                     "mad": round(float(mad[i]), 4), "chi": round(float(chi[i]), 4), "ecr": round(float(ecr[i]), 3)})
+    # Dissolves: a run of moderate differences whose endpoints differ like a cut, with no hard cut inside.
+    span = max(2, int(cfg["dissolve_max_s"] * fps))
+    hard_frames = {c["frame"] for c in cuts if c["kind"] == "hard"}
+    i = 1
+    while i < n - span:
+        run = mad[i:i + span][changing[i:i + span]]
+        if run.size >= span // cadence.get("factor", 1) - 1 and run.min() >= cfg["dissolve_frame_min"] \
+                and not any(f in hard_frames for f in range(i, i + span)):
+            a, b = frames[i - 1], frames[i + span - 1]
+            if np.abs(a - b).mean() / 255.0 >= cfg["dissolve_total_min"]:
+                mid = i + span // 2
+                cuts.append({"frame": mid, "t": mid / fps, "kind": "dissolve", "start_frame": i - 1,
+                             "end_frame": i + span - 1, "score": round(float(run.mean() / cfg["dissolve_frame_min"]), 3)})
+                i += span
+                continue
+        i += 1
+    cuts.sort(key=lambda c: c["frame"])
+    merged = []
+    min_gap = max(1, int(cfg["min_shot_s"] * fps))
+    for cut in cuts:
+        if merged and cut["frame"] - merged[-1]["frame"] < min_gap:
+            if cut["score"] > merged[-1]["score"]:
+                merged[-1] = cut
+            continue
+        merged.append(cut)
+    bounds = [0] + [c["frame"] for c in merged if c["kind"] != "flash"] + [n]
+    shots = []
+    for k in range(len(bounds) - 1):
+        a, b = bounds[k], bounds[k + 1]
+        if b <= a:
+            continue
+        entry = next((c for c in merged if c["frame"] == a), None)
+        shots.append({"id": f"S{len(shots) + 1:02d}", "start_frame": a, "end_frame": b, "start": a / fps, "end": b / fps,
+                      "duration": (b - a) / fps, "enter": entry["kind"] if entry else "start",
+                      "enter_score": entry["score"] if entry else None})
+    return {"fps": fps, "cadence": cadence, "frames": n, "duration": n / fps, "width": info.get("width"),
+            "height": info.get("height"), "cuts": merged, "shots": shots,
+            "curves": {"mad": [round(float(v), 5) for v in mad], "chi": [round(float(v), 5) for v in chi],
+                       "luma": [round(float(v), 4) for v in sig["luma"]]}}

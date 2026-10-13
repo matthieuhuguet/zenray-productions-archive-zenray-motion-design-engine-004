@@ -1,0 +1,143 @@
+# 12 October 2026: event segmentation on the separated stems (R03 section 4.2).
+# Two detectors, because a whoosh has no attack: (1) transients by spectral flux (SuperFlux settings) on the drum and
+# 'other' stems, (2) swells by excess energy over a running median on 'other'. Onsets that fall on the measured
+# sixteenth grid are musical and removed, unless their high band clearly exceeds what the music plays at grid steps
+# nearby (an SFX placed on the beat). The detection only gives a window; the fit sets the exact instant.
+# FR : deux detecteurs (attaques et houles) sur les pistes separees, puis filtrage de la grille musicale.
+from __future__ import annotations
+
+import librosa
+import numpy as np
+import scipy.ndimage as ndi
+from scipy import signal
+
+from . import config
+
+
+def _hop(sr, cfg):
+    return int(cfg["segment"]["hopMs"] * sr / 1000)
+
+
+def transients(y: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
+    s = cfg["segment"]
+    f = s["flux"]
+    hop = _hop(sr, cfg)
+    env = librosa.onset.onset_strength(y=y.astype(np.float32), sr=sr, hop_length=hop, lag=f["lag"], max_size=f["maxSize"])
+    on = librosa.onset.onset_detect(onset_envelope=env, sr=sr, hop_length=hop, units="time", delta=f["delta"],
+                                    wait=max(1, int(f["waitMs"] / s["hopMs"])))
+    return np.asarray(on)
+
+
+def swells(y: np.ndarray, sr: int, cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Swell onsets (15 percent crossing before each peak) and their peak times, R03 lab detector."""
+    s = cfg["segment"]
+    w = s["swell"]
+    hop = _hop(sr, cfg)
+    S = np.abs(librosa.stft(y.astype(np.float32), n_fft=s["nFft"], hop_length=hop))
+    f = librosa.fft_frequencies(sr=sr, n_fft=s["nFft"])
+    band = (f >= w["bandHz"][0]) & (f <= w["bandHz"][1])
+    Sb = S[band]
+    med = ndi.median_filter(Sb, size=(1, max(3, int(w["medianSeconds"] * sr / hop))))
+    excess = np.maximum(Sb - w["excessFactor"] * med, 0.0)
+    sustained = ndi.median_filter(excess, size=(1, w["verticalFrames"]))
+    k = np.hanning(w["smoothFrames"])
+    e = np.convolve((sustained ** 2).sum(axis=0), k / k.sum(), mode="same")
+    edb = 10 * np.log10(e + 1e-12)
+    ms = lambda v: max(1, int(v / s["hopMs"]))
+    peaks = librosa.util.peak_pick(edb, pre_max=ms(w["pickPreMs"]), post_max=ms(w["pickPreMs"]), pre_avg=ms(w["pickAvgMs"]),
+                                   post_avg=ms(w["pickAvgMs"]), delta=w["deltaDb"], wait=ms(w["waitMs"]))
+    onsets = []
+    for p in peaks:
+        j = p
+        while j > 0 and e[j] > w["onsetFraction"] * e[p]:
+            j -= 1
+        onsets.append(j * hop / sr)
+    return np.asarray(onsets), np.asarray(peaks) * hop / sr
+
+
+def grid_steps(music: dict, duration: float, subdivision: int) -> np.ndarray:
+    P = music["period"] / subdivision
+    start = music["t0"] - np.floor(music["t0"] / P) * P
+    return np.arange(start, duration, P)
+
+
+def _band_level(y: np.ndarray, sr: int, t: float, seconds: float) -> float:
+    a = max(0, int(t * sr))
+    seg = y[a:a + max(1, int(seconds * sr))]
+    return float(10 * np.log10(np.mean(seg ** 2) + 1e-12))
+
+
+def detect(stems: dict, sr: int, music: dict, cfg: dict | None = None) -> dict:
+    """stems: drums, bass, other (mono, sr). Returns the event list (times only, plus why each one was kept)."""
+    cfg = cfg or config.cfg()
+    s = cfg["segment"]
+    g = s["grid"]
+    duration = len(stems["drums"]) / sr
+    bed = sum(stems[k] for k in s["transientStems"])
+    steps = grid_steps(music, duration, g["subdivision"])
+    guard = g["guardMs"] / 1000.0
+    cand = []
+    for stem in s["transientStems"]:
+        for t in transients(stems[stem], sr, cfg):
+            cand.append({"t": float(t), "detector": "transient", "stem": stem})
+    on_s, pk_s = swells(sum(stems[k] for k in s["swellStems"]), sr, cfg)
+    for t, pk in zip(on_s, pk_s):
+        cand.append({"t": float(t), "peak": float(pk), "detector": "swell", "stem": "+".join(s["swellStems"])})
+    kept, dropped = [], 0
+    bar = music["period"] * g["beatsPerBar"]
+    for c in sorted(cand, key=lambda c: c["t"]):
+        d = np.abs(steps - c["t"])
+        i = int(np.argmin(d))
+        c["gridOffsetMs"] = round(float((c["t"] - steps[i]) * 1000.0), 1)
+        c["onGrid"] = bool(d[i] <= guard)
+        # Repetition test (12 October 2026): music repeats bar after bar, an SFX does not. The candidate's window is
+        # compared with the same window shifted by whole bars; a small excess means a musical event, dropped.
+        # FR : la musique se repete de mesure en mesure, un SFX non ; faible exces = evenement musical, retire.
+        y = stems[c["stem"].split("+")[0]] if c["detector"] == "transient" else sum(stems[k] for k in s["swellStems"])
+        # A short window for transients, so a loud musical tail does not mask a 10 ms click (12 October 2026).
+        length = g["repeatWindowTransientS"] if c["detector"] == "transient" else max(c.get("peak", c["t"]) - c["t"] + g["repeatWindowS"], g["repeatWindowS"])
+        own = _band_level(y, sr, c["t"], length)
+        shifts = [k for k in g["repeatBars"] if 0 <= c["t"] + k * bar <= duration - max(length, s["windowMaxSeconds"])]
+        others = [_band_level(y, sr, c["t"] + k * bar, length) for k in shifts]
+        # Against the closest repetition (max over shifts): one similar bar nearby is enough to call it music.
+        c["repeatExcessDb"] = round(own - float(np.max(others)), 2) if others else 99.0
+        # The quietest repetition is kept as the event's background: the music alone at the same bar position,
+        # used only to measure (recipe + background against the reference window). FR : fond musical, mesure seule.
+        c["backgroundShiftS"] = round(float(shifts[int(np.argmin(others))] * bar), 5) if others else None
+        if c["repeatExcessDb"] < g["keepIfExcessDb"]:
+            dropped += 1
+            continue
+        if _band_level(bed, sr, c["t"], 0.05) < s["minEventDb"]:
+            dropped += 1
+            continue
+        kept.append(c)
+    merged = []
+    for c in kept:
+        if merged and c["t"] - merged[-1]["t"] <= s["mergeMs"] / 1000.0:
+            prev = merged[-1]
+            prev.setdefault("also", []).append(c["detector"] + ":" + c["stem"])
+            if c["detector"] == "transient" and prev["detector"] == "swell":
+                c["also"] = prev.get("also", []) + ["swell"]
+                merged[-1] = c
+            continue
+        merged.append(c)
+    # Windows: from preRoll before the detection to the -endDb point of the bed, capped and stopped at the next event.
+    pre = cfg["audio"]["preRollSeconds"]
+    env_hop = int(0.005 * sr)
+    env = np.sqrt(np.convolve(bed ** 2, np.ones(env_hop) / env_hop, mode="same")[::env_hop] + 1e-12)
+    events = []
+    for k, c in enumerate(merged[: s["maxEvents"]]):
+        # Only the next event on the same stem ends a window: two stems can carry overlapping events.
+        nxt = next((o["t"] for o in merged[k + 1:] if o["stem"] == c["stem"]), duration)
+        a = int(c["t"] / 0.005)
+        cap = s["transientMaxSeconds"] if c["detector"] == "transient" else s["windowMaxSeconds"]
+        b = min(int(min(nxt, c["t"] + cap) / 0.005), len(env) - 1)
+        peak_i = a + int(np.argmax(env[a:max(b, a + 1)]))
+        floor = env[peak_i] * 10 ** (-s["endDb"] / 20.0)
+        j = peak_i
+        while j < b and env[j] > floor:
+            j += 1
+        end = min(j * 0.005 + s["windowTailSeconds"], c["t"] + cap, nxt, duration)
+        events.append({"id": f"E{k + 1:03d}", "t": round(c["t"], 4), "windowStart": round(max(0.0, c["t"] - pre), 4),
+                       "windowEnd": round(end, 4), **{kk: v for kk, v in c.items() if kk != "t"}})
+    return {"events": events, "candidates": len(cand), "droppedOnGrid": dropped, "gridSteps": len(steps)}

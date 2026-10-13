@@ -1,0 +1,172 @@
+# 12 October 2026, 10:30 CEST: assemble motions and local clips into ONE HyperFrames composition per format
+# (16:9, 9:16, 1:1). Contract (R01 sections 7, 8 and 15): every clip is a <video> inside an envelope section
+# (transform the envelope, never the video), times are integer frames in the plan and frame/fps in the HTML,
+# media files are copied into the project (zero network), a silent clip is `muted`, a clip with sound declares
+# data-has-audio. Formats are reframed by fit (contain or cover): the composition is the same timeline, one
+# instance per canvas. Every tunable value lives in params/montage.json (HDA law).
+# FR : assembler des motions et des clips locaux en une composition HyperFrames par format. Chaque clip est une
+# <video> dans une enveloppe, les temps sont des images entieres, les fichiers sont copies dans le projet.
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+from .. import settings, versions
+
+FAMILY = settings.REPO / "params" / "montage.json"
+
+
+def family() -> dict:
+    return json.loads(FAMILY.read_text(encoding="utf-8"))
+
+
+def root() -> Path:
+    """Where montages are written: params/montage.json 'root', or ZRMD_PATH_MONTAGES for an isolated test."""
+    return Path(os.environ.get("ZRMD_PATH_MONTAGES") or family()["root"])
+
+
+def probe(path: str | Path) -> dict:
+    """Duration (s), size and whether the file carries sound, read by ffprobe."""
+    raw = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height:format=duration",
+                          "-of", "json", str(path)], capture_output=True, text=True, check=True).stdout
+    info = json.loads(raw)
+    streams = info.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    return {"duration": float(info.get("format", {}).get("duration") or 0), "width": video.get("width"),
+            "height": video.get("height"), "audio": any(s.get("codec_type") == "audio" for s in streams)}
+
+
+def resolve_clip(clip: dict, motions_dir: Path, fam: dict) -> Path:
+    """A clip is {'kind': 'motion', 'motion': id, 'version': 'V_008'} or {'kind': 'file', 'path': absolute}."""
+    kind = clip.get("kind")
+    if kind == "motion":
+        motion = str(clip.get("motion", ""))
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", motion):
+            raise ValueError(f"invalid motion id {motion!r}")
+        folder = motions_dir / motion
+        version = clip.get("version") or versions.latest_version(folder)
+        if not version or not versions.VERSION_RE.match(version):
+            raise ValueError(f"motion {motion} has no version {version!r}")
+        path = folder / version / "render.mp4"
+    elif kind == "file":
+        path = Path(str(clip.get("path", "")))
+        if not path.is_absolute():
+            raise ValueError("a file clip needs an absolute path")
+        if path.suffix.lower() not in fam["clip_extensions"]:
+            raise ValueError(f"clip extension {path.suffix} refused")
+    else:
+        raise ValueError(f"unknown clip kind {kind!r}")
+    if not path.is_file():
+        raise FileNotFoundError(f"clip file missing: {path}")
+    return path
+
+
+def plan(spec: dict, motions_dir: Path, *, probe_fn=probe) -> dict:
+    """Validate the spec and return the frame-exact plan shared by every format."""
+    fam = family()
+    mid = str(spec.get("id", ""))
+    if not re.match(fam["id_pattern"], mid):
+        raise ValueError(f"montage id {mid!r} must match {fam['id_pattern']}")
+    clips = spec.get("clips") or []
+    if not clips or len(clips) > fam["max_clips"]:
+        raise ValueError(f"a montage needs 1 to {fam['max_clips']} clips")
+    fps = int(spec.get("fps") or fam["fps"])
+    fit_default = spec.get("fit") or fam["fit"]
+    items, cursor = [], 0
+    for n, clip in enumerate(clips):
+        src = resolve_clip(clip, motions_dir, fam)
+        info = probe_fn(src)
+        start_s = max(0.0, float(clip.get("in") or 0))
+        end_s = min(info["duration"], float(clip["out"])) if clip.get("out") is not None else info["duration"]
+        frames = int(round((end_s - start_s) * fps))
+        if frames <= 0:
+            raise ValueError(f"clip {n + 1} is empty after trimming ({start_s} to {end_s} s)")
+        fit = clip.get("fit") or fit_default
+        if fit not in fam["fits"]:
+            raise ValueError(f"fit {fit!r} not in {fam['fits']}")
+        items.append({"id": f"c{n + 1:02d}", "src": str(src), "start_frame": cursor, "frames": frames,
+                      "media_start_frame": int(round(start_s * fps)), "fit": fit, "audio": bool(info["audio"]) and not clip.get("mute"),
+                      "volume": float(clip.get("volume", 1))})
+        cursor += frames
+    if cursor / fps > fam["max_seconds"]:
+        raise ValueError(f"montage lasts {cursor / fps:.1f} s, above {fam['max_seconds']} s")
+    formats = spec.get("formats") or ["16x9"]
+    for f in formats:
+        if f not in fam["formats"]:
+            raise ValueError(f"unknown format {f!r}, expected one of {list(fam['formats'])}")
+    return {"id": mid, "fps": fps, "frames": cursor, "formats": formats, "background": spec.get("background") or fam["background"],
+            "clips": items}
+
+
+def _t(frame: int, fps: int) -> str:
+    return f"{frame / fps:.6f}"
+
+
+def cook(montage_plan: dict, out_dir: str | Path, fmt: str) -> Path:
+    """Write <out_dir>/<fmt>/ as a HyperFrames project from the plan (one instance per format)."""
+    fam = family()
+    size = fam["formats"][fmt]
+    w, h, fps, frames = size["width"], size["height"], montage_plan["fps"], montage_plan["frames"]
+    project = Path(out_dir) / fmt
+    if project.exists():
+        shutil.rmtree(project)
+    (project / "assets" / "clips").mkdir(parents=True)
+    (project / "vendor").mkdir()
+    shutil.copy(settings.REPO / "vendor" / "gsap.min.js", project / "vendor" / "gsap.min.js")
+    copied: dict[str, str] = {}
+    sections, css = [], ["html, body { margin: 0; padding: 0; background: #000; }",
+                         f"#root {{ position: relative; width: {w}px; height: {h}px; overflow: hidden; isolation: isolate;"
+                         f" background: {montage_plan['background']}; }}",
+                         ".env { position: absolute; inset: 0; }",
+                         ".env video { width: 100%; height: 100%; display: block; }"]
+    for c in montage_plan["clips"]:
+        src = Path(c["src"])
+        if c["src"] not in copied:
+            name = f"clip-{len(copied) + 1:02d}{src.suffix.lower()}"
+            shutil.copy(src, project / "assets" / "clips" / name)
+            copied[c["src"]] = f"assets/clips/{name}"
+        rel = copied[c["src"]]
+        timing = f'data-start="{_t(c["start_frame"], fps)}" data-duration="{_t(c["frames"], fps)}"'
+        sound = f' data-has-audio="true" data-volume="{c["volume"]}"' if c["audio"] else " muted"
+        sections.append(f'<section id="{c["id"]}" class="clip env" {timing} data-track-index="1">'
+                        f'<video id="{c["id"]}v" class="clip" src="{html.escape(rel)}" {timing}'
+                        f' data-media-start="{_t(c["media_start_frame"], fps)}" data-track-index="2"{sound} playsinline></video></section>')
+        css.append(f"#{c['id']}v {{ object-fit: {c['fit']}; }}")
+    (project / "styles.css").write_text("\n".join(css) + "\n", encoding="utf-8")
+    (project / "hyperframes.json").write_text(json.dumps({"$schema": "https://hyperframes.heygen.com/schema/hyperframes.json",
+                                                         "paths": {"assets": "assets"}}, indent=2) + "\n", encoding="utf-8")
+    body = "\n    ".join(sections)
+    page = f"""<!doctype html>
+<!-- Cooked by zrmd.emit.montage from the montage plan (12 October 2026); never edit by hand. -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width={w}, height={h}" />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="vendor/gsap.min.js"></script>
+</head>
+<body>
+  <div id="root" data-composition-id="main" data-start="0" data-duration="{_t(frames, fps)}" data-width="{w}" data-height="{h}" data-fps="{fps}">
+    {body}
+  </div>
+  <script>
+  // A composition never bound to a timeline costs 45 s per render (R01 pitfall 12): one paused timeline of the full length.
+  (function () {{
+    const tl = gsap.timeline({{ paused: true }});
+    tl.to({{}}, {{ duration: {_t(frames, fps)} }}, 0);
+    window.__timelines = window.__timelines || {{}};
+    window.__timelines["main"] = tl;
+  }})();
+  </script>
+</body>
+</html>
+"""
+    (project / "index.html").write_text(page, encoding="utf-8")
+    (project / "montage-plan.json").write_text(json.dumps({**montage_plan, "format": fmt, "width": w, "height": h}, indent=1) + "\n",
+                                               encoding="utf-8")
+    return project

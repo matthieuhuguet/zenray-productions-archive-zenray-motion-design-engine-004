@@ -1,0 +1,81 @@
+# 12 October 2026: task M3, drum class retagging by measured pitch (better transcription, no generative model).
+# The critic of V_031 finds the drum stem's error concentrated in the intro (0 to 5.75 s) and in the fill of 16.7 to
+# 22.1 s, where the per-event deviation tables saturate at +-24 dB: the hits there were transcribed as kicks, but the
+# reference drum stem shows a steady low peak near 85 to 105 Hz (a tom), where every real kick of this track glides
+# down to 43 to 60 Hz within 0.1 s. A kick model (sine sweeping 250 to 43 Hz) cannot draw a steady 100 Hz body.
+# This module measures, for every hit of the source class, the strongest bin of the reference drum stem in bandHz on a
+# few short Hann frames after the onset (parabolic interpolation), and moves the hit to the target class when the
+# median pitch is at least minHz. The moved hits carry "retag": {from, pitchHz} and lose their deviation table (it was
+# fitted to the wrong model). The timbre of the target class is then measured by the sms stage (tom is a tone role).
+# Settings: datasets/resynth-params.json, key "retag" (HDA interface).
+# FR : reclasse les frappes de batterie par leur hauteur mesuree (grosse caisse vers tom), traitement du signal seul.
+from __future__ import annotations
+
+import numpy as np
+
+
+def hit_pitch(x: np.ndarray, sr: int, t: float, R: dict) -> float:
+    """Median of the strongest-bin frequency in bandHz over the frames centred at t + offsetsS. FR : hauteur mesuree."""
+    nf = int(R["nFft"])
+    f = np.fft.rfftfreq(nf, 1.0 / sr)
+    lo, hi = np.searchsorted(f, R["bandHz"][0]), np.searchsorted(f, R["bandHz"][1])
+    win = np.hanning(nf)
+    df = f[1] - f[0]
+    out = []
+    for dt in R["offsetsS"]:
+        i = int(round((t + dt) * sr)) - nf // 2
+        seg = x[max(0, i): i + nf]
+        if len(seg) < nf:
+            seg = np.pad(seg, (0, nf - len(seg)))
+        S = np.abs(np.fft.rfft(seg * win))[lo:hi]
+        k = int(np.argmax(S))
+        p = 0.0
+        if 0 < k < len(S) - 1:
+            a, b, c = np.log(S[k - 1:k + 2] + 1e-12)
+            den = a - 2 * b + c
+            p = 0.5 * (a - c) / den if abs(den) > 1e-12 else 0.0
+        out.append(f[lo + k] + p * df)
+    return float(np.median(out))
+
+
+def retag(score: dict, x: np.ndarray, sr: int, R: dict) -> tuple[dict, list]:
+    """Return a new score with the source-class hits whose measured pitch is >= minHz moved to the target class.
+    x: reference drum stem (mono). FR : nouvelle partition, et la liste des frappes reclassees."""
+    s2 = dict(score)
+    drums = [dict(h) for h in score["drums"]]
+    moved = []
+    for h in drums:
+        if h["class"] != R["fromClass"]:
+            continue
+        p = hit_pitch(x, sr, h["t"], R)
+        if p >= R["minHz"]:
+            h["retag"] = {"from": h["class"], "pitchHz": round(p, 2)}
+            h["class"] = R["toClass"]
+            if R.get("dropDev", True):
+                h.pop("dev", None)
+            moved.append({"t": h["t"], "pitchHz": round(p, 2)})
+    s2["drums"] = drums
+    s2["retagBy"] = "zrmd.audio.retag (12 October 2026)"
+    return s2, moved
+
+
+def selftest(sr: int, R: dict) -> dict:
+    """Known case, proven both ways: a sweep 250 to 45 Hz (kick) and a steady 100 Hz decaying sine (tom), each in its
+    own hit. Green: the kick stays, the tom moves. Red: the same detector with minHz above both pitches moves nothing,
+    and with minHz below both moves both. FR : cas connu, prouve dans les deux sens."""
+    n = int(2.0 * sr)
+    x = np.zeros(n)
+    t = np.arange(int(0.4 * sr)) / sr
+    fk = 45.0 + 205.0 * np.exp(-t / 0.025)
+    kick = np.sin(2 * np.pi * np.cumsum(fk) / sr) * np.exp(-t / 0.15)
+    tom = np.sin(2 * np.pi * 100.0 * t) * np.exp(-t / 0.2)
+    x[int(0.2 * sr):int(0.2 * sr) + len(t)] += kick
+    x[int(1.2 * sr):int(1.2 * sr) + len(t)] += tom
+    sc = {"drums": [{"t": 0.2, "class": "kick", "levelDb": 0.0}, {"t": 1.2, "class": "kick", "levelDb": 0.0}]}
+    _, green = retag(sc, x, sr, R)
+    _, red_hi = retag(sc, x, sr, {**R, "minHz": 200.0})
+    _, red_lo = retag(sc, x, sr, {**R, "minHz": 30.0})
+    ok_green = [m["t"] for m in green] == [1.2]
+    # Both wrong thresholds must fail the green criterion (the check can turn red). FR : le controle sait virer au rouge.
+    ok_red = [m["t"] for m in red_hi] != [1.2] and [m["t"] for m in red_lo] != [1.2]
+    return {"green": green, "redHigh": red_hi, "redLow": red_lo, "greenOk": ok_green, "redOk": ok_red, "pass": bool(ok_green and ok_red)}

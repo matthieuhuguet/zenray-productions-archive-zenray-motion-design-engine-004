@@ -1,0 +1,106 @@
+# 13 October 2026: registry of the reference videos. The DEFINITION lives in datasets/references.json (urls, titles, focus,
+# order of work, one entry per video of Matthieu's first prompt of 12 October 2026 plus later additions); the STATE of each
+# video (file downloaded, bible, stems, music versions and scores, SFX versions, motions) is computed from the disk on
+# demand, never stored, so it cannot go stale. Every orchestrator step takes a slug from this registry.
+# FR : registre des videos de reference ; la definition est un fichier de donnees, l'etat est calcule depuis le disque.
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from . import settings
+
+DEF_PATH = Path(__file__).resolve().parent.parent / "datasets" / "references.json"
+STEM_KEYS = ("drums", "bass", "other", "vocals", "mix")
+
+
+def load() -> dict:
+    return json.loads(DEF_PATH.read_text(encoding="utf-8"))
+
+
+def slugs() -> list[str]:
+    d = load()
+    order = d.get("order", [])
+    rest = [r["slug"] for r in d["references"] if r["slug"] not in order]
+    return [s for s in order if any(r["slug"] == s for r in d["references"])] + rest
+
+
+def get(slug: str) -> dict:
+    for r in load()["references"]:
+        if r["slug"] == slug:
+            return r
+    raise KeyError(f"unknown reference '{slug}' (known: {', '.join(slugs())})")
+
+
+def reference_file(slug: str) -> Path | None:
+    """The downloaded video of a slug in the reference cache (never archived, never published)."""
+    cache = settings.path("refcache") / slug
+    meta = settings.path("workshop") / "references" / slug / "reference.json"
+    if meta.exists():
+        name = json.loads(meta.read_text(encoding="utf-8")).get("file_name")
+        if name and (cache / name).exists():
+            return cache / name
+    if cache.exists():
+        for p in sorted(cache.glob("*.mp4")) + sorted(cache.glob("*.mkv")) + sorted(cache.glob("*.webm")) + sorted(cache.glob("reference.mp3")):
+            return p
+    return None
+
+
+def _music_state(slug: str) -> dict:
+    bench = settings.path("sound_out") / slug / "music-bench"
+    versions = sorted(p.name for p in bench.glob("V_*") if (p / "mix.wav").exists()) if bench.exists() else []
+    best = None
+    for v in versions:
+        try:
+            h = json.loads((bench / v / "scores.json").read_text())["headline"]
+            row = {k: h[k]["tfBands"] for k in STEM_KEYS if k in h and h[k].get("tfBands") is not None}
+        except Exception:  # noqa: BLE001
+            continue
+        if "mix" in row and (best is None or row["mix"] > best["scores"]["mix"]):
+            best = {"version": v, "scores": row}
+    return {"score": (bench / "score.json").exists(), "versions": len(versions), "best": best}
+
+
+def status(slug: str) -> dict:
+    """What exists on disk for a slug, right now."""
+    ws = settings.path("workshop")
+    ref = reference_file(slug)
+    cache = settings.path("refcache") / slug
+    bible = ws / "references" / slug / "bible.json"
+    shots = 0
+    if bible.exists():
+        shots = len(json.loads(bible.read_text(encoding="utf-8")).get("shots", []))
+    sound = settings.path("sound_out") / slug
+    sfx = sorted(p.name for p in sound.glob("V_*")) if sound.exists() else []
+    motions = 0
+    for m in (ws / "motions").glob("*/motion.json"):
+        try:
+            if json.loads(m.read_text()).get("source", {}).get("slug") == slug:
+                motions += 1
+        except Exception:  # noqa: BLE001
+            pass
+    return {"slug": slug, "file": str(ref) if ref else None, "bible": bible.exists(), "shots": shots,
+            "stems": (cache / "stems" / "out" / "htdemucs" / "mix" / "drums.wav").exists(),
+            "music": _music_state(slug), "sfx_versions": len(sfx), "motions": motions}
+
+
+def table() -> list[dict]:
+    d = load()
+    by = {r["slug"]: r for r in d["references"]}
+    out = []
+    for s in slugs():
+        out.append({**by[s], "status": status(s)})
+    return out
+
+
+def main() -> int:
+    for r in table():
+        st = r["status"]
+        best = st["music"]["best"]
+        mus = f"music {best['version']} mix {best['scores']['mix']:.1f}" if best else ("music score only" if st["music"]["score"] else "music -")
+        print(f"{r['slug']:<34} {'file' if st['file'] else 'NO FILE':<8} shots {st['shots']:>3}  {mus:<28} sfx {st['sfx_versions']:>2}  motions {st['motions']:>2}  {r.get('focus', '')}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

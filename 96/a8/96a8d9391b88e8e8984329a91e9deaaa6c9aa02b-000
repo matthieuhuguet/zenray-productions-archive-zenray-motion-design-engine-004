@@ -1,0 +1,43 @@
+# 12 October 2026: ITU-R BS.1770 loudness helpers (integrated by pyloudnorm, short-term curve and true peak here).
+# FR : sonie BS.1770 ; integree par pyloudnorm, courbe a court terme et crete vraie calculees ici.
+from __future__ import annotations
+
+import numpy as np
+import pyloudnorm as pyln
+from scipy import signal
+
+
+def as_2d(x: np.ndarray) -> np.ndarray:
+    return x[:, None] if x.ndim == 1 else x
+
+
+def integrated(x: np.ndarray, sr: int) -> float:
+    value = pyln.Meter(sr).integrated_loudness(as_2d(np.asarray(x, dtype=np.float64)))
+    return float(value) if np.isfinite(value) else -120.0
+
+
+def k_weight(x: np.ndarray, sr: int) -> np.ndarray:
+    """K-weighting pre-filter (shelf + high-pass) as defined in BS.1770, designed for any sample rate by pyloudnorm."""
+    meter = pyln.Meter(sr)
+    y = np.asarray(x, dtype=np.float64)
+    for f in meter._filters.values():
+        y = signal.lfilter(f.b, f.a, y, axis=0)
+    return y
+
+
+def short_term(x: np.ndarray, sr: int, window_s: float, hop_s: float) -> tuple[np.ndarray, np.ndarray]:
+    """Short-term loudness curve (LUFS) on windows of window_s every hop_s, and the window centre times."""
+    y = as_2d(k_weight(as_2d(x), sr))
+    power = (y ** 2).sum(axis=1)
+    win, hop = int(window_s * sr), int(hop_s * sr)
+    cums = np.concatenate([[0.0], np.cumsum(power)])
+    starts = np.arange(0, max(1, len(power) - win + 1), hop)
+    ms = (cums[np.minimum(starts + win, len(power))] - cums[starts]) / win
+    return -0.691 + 10 * np.log10(ms + 1e-12), (starts + win / 2) / sr
+
+
+def true_peak_db(x: np.ndarray, sr: int, oversample: int) -> float:
+    """True peak (dBTP) by polyphase oversampling, per channel."""
+    y = as_2d(np.asarray(x, dtype=np.float64))
+    up = signal.resample_poly(y, oversample, 1, axis=0)
+    return float(20 * np.log10(np.abs(up).max() + 1e-12))

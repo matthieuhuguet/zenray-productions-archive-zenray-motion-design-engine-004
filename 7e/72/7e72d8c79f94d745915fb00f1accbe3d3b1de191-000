@@ -1,0 +1,76 @@
+# 12 October 2026: two-way validation of zrmd.analyze.easefit (engine copy of the R04 laboratory fitter).
+# Green: the 324 known-answer library cases of R04 section 5.2 (18 eases x 3 amplitudes x 3 durations x 2 noises,
+#   60 fps, sub-frame start). The engine must match the laboratory: the true ease first in at least 270 cases and the
+#   re-rendered curve within 1 % of the amplitude in at least 255 (laboratory: 276 and 264 with bezier).
+# Red: a move forced onto a wrong ease leaves more than 3 % of the amplitude, and a power1.in move is never named
+#   power3.out. A smooth noiseless move is also checked (support bug fixed on 12 October 2026).
+# Run: OMP_NUM_THREADS=1 /Users/zenray/.venvs/zenray-motion/bin/python -I tests/test_easefit.py
+from __future__ import annotations
+
+import json
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from zrmd.analyze import curves, easefit as E  # noqa: E402
+
+FPS = 60.0
+TRUE_EASES = ["none", "power1.out", "power2.out", "power3.out", "power4.out", "power2.in", "power2.inOut",
+              "power3.inOut", "sine.out", "sine.inOut", "expo.out", "expo.inOut", "circ.out", "back.out(1.70158)",
+              "elastic.out(1,0.3)", "bounce.out", "css.ease", "material.standard"]
+
+
+def run_case(case):
+    lib = E.default_library()
+    rng = np.random.default_rng(case["seed"])
+    t0 = 0.2 + rng.uniform(0, 1 / FPS)
+    d, amp, noise = case["duration"], case["amplitude"], case["noise"]
+    t = np.arange(0, t0 + d + 0.35, 1 / FPS)
+    truth = lambda tt: 100 + amp * lib.evaluate(case["ease"], (tt - t0) / d)
+    y = truth(t) + rng.normal(0, noise, len(t))
+    res = E.identify(t, y, lib, with_bezier=False)
+    dense = np.linspace(t0 - 0.05, t0 + d + 0.05, 600)
+    err = E.predict(dense, res["chosen"], lib) - truth(dense)
+    return {"ease": case["ease"], "best": res["library_best"]["name"], "err_rel": float(np.abs(err).max() / amp)}
+
+
+def test_library_cases():
+    cases, seed = [], 1000
+    for ease in TRUE_EASES:
+        for amp in (40.0, 200.0, 800.0):
+            for d in (0.25, 0.5, 1.0):
+                for noise in (0.25, 1.0):
+                    seed += 1
+                    cases.append({"ease": ease, "amplitude": amp, "duration": d, "noise": noise, "seed": seed})
+    with ProcessPoolExecutor(16) as pool:
+        rows = list(pool.map(run_case, cases, chunksize=4))
+    top1 = sum(r["best"] == r["ease"] for r in rows)
+    under = sum(r["err_rel"] <= 0.01 for r in rows)
+    print(json.dumps({"cases": len(rows), "top1": top1, "under_1pct": under}))
+    assert top1 >= 270 and under >= 255, (top1, under)
+    return {"cases": len(rows), "top1": top1, "under_1pct": under}
+
+
+def test_red_and_smooth():
+    st = E.selftest()
+    assert st["recovers_power3_out"] and st["rejects_wrong"], st
+    assert st["forced_wrong_rms_rel"] > 0.03, st
+    lib = E.default_library()
+    t = np.arange(0, 2, 1 / 30)
+    v = np.where(t < 1, 50 + 200 * lib.evaluate("sine.inOut", (t - 0.1) / 0.7),
+                 250 - 100 * lib.evaluate("expo.out", (t - 1.1) / 0.6))
+    tw = curves.fit_track_exact(t, v, bounds=(0, 2))
+    names = [x["ease"] for x in tw]
+    print(json.dumps({"smooth_two_moves": names, "forced_wrong_rms_rel": st["forced_wrong_rms_rel"]}))
+    assert names == ["sine.inOut", "expo.out"], tw
+    return {"smooth_two_moves": names, "forced_wrong_rms_rel": st["forced_wrong_rms_rel"]}
+
+
+if __name__ == "__main__":
+    t = time.time()
+    out = {"red_and_smooth": test_red_and_smooth(), "library": test_library_cases(), "seconds": round(time.time() - t, 1)}
+    print(json.dumps(out))

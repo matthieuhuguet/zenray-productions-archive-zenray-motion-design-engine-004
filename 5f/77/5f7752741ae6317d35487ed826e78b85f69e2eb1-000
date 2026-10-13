@@ -1,0 +1,89 @@
+# 12 October 2026, 22:30 CEST: command line of the F2 2D asset and SVG creator (zrmd.vector.asset).
+#   trace   <image> --id ID [--box x y w h] [--private]  vectorise a crop into ASSETS/<ID>/V_NNN
+#   rebuild <asset_dir> [--set dotted=value ...] [--overrides FILE] [--source IMAGE]
+#           cook a new version from the latest params.json plus edits, no retrace (HDA loop)
+# Every version holds params.json (the editable truth), asset.svg (named <g> per layer), render.png and
+# fidelity.json. Versions are never overwritten. Defaults: settings.json, section "vector.trace".
+# Usage: ~/.venvs/zenray-motion/bin/python -I Scripts/Vectorise.py trace crop.png --id my-logo --box 10 20 300 200
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+import numpy as np  # noqa: E402
+from PIL import Image  # noqa: E402
+
+from zrmd import versions as V  # noqa: E402
+from zrmd.vector import asset as A  # noqa: E402
+
+
+def load_rgb(path: str, box=None) -> np.ndarray:
+    img = np.asarray(Image.open(path).convert("RGB"))
+    if box:
+        x, y, w, h = box
+        img = img[y:y + h, x:x + w]
+    return np.ascontiguousarray(img)
+
+
+def cmd_trace(a) -> int:
+    rgb = load_rgb(a.image, a.box)
+    src = {"kind": "reference-crop" if a.private else "image", "path": str(Path(a.image).resolve()),
+           "box": a.box, "sha256": A.sha256_file(a.image)}
+    out = A.vectorise(rgb, a.id, src)
+    fid = A.evaluate(out["params"], rgb, out["analysis"])
+    vdir = A.write_version(A.assets_root() / a.id, out["params"], rgb, fid, note="trace")
+    print(json.dumps({"version": str(vdir), "pass": fid["pass"], "min_iou": fid["min_iou"],
+                      "max_edge_mean": fid["max_edge_mean"], "colour": fid["colour"],
+                      "layers": [(l["id"], l["kind"]) for l in out["params"]["layers"]],
+                      "rejected": out["params"]["trace"]["rejected"]}, indent=1, default=str))
+    return 0 if fid["pass"] else 1
+
+
+def cmd_rebuild(a) -> int:
+    adir = Path(a.asset_dir)
+    last = V.latest_version(adir)
+    if last is None:
+        raise SystemExit(f"no version under {adir}")
+    params = json.loads((adir / last / "params.json").read_text())
+    if a.overrides:
+        params = A.apply_overrides(params, json.loads(Path(a.overrides).read_text()))
+    for item in a.set or []:
+        key, _, raw = item.partition("=")
+        try:
+            val = json.loads(raw)
+        except json.JSONDecodeError:
+            val = raw
+        params = V.set_path(params, key, val)
+    fid, rgb = None, None
+    if a.source:                                         # optional: re-measure against the source image
+        rgb = load_rgb(a.source, params.get("source", {}).get("box"))
+        fid = A.evaluate(params, rgb)
+    vdir = A.write_version(adir, params, rgb, fid, parent=last, note="rebuild " + " ".join(a.set or []))
+    print(json.dumps({"version": str(vdir), "parent": last, "pass": fid and fid["pass"]}, indent=1))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    t = sub.add_parser("trace")
+    t.add_argument("image")
+    t.add_argument("--id", required=True)
+    t.add_argument("--box", type=int, nargs=4, metavar=("X", "Y", "W", "H"))
+    t.add_argument("--private", action="store_true", help="1:1 of a reference: marked private, never published")
+    r = sub.add_parser("rebuild")
+    r.add_argument("asset_dir")
+    r.add_argument("--set", nargs="*", help="dotted=value, e.g. palette.c0=#ff0000 or layers.1.effects.blur=2")
+    r.add_argument("--overrides")
+    r.add_argument("--source")
+    a = ap.parse_args()
+    return cmd_trace(a) if a.cmd == "trace" else cmd_rebuild(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

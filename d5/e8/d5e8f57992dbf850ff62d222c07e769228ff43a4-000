@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+# 12 October 2026: task M1, transcribe a reference's music into a procedural score (score.json) and verify it both ways.
+#   TranscribeMusic.py [--slug onekey-pro-2] [--stems DIR] [--out DIR] [--set a.b=json] [--no-verify] [--json]
+# Writes <out>/score.json (a previous score.json is moved to <out>/scores/score-<stamp>.json first, never overwritten),
+# then, unless --no-verify, plays the score with sine and noise voices into the next <out>/V_NNN (private
+# transcription-check render, never published) and measures onset F-measure, chroma similarity and envelope
+# correlation against each Demucs stem, the same for a deliberately shifted score (red), and a synthetic known score
+# transcribed back (green on an exact truth). Exit 0 when green is green and red is red, 1 otherwise, 2 on usage error.
+# Parameters: datasets/transcribe-params.json (HDA interface); --set overrides one value for this run.
+# FR : transcrit la musique d'une reference en partition procedurale et la verifie dans les deux sens.
+import os
+
+for _k in ("OMP_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_k, "1")
+import argparse
+import json
+import shutil
+import sys
+import time
+import warnings
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+def parse_set(items):
+    over = {}
+    for item in items or []:
+        key, _, raw = item.partition("=")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        node = over
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    return over
+
+
+def red_check(base: dict, bad: dict, P: dict, T) -> dict:
+    """The shifted score must fail the pass thresholds, and every judged stem must lose at least one of its margins
+    (onset F by minDropF or chroma by minDropChroma). 12 October 2026: "at least one", because a dense stem keeps a
+    high chance level of onset matches (about 0.38 for "other"), while its chroma collapses. FR : le decale doit echouer."""
+    v = P["verify"]
+    drops = {}
+    ok = True
+    for k in base:
+        row = {"onsetFDrop": round(base[k]["onset"]["f"] - bad[k]["onset"]["f"], 4)}
+        judged = []
+        if k in v["pass"]["onsetF"]:
+            judged.append(row["onsetFDrop"] >= v["minDropF"])
+        if k in v["pass"]["chroma"]:
+            row["chromaDrop"] = round(base[k]["chroma"] - bad[k]["chroma"], 4)
+            judged.append(row["chromaDrop"] >= v["minDropChroma"])
+        row["lostAMargin"] = any(judged) if judged else None
+        if judged:
+            ok &= any(judged)
+        drops[k] = row
+    failed = not all(r["pass"] for r in T.passes(bad, P).values())
+    return {"drops": drops, "marginsMet": bool(ok), "failsThresholds": failed, "red": bool(ok and failed)}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Transcribe a reference's music into a procedural score")
+    ap.add_argument("--slug", default="onekey-pro-2")
+    ap.add_argument("--stems", help="folder with drums/bass/other/vocals.wav (default: the Demucs stems of the slug)")
+    ap.add_argument("--out", help="music-bench folder (default: <sound_out>/<slug>/music-bench)")
+    ap.add_argument("--set", action="append", default=[], help="override a transcribe-params.json value, a.b=json")
+    ap.add_argument("--no-verify", action="store_true")
+    ap.add_argument("--json", action="store_true", help="print the verification report as JSON")
+    args = ap.parse_args()
+    over = parse_set(args.set)
+    if over:
+        os.environ["ZRMD_TRANSCRIBE_OVERRIDES"] = json.dumps(over)
+
+    from zrmd import settings, versions
+    from zrmd.audio import transcribe as T
+
+    P = T.params()
+    stem_dir = Path(args.stems) if args.stems else settings.path("refcache") / args.slug / "stems" / "out" / "htdemucs" / "mix"
+    out = Path(args.out) if args.out else settings.path("sound_out") / args.slug / "music-bench"
+    if not all((stem_dir / f"{k}.wav").exists() for k in T.STEMS):
+        print(f"missing stems in {stem_dir}", file=sys.stderr)
+        sys.exit(2)
+    out.mkdir(parents=True, exist_ok=True)
+    t_all = time.time()
+    score = T.transcribe(stem_dir, P, slug=args.slug)
+    score["transcribedAt"] = versions.stamp() if hasattr(versions, "stamp") else time.strftime("%Y-%m-%d %H:%M:%S")
+    target = out / "score.json"
+    if target.exists():
+        keep = out / "scores"
+        keep.mkdir(exist_ok=True)
+        shutil.move(str(target), str(keep / f"score-{time.strftime('%Y%m%d-%H%M%S')}.json"))
+    target.write_text(json.dumps(score, indent=1), encoding="utf-8")
+    report = {"score": str(target), "summary": T.summary(score), "transcribeS": round(time.time() - t_all, 1)}
+    code = 0
+    if not args.no_verify:
+        import numpy as np
+        import soundfile as sf
+
+        sr = P["analysis"]["sr"]
+        stems = T.load_stems(stem_dir, sr)
+        v = P["verify"]
+        # Judged: the whole score (notes plus per-voice automation lanes); notesOnly is reported beside it.
+        base = T.evaluate(T.render_score(score, sr, P, automation=True), stems, sr, P)
+        notes_only = T.evaluate(T.render_score(score, sr, P), stems, sr, P)
+        shifts = {"timeAndPitch": T.shifted(score, v["shiftS"], v["shiftSemi"]),
+                  "timeOnly": T.shifted(score, v["shiftS"], 0), "pitchOnly": T.shifted(score, 0.0, v["shiftSemi"])}
+        bad = {k: T.evaluate(T.render_score(s, sr, P, automation=True), stems, sr, P) for k, s in shifts.items()}
+        known = T.known_case(P, sr, P["analysis"]["workers"])
+        green_real = T.passes(base, P)
+        known_ok = (known["drums"]["f"] >= v["knownDrumF"] and known["bass"]["f"] >= v["knownNoteF"]
+                    and known["other"]["f"] >= v["knownNoteF"] and max(known["redShifted"].values()) < v["knownNoteF"])
+        red = red_check(base, bad["timeAndPitch"], P, T)
+        report.update({"real": base, "realNotesOnly": notes_only, "realPass": green_real, "shifted": bad, "red": red, "knownCase": known,
+                       "knownCasePass": bool(known_ok)})
+        ok = all(r["pass"] for r in green_real.values()) and known_ok and red["red"]
+        report["verdict"] = "green and red as expected" if ok else "verification failed"
+        code = 0 if ok else 1
+        # Private transcription-check render, one new version (never overwritten, never published).
+        vname = versions.next_version(out)
+        vdir = out / vname
+        vdir.mkdir(parents=True, exist_ok=False)
+        rendered = T.render_score(score, sr, P, automation=True)
+        mixdown = sum(rendered.values())
+        peak = float(np.max(np.abs(mixdown))) + 1e-9
+        sf.write(str(vdir / "check-sine.wav"), (mixdown / max(1.0, peak / 0.98)).astype(np.float32), sr, subtype="PCM_24")
+        shutil.copy(str(target), str(vdir / "score.json"))
+        (vdir / "meta.json").write_text(json.dumps({"kind": "transcription-check", "private": True, "slug": args.slug,
+                                                    "note": "sine and noise verification voices, not a sound design (12 October 2026)",
+                                                    "params": str(T.params_path()), "overrides": over}, indent=1), encoding="utf-8")
+        (vdir / "verify.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+        report["version"] = str(vdir)
+    report["totalS"] = round(time.time() - t_all, 1)
+    if args.json:
+        print(json.dumps(report, indent=1))
+    else:
+        print(json.dumps({k: report[k] for k in report if k in ("score", "summary", "verdict", "version", "totalS")}, indent=1))
+        if "real" in report:
+            for k, row in report["real"].items():
+                print(f"{k:7s} onsetF {row['onset']['f']:.3f}  chroma {row['chroma']:.3f}  env {row['envelopeCorr']:.3f}"
+                      f"   shifted onsetF {report['shifted']['timeAndPitch'][k]['onset']['f']:.3f}"
+                      f" chroma {report['shifted']['timeAndPitch'][k]['chroma']:.3f}")
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,568 @@
+# 12 October 2026: task MI, bass stem. Per-note shape fit of the measured (sms) bass voice: release time (T60),
+# a low-pass tilt (dB per octave above a corner) and a sustain level (dB from sustainStartS to the gate), fitted note
+# by note against the reference bass stem in the third-octave time-frequency domain that MusicCritic scores.
+# Only numbers come from the reference (the fitted parameters); the render is the additive voice of zrmd/audio/sms.py
+# replayed with those parameters, never a reference sample.
+# Shared modules (resynth, sms, MusicCritic) are imported read-only; nothing in them is edited.
+# FR : ajustement par note de la basse (release, filtre passe-bas en pente, niveau de sustain), contre la piste de
+# reference, dans le domaine des tiers d'octave du critique ; seuls des nombres viennent de la reference.
+import json
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "Scripts"))
+from zrmd.audio import resynth as RS  # noqa: E402
+from zrmd.audio import sms  # noqa: E402
+import MusicCritic as MC  # noqa: E402
+
+STEM = "bass"
+
+# 12 October 2026: the interface of the per-note fit (HDA parameters, 8 at most per group). Defaults are the values
+# measured best in Scripts/IterateBass.py (see docs/build/MI-bass.md).
+FIT = {
+    # neutral values reproduce V_034 bit for bit (releaseS equals the voice macro)
+    "neutral": {"releaseS": 0.25, "tiltDbOct": 0.0, "cornerHz": 1000.0, "sustainDb": 0.0, "attackDb": 0.0},
+    "sustainStartS": 0.06,     # sustain level starts this long after the onset (attack left alone)
+    "sustainRampS": 0.04,      # crossfade from attack gain to sustain gain
+    "grid": {
+        "releaseS": [0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.5, 0.7, 1.0],
+        "tiltDbOct": [0.0, 1.5, 3.0, 4.5, 6.0, 9.0, 12.0, 18.0, 24.0],
+        "cornerHz": [120.0, 200.0, 350.0, 600.0, 1000.0],
+        "sustainDb": [-9.0, -6.0, -4.5, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.5, 6.0],
+        "attackDb": [-6.0, -4.0, -2.0, -1.0, 0.0, 1.0, 2.0, 4.0],
+    },
+    # 12 October 2026: per-note spectral gain (fit key "bandDb"), one dB value per third-octave centre below, linear
+    # in log2 frequency between centres, held flat outside; the band step of Scripts/IterateBass.py ("fit:bandDb").
+    "bandCentresHz": [30.0 * 2 ** (k / 3.0) for k in range(21)],
+    "bandGrid": [-6.0, -4.0, -3.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0],
+    "bandMaxDb": 12.0,
+    "sweeps": 3,               # coordinate-descent sweeps over all notes
+    "marginS": 0.6,            # analysis window around a note: [t - marginS/4, t + dur + release + marginS]
+}
+
+
+# ---------------------------------------------------------------- base version (12 October 2026)
+
+def load_base(bench: Path, version: str) -> dict:
+    """params.json + score.json of a music-bench version, retimed and edited exactly like resynth.render."""
+    P = RS.params()
+    d = bench / version
+    prm = json.loads((d / "params.json").read_text())
+    sc0 = json.loads((d / "score.json").read_text())
+    sc, k = RS.retime(sc0, prm["tempo"]["bpm"])
+    sc = RS.apply_edits(sc, prm.get("patternEdits", []))
+    return {"P": P, "prm": prm, "score0": sc0, "score": sc, "k": k, "n": prm["lengthSamples"], "sr": P["sampleRate"], "dir": d}
+
+
+def bass_roles(B: dict) -> list[str]:
+    ev = RS.role_events(B["score"])
+    return [r for r, s in B["prm"]["voices"].items() if B["P"]["roles"][r]["stem"] == STEM and not s.get("mute") and ev.get(r)]
+
+
+# ---------------------------------------------------------------- note renderer (12 October 2026)
+
+def note_gain_db(fit: dict, fh: float, t: np.ndarray, dur: float) -> np.ndarray:
+    """12 October 2026: the per-note shape in dB for harmonic frequency fh at times t after the onset: low-pass tilt
+    above cornerHz, attack gain before sustainStartS, sustain gain after it (linear crossfade over sustainRampS).
+    The release is not here (it is the T60 of the envelope). FR : forme par note en dB."""
+    g = -fit["tiltDbOct"] * max(0.0, math.log2(max(fh, 1.0) / fit["cornerHz"]))
+    if fit.get("bandDb"):
+        g += float(np.interp(math.log2(max(fh, 1.0)), np.log2(FIT["bandCentresHz"]), fit["bandDb"]))
+    s0 = FIT["sustainStartS"]
+    x = np.clip((t - s0) / max(FIT["sustainRampS"], 1e-4) + 0.5, 0.0, 1.0)
+    return g + fit["attackDb"] * (1.0 - x) + fit["sustainDb"] * x
+
+
+def tonal_note_fit(ev: dict, model: dict, macros: dict, T: dict, sr: int, transpose: float, rng: np.random.Generator, fit: dict) -> np.ndarray:
+    """12 October 2026: sms.tonal_note with a per-note release, tilt and sustain level (fit). With the neutral fit
+    (releaseS equal to the macro, zero gains) every operation reduces to sms.tonal_note, bit for bit (checked by
+    IterateBass.py selftest). The random phase draws are the same count per note, so a refit keeps the phases."""
+    f0 = sms.note_hz(ev, transpose)
+    dur = max(ev["dur"], T["minGateS"])
+    rel = fit["releaseS"]
+    m = int(math.ceil((dur + max(rel, fit.get("tailS", 0.0))) * sr))  # tailS: longer analysis buffer (12 October 2026)
+    t = np.arange(m, dtype=np.float64) / sr
+    knots = np.asarray(model["knotsS"]) * macros["timeScale"]
+    tab = np.asarray(model["tableDb"], np.float64)
+    lc = np.log2(np.asarray(model["centresHz"]))
+    ft = np.full(m, f0)
+    if ev.get("glide"):
+        g0 = sms.midi_hz(ev["glide"]["fromMidi"] + transpose)
+        tau = max(ev["glide"].get("ms", 30.0), 1.0) / 1000.0 / 3.0
+        ft = f0 * (g0 / f0) ** np.exp(-t / tau)
+    phase = 2 * np.pi * np.cumsum(ft) / sr
+    tg = np.minimum(t, dur)
+    after = np.maximum(t - dur, 0.0)
+    relg = 10 ** (-3.0 * after / max(rel, 1e-3))
+    amp0 = 10 ** ((ev["levelDb"] + macros["gainDb"]) / 20.0)
+    out = np.zeros(m)
+    nyq = min(T["fMax"], 0.45 * sr)
+    dev_on = bool(ev.get("dev"))
+    shaped = any(fit[k_] != 0.0 for k_ in ("tiltDbOct", "sustainDb", "attackDb")) or bool(fit.get("bandDb"))
+    for h in range(1, T["harmonics"] + 1):
+        fh = h * f0
+        if fh >= nyq:
+            break
+        row = np.array([np.interp(math.log2(max(fh, 1.0)), lc, tab[:, k]) for k in range(tab.shape[1])])
+        row = row + macros["tiltDbOct"] * math.log2(fh / T["tiltPivotHz"])
+        a = 10 ** (np.interp(tg, knots, row) / 20.0)
+        if dev_on:
+            a = a * 10 ** (sms.event_dev_db(ev, [fh], t)[0] / 20.0)
+        if shaped:
+            a = a * 10 ** (note_gain_db(fit, fh, t, dur) / 20.0)
+        out += a * np.sin(h * phase + rng.uniform(0, 2 * np.pi) * T["randomPhase"])
+    if T["attackS"] > 0:
+        out *= np.clip(t / T["attackS"], 0.0, 1.0)
+    return (amp0 * out * relg).astype(np.float32)
+
+
+def render_notes(B: dict, fits: dict | None = None) -> tuple[np.ndarray, list]:
+    """Dry bass stem (sum of the bass roles) plus each note's (start sample, buffer, role, index). fits maps
+    "role:index" to a fit dict; missing notes use FIT.neutral with the voice's own releaseS."""
+    P, prm, n, sr = B["P"], B["prm"], B["n"], B["sr"]
+    ev = RS.role_events(B["score"])
+    dry = np.zeros(n, np.float32)
+    parts = []
+    for role in bass_roles(B):
+        spec = prm["voices"][role]
+        T = {**P["sms"]["tonal"], **spec.get("settings", {})}
+        rng = np.random.default_rng(P["render"]["seedBase"] + sorted(prm["voices"]).index(role))
+        tr = prm.get("transposeSemitones", 0.0)
+        base = {**FIT["neutral"], "releaseS": spec["macros"]["releaseS"]}
+        for i, e in enumerate(ev[role]):
+            fit = {**base, **((fits or {}).get(f"{role}:{i}", {}))}
+            y = tonal_note_fit(e, spec["model"], spec["macros"], T, sr, tr, rng, fit)
+            at = int(round(e["t"] * sr))
+            if at < 0:
+                y, at = y[-at:], 0
+            kk = min(len(y), n - at)
+            if kk > 0:
+                dry[at:at + kk] += y[:kk]
+            parts.append((at, y[:max(kk, 0)], role, i, e))
+    return dry, parts
+
+
+# ---------------------------------------------------------------- chain after the voice (12 October 2026)
+
+def residual(B: dict) -> np.ndarray:
+    P, prm, sc, n, sr = B["P"], B["prm"], B["score"], B["n"], B["sr"]
+    fx = prm["stemFx"][STEM]
+    au = sc["automation"]
+    if not fx.get("residual"):
+        return np.zeros(n, np.float32)
+    return RS.render_residual(fx["residual"], n, sr, P, au["stems"].get(STEM) if au.get("stems") else None, au["hopS"],
+                              P["render"]["seedBase"] + 500 + RS.STEMS.index(STEM), B["k"], B["score0"]["tempo"]["t0"])
+
+
+def automation_gain(B: dict, x: np.ndarray) -> np.ndarray:
+    """The per-sample gain (linear) that resynth.apply_automation would apply to x (same formula, returned instead of
+    applied), so a fit can hold it frozen. FR : le gain de l'automation, gele pendant l'ajustement."""
+    import librosa
+    P, sc, sr = B["P"], B["score"], B["sr"]
+    au, A = sc["automation"], P["automation"]
+    curve = au["stems"].get(STEM)
+    if not (B["prm"]["stemFx"][STEM].get("automation") and curve):
+        return np.ones(len(x), np.float32)
+    h, w = max(1, int(round(au["hopS"] * sr))), max(2, int(round(au["windowS"] * sr)))
+    own = 20 * np.log10(librosa.feature.rms(y=x, frame_length=w, hop_length=h)[0] + 1e-9)
+    tgt = np.asarray(curve, np.float64)
+    m = min(len(own), len(tgt))
+    g = np.where(own[:m] > A["silentDb"], np.clip(tgt[:m] - own[:m], -A["maxDb"], A["maxDb"]), 0.0)
+    if A["smoothFrames"] > 1:
+        k = A["smoothFrames"]
+        g = np.convolve(np.pad(g, k, mode="edge"), np.ones(2 * k + 1) / (2 * k + 1), mode="valid")
+    gs = np.interp(np.arange(len(x)), np.arange(m) * h, g)
+    return (10 ** (gs / 20.0)).astype(np.float32)
+
+
+def automation_curve_db(B: dict, x: np.ndarray) -> np.ndarray:
+    """12 October 2026: the fader lane (dB per automation hop) that resynth.apply_automation would ride on x, so it
+    can be frozen, stored in params.json and refitted. FR : la courbe de fader, en dB par pas d'automation."""
+    g = 20 * np.log10(np.maximum(automation_gain(B, x)[:: max(1, int(round(B["score"]["automation"]["hopS"] * B["sr"])))], 1e-9))
+    return g.astype(np.float64)
+
+
+def gain_from_curve(B: dict, curve_db) -> np.ndarray:
+    """Per-sample linear gain from a fader lane, interpolated like resynth.apply_automation."""
+    h = max(1, int(round(B["score"]["automation"]["hopS"] * B["sr"])))
+    c = np.asarray(curve_db, np.float64)
+    gs = np.interp(np.arange(B["n"]), np.arange(len(c)) * h, c)
+    return (10 ** (gs / 20.0)).astype(np.float32)
+
+
+def chain(B: dict, dry: np.ndarray, res: np.ndarray, eq: dict | None = None, frozen_gain: np.ndarray | None = None) -> np.ndarray:
+    """dry + residual -> equaliser -> automation (adaptive, or a frozen gain) -> stereo, exactly as resynth.render."""
+    P, prm, sr = B["P"], B["prm"], B["sr"]
+    fx = prm["stemFx"][STEM]
+    x = dry * 10 ** (prm.get("stemGainsDb", {}).get(STEM, 0.0) / 20.0) + res
+    eq = eq if eq is not None else fx.get("eq")
+    if eq:
+        x = RS.apply_eq(x, eq, sr, P, B["k"], B["score0"]["tempo"]["t0"])
+    if frozen_gain is not None:
+        x = (x * frozen_gain).astype(np.float32)
+    elif fx.get("automation") and B["score"]["automation"]["stems"].get(STEM):
+        au = B["score"]["automation"]
+        x = RS.apply_automation(x, au["stems"][STEM], au["hopS"], au["windowS"], sr, P)
+    return RS.apply_stereo(x, fx.get("stereo"), sr, P)
+
+
+def eq_window(eq: dict, a_s: float) -> dict:
+    """The stem equaliser with its section times moved by -a_s, to filter a window that starts at a_s seconds."""
+    return {"centresHz": eq["centresHz"], "sections": [{**s, "start": s["start"] - a_s, "end": s["end"] - a_s} for s in eq["sections"]]}
+
+
+# ---------------------------------------------------------------- band-domain per-note fit (12 October 2026)
+
+class BandModel:
+    """12 October 2026: the bass stem in the critic's band domain (MusicCritic.band_power, nFft 4096, hop 2048):
+    power = sum over notes of each note's power map (rendered alone, filtered by the equaliser and multiplied by the
+    frozen automation gain) + the residual's map. Cross terms between notes are neglected (random phases). A note's
+    candidate shape is applied to its map in the band domain (tilt by band centre, attack, sustain and release by frame
+    time), so a candidate costs one array operation. The exact render is scored afterwards by MusicCritic."""
+
+    def __init__(self, B: dict, ref_mono: np.ndarray, parts: list, res: np.ndarray, gain: np.ndarray, eq: dict,
+                 fits: list[dict], rel_model: float):
+        # 12 October 2026: parts are rendered with releaseS = rel_model (the longest grid value), so a candidate
+        # release only ever shortens the rendered tail; fits[j] gives each note's starting shape.
+        self.B = B
+        sr = B["sr"]
+        self.sr = sr
+        self.c, self.W = MC.bands(sr)
+        self.hop = MC.CFG["hop"]
+        self.nfft = MC.CFG["nFft"]
+        n = B["n"]
+        self.R = MC.band_power(ref_mono[:n], sr, self.W)  # dB [bands, frames]
+        self.nf = self.R.shape[1]
+        self.times = np.arange(self.nf) * self.hop / sr
+        self.fl = self.R.max() - MC.CFG["floorDb"]
+        self.R2 = np.maximum(self.R, self.fl)
+        y = RS.apply_eq(res, eq, sr, B["P"], B["k"], B["score0"]["tempo"]["t0"]) * gain if eq else res * gain
+        self.Pres = 10 ** (MC.band_power(y, sr, self.W) / 10.0)
+        self.notes = []
+        for at, buf, role, i, e in parts:
+            self.notes.append(self._note_map(at, buf, role, i, e, gain, eq))
+        self.rel0 = rel_model
+        for nm, fit in zip(self.notes, fits):
+            nm["Pw"] = nm["Pw0"] * 10 ** (self.shape_db(nm, fit, rel_model) / 10.0)
+        self.total = self.Pres.copy()
+        for nm in self.notes:
+            self.total[:, nm["f0"]:nm["f1"]] += nm["Pw"]
+
+    def _note_map(self, at, buf, role, i, e, gain, eq):
+        sr, hop, nfft = self.sr, self.hop, self.nfft
+        n = self.B["n"]
+        # Window aligned on the critic frame grid, with nFft of margin on both sides (interior frames exact).
+        a = max(0, (at // hop - nfft // hop - 2) * hop)
+        b = min(n, at + len(buf) + 2 * nfft + int(FIT["marginS"] * sr))
+        x = np.zeros(b - a, np.float32)
+        x[at - a: at - a + len(buf)] = buf
+        x = x * 10 ** (self.B["prm"].get("stemGainsDb", {}).get(STEM, 0.0) / 20.0)
+        if eq:
+            x = RS.apply_eq(x, eq_window(eq, a / sr), sr, self.B["P"], 1.0, 0.0)
+        x = x * gain[a:b]
+        Bp = MC.band_power(x, sr, self.W)  # reflect padding at the window edge: drop edge frames
+        f0 = a // hop + (nfft // hop if a > 0 else 0)
+        f1 = min(self.nf, (b // hop) - (nfft // hop if b < n else 0))
+        loc = Bp[:, f0 - a // hop: f1 - a // hop]
+        return {"role": role, "i": i, "t": e["t"], "dur": max(e["dur"], 0.05), "f0": f0, "f1": f1,
+                "Pw0": 10 ** (loc / 10.0), "Pw": 10 ** (loc / 10.0), "midi": e["midi"]}
+
+    def shape_db(self, nm: dict, fit: dict, rel0: float) -> np.ndarray:
+        """dB applied to a note map for a fit, relative to the neutral render (release rel0)."""
+        t = self.times[nm["f0"]:nm["f1"]] - nm["t"]
+        dur = nm["dur"]
+        out = np.zeros((len(self.c), len(t)))
+        s0, rr = FIT["sustainStartS"], max(FIT["sustainRampS"], 1e-4)
+        x = np.clip((t - s0) / rr + 0.5, 0.0, 1.0)
+        out += (fit["attackDb"] * (1.0 - x) + fit["sustainDb"] * x)[None, :]
+        out += (-fit["tiltDbOct"] * np.maximum(0.0, np.log2(self.c / fit["cornerHz"])))[:, None]
+        if fit.get("bandDb"):
+            out += np.interp(np.log2(self.c), np.log2(FIT["bandCentresHz"]), fit["bandDb"])[:, None]
+        after = np.maximum(t - dur, 0.0)
+        out += (-60.0 * after * (1.0 / max(fit["releaseS"], 1e-3) - 1.0 / max(rel0, 1e-3)))[None, :]
+        return out
+
+    def scale_frames(self, f0: int, f1: int, lin: np.ndarray) -> None:
+        """Apply a frame gain (linear power) to every component on frames f0:f1 (a fader move)."""
+        self.total[:, f0:f1] *= lin[None, :]
+        self.Pres[:, f0:f1] *= lin[None, :]
+        for nm in self.notes:
+            a, b = max(f0, nm["f0"]), min(f1, nm["f1"])
+            if a < b:
+                g = lin[a - f0:b - f0][None, :]
+                nm["Pw0"][:, a - nm["f0"]:b - nm["f0"]] *= g
+                nm["Pw"][:, a - nm["f0"]:b - nm["f0"]] *= g
+
+    def err_parts(self, f0: int, f1: int, tot: np.ndarray):
+        o2 = np.maximum(10 * np.log10(tot + 1e-20), self.fl)
+        r2 = self.R2[:, f0:f1]
+        w = np.maximum(r2, o2) - self.fl
+        return float((w * np.abs(o2 - r2)).sum()), float(w.sum())
+
+    def E(self) -> float:
+        e, w = self.err_parts(0, self.nf, self.total)
+        return e / (w + 1e-9) / MC.CFG["jndDb"]
+
+    def fit_note(self, j: int, fit: dict, rel0: float, grid: dict, keys: list[str]) -> dict:
+        """Coordinate descent on one note, each key on its grid in turn, others held."""
+        nm = self.notes[j]
+        f0, f1 = nm["f0"], nm["f1"]
+        e_all, w_all = self.err_parts(0, self.nf, self.total)
+        others = self.total[:, f0:f1] - nm["Pw"]
+        e_loc0, w_loc0 = self.err_parts(f0, f1, self.total[:, f0:f1])
+        e_rest, w_rest = e_all - e_loc0, w_all - w_loc0
+
+        def cost(fc):
+            # Release can only shorten the tail inside the window; a longer one is clipped at the window end.
+            tot = others + nm["Pw0"] * 10 ** (self.shape_db(nm, fc, rel0) / 10.0)
+            e, w = self.err_parts(f0, f1, tot)
+            return (e_rest + e) / (w_rest + w + 1e-9)
+
+        best = dict(fit)
+        bc = cost(best)
+        for key in keys:
+            if key == "bandDb":  # 12 October 2026: one band at a time, moves added to the current value
+                cur = list(best.get("bandDb") or [0.0] * len(FIT["bandCentresHz"]))
+                for b in range(len(cur)):
+                    for dv in FIT["bandGrid"]:
+                        v = float(np.clip(cur[b] + dv, -FIT["bandMaxDb"], FIT["bandMaxDb"]))
+                        trial = cur[:b] + [v] + cur[b + 1:]
+                        cc = cost({**best, "bandDb": trial})
+                        if cc < bc - 1e-12:
+                            bc, cur = cc, trial
+                    best = {**best, "bandDb": cur}
+                continue
+            for v in grid[key]:
+                c_ = {**best, key: v}
+                cc = cost(c_)
+                if cc < bc - 1e-12:
+                    bc, best = cc, c_
+        nm["Pw"] = nm["Pw0"] * 10 ** (self.shape_db(nm, best, rel0) / 10.0)
+        self.total[:, f0:f1] = others + nm["Pw"]
+        return best
+
+
+def stft_c(x: np.ndarray) -> np.ndarray:
+    """12 October 2026: the complex frames behind MusicCritic.band_power (reflect padding, Hann, rfft), [bins, frames]."""
+    n, h = MC.CFG["nFft"], MC.CFG["hop"]
+    x = np.pad(np.asarray(x, np.float64), (n // 2, n // 2), mode="reflect")
+    m = 1 + (len(x) - n) // h
+    win = np.hanning(n + 1)[:-1]
+    idx = np.arange(n)[None, :] + h * np.arange(m)[:, None]
+    return np.fft.rfft(x[idx] * win, axis=1).T
+
+
+class ComplexModel(BandModel):
+    """12 October 2026: the same fit with cross terms: each note keeps its complex critic frames, the stem is their
+    complex sum (plus the residual), and a candidate shape is a per-bin, per-frame gain on the note's frames. Repeated
+    notes of one pitch (the bass plays many) interfere, which the power model of BandModel cannot see; this model
+    agrees with the critic to the cross terms inside a frame. FR : le meme ajustement avec les interferences entre
+    notes, dans le domaine complexe des trames du critique."""
+
+    def __init__(self, B, ref_mono, parts, res, gain, eq, fits, rel_model):
+        self.B = B
+        sr = B["sr"]
+        self.sr = sr
+        self.c, self.W = MC.bands(sr)
+        self.hop, self.nfft = MC.CFG["hop"], MC.CFG["nFft"]
+        self.freqs = np.fft.rfftfreq(self.nfft, 1.0 / sr)
+        n = B["n"]
+        self.R = MC.band_power(ref_mono[:n], sr, self.W)
+        self.nf = self.R.shape[1]
+        self.times = np.arange(self.nf) * self.hop / sr
+        self.fl = self.R.max() - MC.CFG["floorDb"]
+        self.R2 = np.maximum(self.R, self.fl)
+        y = RS.apply_eq(res, eq, sr, B["P"], B["k"], B["score0"]["tempo"]["t0"]) * gain if eq else res * gain
+        self.Sres = stft_c(y)
+        self.notes = []
+        for at, buf, role, i, e in parts:
+            nm = self._note_map(at, buf, role, i, e, gain, eq)
+            self.notes.append(nm)
+        # 12 October 2026: parts are rendered with each note's current fit (exact at the start), and a candidate is
+        # the dB difference between its shape and that fit.
+        self.rel0 = rel_model
+        for nm, fit in zip(self.notes, fits):
+            nm["fit0"] = dict(fit)
+            nm["db0"] = self._shape_db(nm, fit)
+            nm["X"] = nm["X0"].copy()
+        self.S = self.Sres.copy()
+        for nm in self.notes:
+            self.S[:, nm["f0"]:nm["f1"]] += nm["X"]
+
+    def _note_map(self, at, buf, role, i, e, gain, eq):
+        sr, hop, nfft = self.sr, self.hop, self.nfft
+        n = self.B["n"]
+        a = max(0, (at // hop - nfft // hop - 2) * hop)
+        b = min(n, at + len(buf) + 2 * nfft + int(FIT["marginS"] * sr))
+        x = np.zeros(b - a, np.float32)
+        x[at - a: at - a + len(buf)] = buf
+        x = x * 10 ** (self.B["prm"].get("stemGainsDb", {}).get(STEM, 0.0) / 20.0)
+        if eq:
+            x = RS.apply_eq(x, eq_window(eq, a / sr), sr, self.B["P"], 1.0, 0.0)
+        x = x * gain[a:b]
+        X = stft_c(x)
+        f0 = a // hop + (nfft // hop if a > 0 else 0)
+        f1 = min(self.nf, (b // hop) - (nfft // hop if b < n else 0))
+        loc = X[:, f0 - a // hop: f1 - a // hop]
+        return {"role": role, "i": i, "t": e["t"], "dur": max(e["dur"], 0.05), "f0": f0, "f1": f1, "X0": loc, "midi": e["midi"]}
+
+    def _shape_db(self, nm, fit):
+        """Absolute per-bin [F] and per-frame [T] dB of a fit (release as -60 dB per releaseS after the gate)."""
+        t = self.times[nm["f0"]:nm["f1"]] - nm["t"]
+        s0, rr = FIT["sustainStartS"], max(FIT["sustainRampS"], 1e-4)
+        x = np.clip((t - s0) / rr + 0.5, 0.0, 1.0)
+        tdb = fit["attackDb"] * (1.0 - x) + fit["sustainDb"] * x
+        tdb = tdb - 60.0 * np.maximum(t - nm["dur"], 0.0) / max(fit["releaseS"], 1e-3)
+        fdb = -fit["tiltDbOct"] * np.maximum(0.0, np.log2(np.maximum(self.freqs, 1.0) / fit["cornerHz"]))
+        if fit.get("bandDb"):
+            fdb = fdb + np.interp(np.log2(np.maximum(self.freqs, 1.0)), np.log2(FIT["bandCentresHz"]), fit["bandDb"])
+        return fdb, tdb
+
+    def gain_lin(self, nm, fit):
+        """Per-bin, per-frame amplitude gain of a fit relative to the note's analysis render (its fit0)."""
+        fdb, tdb = self._shape_db(nm, fit)
+        f0, t0 = nm["db0"]
+        return 10 ** (((fdb - f0)[:, None] + (tdb - t0)[None, :]) / 20.0)
+
+    def _err(self, f0, f1, S):
+        o = 10 * np.log10(self.W @ (np.abs(S) ** 2) + 1e-20)
+        o2 = np.maximum(o, self.fl)
+        r2 = self.R2[:, f0:f1]
+        w = np.maximum(r2, o2) - self.fl
+        return float((w * np.abs(o2 - r2)).sum()), float(w.sum())
+
+    def E(self) -> float:
+        e, w = self._err(0, self.nf, self.S)
+        return e / (w + 1e-9) / MC.CFG["jndDb"]
+
+    def fit_note(self, j, fit, rel0, grid, keys):
+        nm = self.notes[j]
+        f0, f1 = nm["f0"], nm["f1"]
+        e_all, w_all = self._err(0, self.nf, self.S) if not hasattr(self, "_ew") else self._ew
+        others = self.S[:, f0:f1] - nm["X"]
+        e_loc0, w_loc0 = self._err(f0, f1, self.S[:, f0:f1])
+        e_rest, w_rest = e_all - e_loc0, w_all - w_loc0
+
+        def cost(fc):
+            e, w = self._err(f0, f1, others + nm["X0"] * self.gain_lin(nm, fc))
+            return (e_rest + e) / (w_rest + w + 1e-9)
+
+        best = dict(fit)
+        bc = cost(best)
+        for key in keys:
+            if key == "bandDb":
+                cur = list(best.get("bandDb") or [0.0] * len(FIT["bandCentresHz"]))
+                for b in range(len(cur)):
+                    for dv in FIT["bandGrid"]:
+                        v = float(np.clip(cur[b] + dv, -FIT["bandMaxDb"], FIT["bandMaxDb"]))
+                        trial = cur[:b] + [v] + cur[b + 1:]
+                        cc = cost({**best, "bandDb": trial})
+                        if cc < bc - 1e-12:
+                            bc, cur = cc, trial
+                    best = {**best, "bandDb": cur}
+                continue
+            for v in grid[key]:
+                c_ = {**best, key: v}
+                cc = cost(c_)
+                if cc < bc - 1e-12:
+                    bc, best = cc, c_
+        nm["X"] = nm["X0"] * self.gain_lin(nm, best)
+        self.S[:, f0:f1] = others + nm["X"]
+        e_new, w_new = self._err(f0, f1, self.S[:, f0:f1])
+        self._ew = (e_rest + e_new, w_rest + w_new)
+        return best
+
+    def err_parts(self, f0, f1, tot=None):
+        return self._err(f0, f1, self.S[:, f0:f1])
+
+    def scale_frames(self, f0, f1, lin):
+        a = np.sqrt(lin)[None, :]
+        self.S[:, f0:f1] *= a
+        self.Sres[:, f0:f1] *= a
+        for nm in self.notes:
+            lo, hi = max(f0, nm["f0"]), min(f1, nm["f1"])
+            if lo < hi:
+                g = a[:, lo - f0:hi - f0]
+                nm["X0"][:, lo - nm["f0"]:hi - nm["f0"]] *= g
+                nm["X"][:, lo - nm["f0"]:hi - nm["f0"]] *= g
+
+
+def fit_fader_c(M: ComplexModel, B: dict, curve_db: np.ndarray, grid: list[float], sweeps: int = 2) -> np.ndarray:
+    """12 October 2026: fit_fader on the complex model (frame gains scale amplitudes). FR : fader, modele complexe."""
+    h = max(1, int(round(B["score"]["automation"]["hopS"] * B["sr"])))
+    hs = h / B["sr"]
+    fc = M.times
+    cur = np.asarray(curve_db, np.float64).copy()
+    e_all, w_all = M._err(0, M.nf, M.S)
+    for _ in range(sweeps):
+        for k in range(len(cur)):
+            hat = np.clip(1.0 - np.abs(fc / hs - k), 0.0, 1.0)
+            fr = np.flatnonzero(hat > 0)
+            if len(fr) == 0:
+                continue
+            f0, f1 = fr[0], fr[-1] + 1
+            base = M.S[:, f0:f1]
+            P0 = M.W @ (np.abs(base) ** 2)
+            e0, w0 = M._err(f0, f1, base)
+            best_d, best_c, best_ew = 0.0, e_all / (w_all + 1e-9), None
+            for d in grid:
+                lin = 10 ** (d * hat[f0:f1] / 10.0)
+                o2 = np.maximum(10 * np.log10(P0 * lin[None, :] + 1e-20), M.fl)
+                r2 = M.R2[:, f0:f1]
+                w = np.maximum(r2, o2) - M.fl
+                e, ww = float((w * np.abs(o2 - r2)).sum()), float(w.sum())
+                c_ = (e_all - e0 + e) / (w_all - w0 + ww + 1e-9)
+                if c_ < best_c - 1e-12:
+                    best_c, best_d, best_ew = c_, d, (e_all - e0 + e, w_all - w0 + ww)
+            if best_d:
+                cur[k] += best_d
+                M.scale_frames(f0, f1, 10 ** (best_d * hat[f0:f1] / 10.0))
+                e_all, w_all = best_ew
+    return cur
+
+
+def fit_fader(M: "BandModel", B: dict, curve_db: np.ndarray, grid: list[float], sweeps: int = 2) -> np.ndarray:
+    """12 October 2026: refit the fader lane point by point against the critic error in the band model. A lane point
+    k scales every component (notes and residual) by its interpolation hat, so a delta of d dB at k multiplies the
+    frame powers by 10^(d * hat / 10), hat taken at each critic frame centre. FR : courbe de fader ajustee point par
+    point sur l'erreur du critique."""
+    h = max(1, int(round(B["score"]["automation"]["hopS"] * B["sr"])))
+    hs = h / B["sr"]
+    fc = M.times  # critic frame centres (frames are centred: frame i at i * hop)
+    cur = np.asarray(curve_db, np.float64).copy()
+    for _ in range(sweeps):
+        for k in range(len(cur)):
+            hat = np.clip(1.0 - np.abs(fc / hs - k), 0.0, 1.0)
+            fr = np.flatnonzero(hat > 0)
+            if len(fr) == 0:
+                continue
+            f0, f1 = fr[0], fr[-1] + 1
+            e_all, w_all = M.err_parts(0, M.nf, M.total)
+            e0, w0 = M.err_parts(f0, f1, M.total[:, f0:f1])
+            base = M.total[:, f0:f1]
+            best_d, best_c = 0.0, (e_all) / (w_all + 1e-9)
+            for d in grid:
+                if d == 0.0:
+                    continue
+                tot = base * 10 ** (d * hat[f0:f1] / 10.0)[None, :]
+                e, w = M.err_parts(f0, f1, tot)
+                c_ = (e_all - e0 + e) / (w_all - w0 + w + 1e-9)
+                if c_ < best_c - 1e-12:
+                    best_c, best_d = c_, d
+            if best_d:
+                cur[k] += best_d
+                M.scale_frames(f0, f1, 10 ** (best_d * hat[f0:f1] / 10.0))
+    return cur
+
+
+def critic_score(ref_mono: np.ndarray, ours_stereo: np.ndarray, sr: int, B: dict) -> dict:
+    """MusicCritic's independent tfBands with its diagnosis for the bass stem. FR : score du critique."""
+    cmp = MC.compare(ref_mono, RS.mono(ours_stereo), sr)
+    times = np.arange(cmp["d"].shape[1]) * MC.CFG["hop"] / sr
+    secs = [{"start": s["start"], "end": s["end"]} for s in B["score"]["sections"]]
+    return MC.diagnose(cmp, times, secs, RS.stem_events(B["score"], STEM))

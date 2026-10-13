@@ -1,0 +1,59 @@
+# 12 October 2026: two-way validation of zrmd.analyze.camera (similarity camera and 3D probe, R04 sections 3 and 10).
+# Green: a textured plate zoomed by 15 % in power2.inOut and panned in power1.out comes back as a 15 % zoom with the
+#   right ease and a pan; a card turning in perspective is not called a 2D layer.
+# Red: a still sequence reports no move ('fixe'); a pure 2D zoom is not called 3D.
+# Run: OMP_NUM_THREADS=1 /Users/zenray/.venvs/zenray-motion/bin/python -I tests/test_camera.py
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from zrmd.analyze import camera  # noqa: E402
+
+
+def plate(seed: int = 3) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    base = cv2.GaussianBlur((rng.random((540, 960)) * 255).astype(np.uint8), (0, 0), 2.0)
+    return cv2.normalize(base, None, 0, 255, cv2.NORM_MINMAX)
+
+
+def test_zoom_and_still():
+    st = camera.selftest()
+    print(json.dumps({k: st[k] for k in ("zoom_total_pct", "zoom_ease", "x_total_pct", "kind", "probe", "still_is_fixed")}))
+    assert st["recovers_zoom"], st
+    assert st["still_is_fixed"], st
+    assert "panoramique" in st["kind"], st
+    assert st["probe"] in ("layer_2d", "layer_2d_affine"), st  # red side: a pure 2D zoom is not 3D
+    return st
+
+
+def test_perspective_card():
+    base = plate(5)
+    h, w = base.shape
+    frames = []
+    for i in range(30):
+        a = np.deg2rad(1.2 * i)  # the card turns about its vertical axis
+        f = 900.0
+        cx, cy = w / 2, h / 2
+        pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+        out = []
+        for x, y in pts:
+            X, Y = x - cx, y - cy
+            Z = f + X * np.sin(a)
+            out.append([cx + f * X * np.cos(a) / Z, cy + f * Y / Z])
+        H = cv2.getPerspectiveTransform(pts, np.float32(out))
+        frames.append(cv2.resize(cv2.warpPerspective(base, H, (w, h), borderMode=cv2.BORDER_REFLECT), (480, 270)))
+    res = camera.measure(frames, 30.0)
+    print(json.dumps({"perspective_class": res["probe"]["class"], "hom": res["probe"]["hom"], "aff": res["probe"]["aff"]}))
+    assert res["probe"]["class"] not in ("layer_2d", "static"), res["probe"]
+    return res["probe"]
+
+
+if __name__ == "__main__":
+    out = {"zoom": test_zoom_and_still()["zoom_ease"], "perspective": test_perspective_card()["class"]}
+    print(json.dumps(out))

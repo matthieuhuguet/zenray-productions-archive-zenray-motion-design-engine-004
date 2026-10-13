@@ -1,0 +1,67 @@
+# 12 October 2026, 03:55 CEST: sound-event measurement of a reference soundtrack.
+# The mix is split into harmonic and percussive parts (HPSS); onsets are found on the percussive part and on the
+# full mix; each event gets its window (onset to decay), its loudness, and a compact descriptor set (log-mel
+# envelope, centroid track, flatness, pitch) used later to choose and fit a synthesis recipe. Numbers only:
+# no sample of the reference is stored.
+from __future__ import annotations
+
+import librosa
+import numpy as np
+
+from .. import settings
+from ..media import load_audio
+
+
+def features(y: np.ndarray, sr: int, cfg: dict) -> dict:
+    """Frame features shared by detection and fitting."""
+    hop = int(sr * cfg["hop_ms"] / 1000)
+    n_fft = cfg["n_fft"]
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=n_fft, hop_length=hop, n_mels=cfg["n_mels"], power=2.0,
+                                         fmin=cfg["fmin"], fmax=sr / 2)
+    logmel = librosa.power_to_db(mel, ref=1.0, top_db=None)
+    rms = librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop)[0]
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr, n_fft=n_fft, hop_length=hop)[0]
+    flatness = librosa.feature.spectral_flatness(y=y, n_fft=n_fft, hop_length=hop)[0]
+    return {"hop": hop, "logmel": logmel, "rms": rms, "centroid": centroid, "flatness": flatness}
+
+
+def detect_events(wav_or_video: str, cfg: dict | None = None) -> dict:
+    cfg = cfg or settings.get("analysis.audio")
+    sr = cfg["sample_rate"]
+    stereo, _ = load_audio(wav_or_video, sr, mono=False)
+    y = stereo.mean(axis=1)
+    harmonic, percussive = librosa.effects.hpss(y, margin=cfg["hpss_margin"])
+    feat = features(y, sr, cfg)
+    pfeat = features(percussive, sr, cfg)
+    hop = feat["hop"]
+    env = librosa.onset.onset_strength(S=pfeat["logmel"], sr=sr, hop_length=hop)
+    peaks = librosa.onset.onset_detect(onset_envelope=env, sr=sr, hop_length=hop, units="frames", backtrack=True,
+                                       delta=cfg["onset_delta"], wait=int(cfg["onset_wait_ms"] / cfg["hop_ms"]))
+    rms_db = 20 * np.log10(np.maximum(feat["rms"], 1e-6))
+    events = []
+    for k, f in enumerate(peaks):
+        nxt = peaks[k + 1] if k + 1 < len(peaks) else len(rms_db) - 1
+        peak_f = f + int(np.argmax(rms_db[f:min(nxt, f + int(cfg["peak_search_ms"] / cfg["hop_ms"])) + 1]))
+        floor = rms_db[peak_f] - cfg["decay_db"]
+        end_f = peak_f
+        while end_f < nxt and end_f < len(rms_db) - 1 and rms_db[end_f] > floor:
+            end_f += 1
+        seg = slice(f, max(end_f, f + 2))
+        band = pfeat["logmel"][:, seg]
+        energy = float(np.mean(10 ** (band / 10)))
+        events.append({
+            "id": f"E{len(events) + 1:03d}", "t": round(f * hop / sr, 4), "peak_t": round(peak_f * hop / sr, 4),
+            "end_t": round(end_f * hop / sr, 4), "dur": round((end_f - f) * hop / sr, 4),
+            "peak_db": round(float(rms_db[peak_f]), 2), "strength": round(float(env[f]), 3),
+            "centroid_hz": round(float(np.median(feat["centroid"][seg])), 1),
+            "centroid_start_hz": round(float(feat["centroid"][f]), 1),
+            "centroid_end_hz": round(float(feat["centroid"][max(f, end_f - 1)]), 1),
+            "flatness": round(float(np.median(feat["flatness"][seg])), 4),
+            "percussive_ratio": round(float(np.sum(percussive[f * hop:end_f * hop + 1] ** 2) /
+                                            max(np.sum(y[f * hop:end_f * hop + 1] ** 2), 1e-12)), 3),
+            "energy": energy,
+        })
+    tempo, beats = librosa.beat.beat_track(y=harmonic + percussive, sr=sr, hop_length=hop, units="time")
+    return {"sample_rate": sr, "hop_ms": cfg["hop_ms"], "duration": len(y) / sr, "tempo": float(np.atleast_1d(tempo)[0]),
+            "beats": [round(float(b), 4) for b in beats], "events": events,
+            "loudness_db": [round(float(v), 2) for v in rms_db[:: max(1, int(50 / cfg["hop_ms"]))]]}

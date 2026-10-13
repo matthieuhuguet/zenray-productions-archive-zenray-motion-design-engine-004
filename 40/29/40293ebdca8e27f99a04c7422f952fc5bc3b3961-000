@@ -1,0 +1,42 @@
+# 12 October 2026: identity ceiling and two-direction check of each recipe (R03 sections 6.3 and 7.3).
+# Green: the recipe against itself with other seeds (the best any fit can do). Red: each audible perturbation
+# declared in sfx-params.json "perturbations" must fall under the pass threshold.
+# FR : plafond d'identite et test dans les deux sens de chaque recette.
+from __future__ import annotations
+
+import numpy as np
+
+from . import config
+from .fit import desc_of, shipped
+from . import describe as D
+from .recipes import REGISTRY
+
+
+def perturb(params: dict, spec: dict) -> dict:
+    p = dict(params)
+    if "mul" in spec:
+        p[spec["param"]] *= spec["mul"]
+    elif "add" in spec:
+        p[spec["param"]] += spec["add"]
+    return p
+
+
+def check(job) -> dict:
+    kind, index = job
+    c = config.cfg()["ceiling"]
+    schema = REGISTRY[kind].schema
+    if index == 0:
+        truth = schema.defaults()
+    else:
+        rng = np.random.default_rng(c["truthSeed"] + 97 * index + sum(map(ord, kind)))
+        truth = schema.to_physical(rng.uniform(c["truthUnitMargin"], 1 - c["truthUnitMargin"], len(schema.fit_names)))
+    # 12 October 2026: measured on the shipped metric (one draw, seed chosen among renderSeeds), so the check also
+    # proves that choosing a seed cannot rescue a wrong parameter. The capped cloud identity is kept for reference.
+    ref = desc_of(kind, truth, c["targetSeed"])
+    ident, _, _ = shipped(ref, kind, truth, 0.0, c["renderSeeds"])
+    cloud_ident = D.compare_cloud(ref, [desc_of(kind, truth, s) for s in c["evalSeeds"]])["score"]
+    out = {"kind": kind, "index": index, "identity": round(ident, 2), "cloudIdentity": round(cloud_ident, 2), "perturbed": {}}
+    for spec in config.cfg()["perturbations"][kind]:
+        p = perturb(truth, spec)
+        out["perturbed"][spec["name"]] = round(shipped(ref, kind, p, 0.0, c["renderSeeds"])[0], 2)
+    return out

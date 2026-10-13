@@ -1,0 +1,257 @@
+# 12 October 2026: shared differentiable DSP for the transient and noise blocks of the sound bank (task A1).
+# One definition per gesture (decay, bell envelope, band and shelf masks, filtered noise, hit trains, deterministic
+# patterns, modal partials, metallic hats, sweeps), used by every block that needs it, so a fix lands everywhere.
+# Determinism: "random looking" variation (typing jitter, accents, grain pitches, crackle positions) comes from the R1
+# low-discrepancy sequence (fractional parts of i * 1/phi), never from a random generator; noise comes from the
+# block's fixed seed (bank.Block.noise). Everything is derived from the mathematics, no borrowed code.
+# FR : DSP différentiable partagé des blocs transitoires et bruits ; variations par suite déterministe R1.
+from __future__ import annotations
+
+import math
+
+import torch
+
+from .bank import db_to_amp, phase_from_freq, stft_filter
+
+N_FFT, HOP = 1024, 256  # 12 October 2026: STFT of every noise filter (21 ms window, 5.3 ms hop at 48 kHz)
+GOLDEN = (math.sqrt(5.0) - 1.0) / 2.0  # 0.618..., R1 sequence step
+FWHM = 2.0 * math.sqrt(2.0 * math.log(2.0))  # Gaussian full width at half maximum over sigma
+SOFT = 1e-4  # seconds, smoothing of gates so that times stay differentiable
+
+
+def pattern(k: int, salt: float, device) -> torch.Tensor:
+    """k deterministic values in [0, 1): fractional parts of salt + (i + 1) / phi (R1 sequence, well spread)."""
+    i = torch.arange(1, k + 1, device=device, dtype=torch.float32)
+    v = salt + i * GOLDEN
+    return v - torch.floor(v)
+
+
+def soft_count(count, k: int, device, sharp: float = 8.0) -> torch.Tensor:
+    """Weights of k slots for a continuous count: slot i is on when count > i + 0.5 (sigmoid of width 1 / sharp)."""
+    i = torch.arange(k, device=device, dtype=torch.float32)
+    return torch.sigmoid(sharp * (count - i - 0.5))
+
+
+def gate(t, onset):
+    """Smooth step at onset (differentiable in onset)."""
+    return torch.sigmoid((t - onset) / SOFT)
+
+
+def decay(t, onset, t60, attack=0.0005):
+    """Linear attack from onset, then an exponential 60 dB fall over t60; zero before onset. Broadcasts."""
+    u = t - onset
+    rise = torch.clamp(u / attack, 0.0, 1.0)
+    return rise * torch.pow(10.0, -3.0 * torch.clamp(u - attack, min=0.0) / t60)
+
+
+def bell(t, onset, duration, peak_pos, power=2.0):
+    """Rise to 1 at onset + peak_pos * duration, fall back to 0 at onset + duration (power-law sides)."""
+    x = torch.clamp((t - onset) / duration, 0.0, 1.0)
+    up = torch.clamp(x / peak_pos, 0.0, 1.0)
+    down = torch.clamp((1.0 - x) / (1.0 - peak_pos), 0.0, 1.0)
+    return torch.where(x < peak_pos, up, down) ** power * (x < 1.0).float() * (x > 0.0).float()
+
+
+def box(t, start, length, ramp=0.001):
+    """Smooth box from start to start + length with sigmoid ramps of `ramp` seconds."""
+    return torch.sigmoid((t - start) / ramp) * torch.sigmoid((start + length - t) / ramp)
+
+
+def log2f(freqs):
+    return torch.log2(torch.clamp(freqs, min=10.0))
+
+
+def l2(x):
+    """log2 of a tensor or of a plain float (constants of a block stay floats, on any device)."""
+    return torch.log2(x) if torch.is_tensor(x) else math.log2(x)
+
+
+def band(freqs, centre_hz, bw_oct):
+    """Gaussian band in log frequency, bw_oct is its full width at half maximum."""
+    return torch.exp(-0.5 * ((log2f(freqs) - l2(centre_hz)) / (bw_oct / FWHM)) ** 2)
+
+
+def lowpass(freqs, cutoff_hz, slope_db_oct=24.0):
+    """Smooth low-pass magnitude: -slope dB per octave above cutoff (soft knee)."""
+    over = torch.nn.functional.softplus(4.0 * (log2f(freqs) - l2(cutoff_hz))) / 4.0
+    return torch.pow(10.0, -slope_db_oct * over / 20.0)
+
+
+def highpass(freqs, cutoff_hz, slope_db_oct=24.0):
+    under = torch.nn.functional.softplus(4.0 * (l2(cutoff_hz) - log2f(freqs))) / 4.0
+    return torch.pow(10.0, -slope_db_oct * under / 20.0)
+
+
+def tilt(freqs, db_per_oct, ref_hz=1000.0):
+    return torch.pow(10.0, db_per_oct * (log2f(freqs) - math.log2(ref_hz)) / 20.0)
+
+
+def filtered(x, mask_fn, sr, normalise=True):
+    """STFT-domain magnitude filter. With a static mask (mask_fn(freqs) -> [F, 1]) and normalise, the output of white
+    noise has unit RMS (gain divided by sqrt of the mean squared mask, analytic)."""
+    freqs = torch.fft.rfftfreq(N_FFT, 1.0 / sr).to(x.device)[:, None]
+    m = mask_fn(freqs)
+    y = stft_filter(x, lambda f, tt: m, N_FFT, HOP, sr)
+    if normalise:
+        y = y / torch.sqrt(torch.mean(m * m) + 1e-12)
+    return y
+
+
+def moving(x, mask_fn, sr):
+    """Time-varying STFT filter, mask_fn(freqs[F,1], times[1,T]) -> [F,T]; output normalised to unit RMS."""
+    y = stft_filter(x, mask_fn, N_FFT, HOP, sr)
+    return y / torch.sqrt(torch.mean(y * y) + 1e-12)
+
+
+def partials(t, onset, freqs, t60s, amps):
+    """Sum of decaying sines started at onset (modal synthesis). freqs, t60s, amps: tensors [K]."""
+    u = torch.clamp(t - onset, min=0.0)[None, :]
+    env = decay(t[None, :], onset, t60s[:, None])
+    return (amps[:, None] * env * torch.sin(2.0 * math.pi * freqs[:, None] * u)).sum(0)
+
+
+def hit_times(onset, rate_hz, k, jitter, salt, device, swing=None):
+    """k stroke times: onset + i / rate, each shifted by jitter * (pattern - 0.5) / rate; optional swing delays odd
+    strokes by swing / rate. Fully differentiable in onset, rate, jitter and swing."""
+    i = torch.arange(k, device=device, dtype=torch.float32)
+    tt = onset + i / rate_hz + jitter * (pattern(k, salt, device) - 0.5) / rate_hz
+    if swing is not None:
+        tt = tt + swing * (i % 2) / rate_hz
+    return tt
+
+
+def hit_train(t, times, weights, attack, t60):
+    """Sum over hits of weight_i * decay envelope started at times_i. Returns the envelope [n]."""
+    return (weights[:, None] * decay(t[None, :], times[:, None], t60, attack)).sum(0)
+
+
+def delay_sum(templates, times, weights, n: int, sr: int, guard_s: float = 0.001):
+    """12 October 2026 (A1): sum of stroke templates, each delayed by an exact fractional delay in the frequency domain:
+    y = irfft(sum_i w_i * rfft(template_i) * exp(-2 pi i f t_i)). A stroke carries its own noise with it, so moving a
+    stroke is a pure delay instead of a new noise excerpt: the loss of a stroke time becomes smooth and wide (with
+    absolute-time noise every shift of a millisecond draws a different excerpt, which made rate and onset needles).
+    templates [K, L] start at their own time zero; times [K] in seconds; strokes starting after the window are muted
+    (sigmoid of guard_s) so nothing wraps around the FFT. FR : somme de gabarits de frappe retardés exactement dans le
+    domaine fréquentiel ; chaque frappe garde son bruit, déplacer une frappe n'est qu'un retard."""
+    k, length = templates.shape
+    nfft = 1 << int(math.ceil(math.log2(n + length)))
+    spec = torch.fft.rfft(templates, nfft)
+    f = torch.fft.rfftfreq(nfft, 1.0 / sr).to(templates.device)
+    ang = -2.0 * math.pi * f[None, :] * times[:, None]
+    w = weights * torch.sigmoid((n / sr - times) / guard_s)
+    re = (w[:, None] * (spec.real * torch.cos(ang) - spec.imag * torch.sin(ang))).sum(0)
+    im = (w[:, None] * (spec.real * torch.sin(ang) + spec.imag * torch.cos(ang))).sum(0)
+    return torch.fft.irfft(torch.complex(re, im), nfft)[:n]
+
+
+def stroke_noise(block, k: int, length: int, device):
+    """12 October 2026 (A1): k fixed noise excerpts of `length` samples, one per stroke (from the block seed)."""
+    return block.noise(k * length, device).reshape(k, length)
+
+
+def metal_hat(t, noise, sr, base_hz, metal_db, hp_hz):
+    """Hi-hat source: six inharmonic partials (ratios of the TR-808 hat oscillators, 205.3 to 800 Hz scaled to base_hz,
+    each with odd harmonics 3 and 5 like a square) mixed with noise, then high-passed and normalised."""
+    ratios = torch.tensor(HAT_RATIOS, device=t.device)
+    metal = 0.0
+    for h, a in ((1.0, 1.0), (3.0, 1.0 / 3.0), (5.0, 1.0 / 5.0)):
+        f = (base_hz * ratios * h)[:, None] * torch.ones_like(t)[None, :]
+        metal = metal + a * torch.sin(2.0 * math.pi * f * t[None, :]).sum(0)
+    metal = metal / torch.sqrt(torch.mean(metal * metal) + 1e-12)
+    src = noise + db_to_amp(metal_db) * metal
+    return filtered(src, lambda f: highpass(f, hp_hz, 36.0), sr, normalise=False) / (1.0 + db_to_amp(metal_db))
+
+
+HAT_RATIOS = [1.0, 304.4 / 205.3, 369.6 / 205.3, 522.7 / 205.3, 540.0 / 205.3, 800.0 / 205.3]  # TR-808 hat oscillators
+
+
+def sweep_tone(t, onset, f_of_t, sr):
+    """Sine whose instantaneous frequency is f_of_t (tensor [n]), phase accumulated, silent before onset."""
+    return torch.sin(phase_from_freq(f_of_t * gate(t, onset), sr))
+
+
+def rms_norm(y):
+    return y / torch.sqrt(torch.mean(y * y) + 1e-12)
+
+
+def progress(t, onset, duration):
+    """0 before onset, linear to 1 at onset + duration, then 1."""
+    return torch.clamp((t - onset) / duration, 0.0, 1.0)
+
+
+def swept_band_tone(noise, t, sr, onset, duration, start_hz, end_hz, bw_oct, tone_db):
+    """12 October 2026: noise through a Gaussian band whose centre moves geometrically from start_hz to end_hz over
+    duration, plus a sine following the same centre (riser, downlifter). Both layers unit RMS before mixing."""
+    a, b = torch.log2(start_hz), torch.log2(end_hz)
+    sig = bw_oct / FWHM
+
+    def mask(freqs, times):
+        c = a + (b - a) * progress(times, onset, duration)
+        return torch.exp(-0.5 * ((log2f(freqs) - c) / sig) ** 2)
+
+    f = start_hz * torch.pow(end_hz / start_hz, progress(t, onset, duration))
+    return moving(noise, mask, sr) + db_to_amp(tone_db) * math.sqrt(2.0) * sweep_tone(t, onset, f, sr)
+
+
+def param(name, unit, lo, hi, default, scale, description):
+    """12 October 2026: one PARAMS row (name, unit, min, max, default, scale, description), so block files stay short."""
+    return {"name": name, "unit": unit, "min": float(lo), "max": float(hi), "default": float(default), "scale": scale, "description": description}
+
+
+def meta(family, description, tags, what="", reference=None):
+    """12 October 2026: META of an original block (derived from the mathematics, no code copied)."""
+    src = {"what": what or "derived from the mathematics", "url": None, "licence": "original (derived from the mathematics, no code copied)"}
+    if reference:
+        src["reference"] = reference
+    return {"family": family, "description": description + " (12 October 2026)", "tags": tags, "sources": [src], "licence": "original"}
+
+
+ONSET = lambda hi=0.2, default=0.02: param("onset_s", "s", 0.0, hi, default, "lin", "start time in the window")  # noqa: E731
+AMP = lambda default=-14.0: param("amp_db", "dBFS", -60.0, 0.0, default, "lin", "peak level of the main layer")  # noqa: E731
+
+
+def masked_delay_sum(templates, masks_fn, times, weights, n: int, sr: int, guard_s: float = 0.001):
+    """12 October 2026 (A4): delay_sum where every stroke also gets its own magnitude mask, so each hit of a roll can have
+    its own brightness: y = irfft(sum_i w_i * M_i(f) * rfft(template_i) * exp(-2 pi i f t_i)). masks_fn(freqs[1, F])
+    returns [K, F]. FR : comme delay_sum, avec un filtre propre à chaque frappe (brillance par frappe)."""
+    k, length = templates.shape
+    nfft = 1 << int(math.ceil(math.log2(n + length)))
+    spec = torch.fft.rfft(templates, nfft)
+    f = torch.fft.rfftfreq(nfft, 1.0 / sr).to(templates.device)
+    m = masks_fn(f[None, :])
+    ang = -2.0 * math.pi * f[None, :] * times[:, None]
+    w = (weights * torch.sigmoid((n / sr - times) / guard_s))[:, None] * m
+    re = (w * (spec.real * torch.cos(ang) - spec.imag * torch.sin(ang))).sum(0)
+    im = (w * (spec.real * torch.sin(ang) + spec.imag * torch.cos(ang))).sum(0)
+    return torch.fft.irfft(torch.complex(re, im), nfft)[:n]
+
+
+def breakpoints(t, onset, duration, values, power=1.0):
+    """12 October 2026 (A4): piecewise-linear curve through len(values) equally spaced breakpoints over
+    [onset, onset + duration] (held before and after), differentiable in every value, onset and duration.
+    values: list of tensors. FR : courbe par points de passage, différentiable."""
+    k = len(values) - 1
+    x = progress(t, onset, duration) ** power * k
+    out = torch.zeros_like(t) + values[0]
+    for i in range(k):
+        seg = torch.clamp(x - i, 0.0, 1.0)
+        out = out + seg * (values[i + 1] - values[i])
+    return out
+
+
+def soft_steps(t, start, step_s, values, edge_s=0.001):
+    """12 October 2026 (A4): a staircase that holds values[0] from start, values[1] from start + step_s, and so on,
+    with sigmoid edges of edge_s (discrete pitch steps of a chip blip, sample and hold). FR : escalier à bords doux."""
+    out = torch.zeros_like(t) + values[0]
+    for i in range(1, len(values)):
+        out = out + torch.sigmoid((t - start - i * step_s) / edge_s) * (values[i] - values[i - 1])
+    return out
+
+
+def template_time(t, n: int, sr: int):
+    """13 October 2026: time axis of a stroke template of n samples, independent of the length of the fit window t.
+    The blocks used t[:n], which is shorter than n when the window is shorter than the template (windows of 0.34 s at
+    176 BPM against a 0.5 s template crashed the fit with a tensor size error). t is arange(len)/sr, so for long
+    windows this is bit-identical. FR : axe du gabarit, independant de la longueur de la fenetre d'ajustement."""
+    import torch
+    return torch.arange(n, device=t.device, dtype=t.dtype) / sr

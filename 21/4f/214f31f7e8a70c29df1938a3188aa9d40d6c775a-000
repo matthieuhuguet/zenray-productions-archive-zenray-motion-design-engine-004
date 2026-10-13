@@ -1,0 +1,640 @@
+# 12 October 2026: task MI-other, iteration on the "other" stem of the onekey-pro-2 music benchmark (private, 1:1).
+# The shared modules (resynth, sms, eventdev, transcribe) are imported read-only; nothing here edits them.
+# Pipeline of one candidate (a pure function of a params dict and a note list, every reference-derived quantity is a
+# number: notes, timbre tables, per-event dev tables, residual and eq tables, never a sample):
+#   1. transcription of the reference "other" stem (this file, section "transcription"): CQT, per-note templates
+#      learned from isolated notes of the stem itself, NMF with those fixed templates, note tracking; pyin on the
+#      monophonic segments; onset-aligned retiming;
+#   2. timbre tables per voice by sms.analyse_stem (measured, calibrated), per-event dev tables by eventdev.fit_stem;
+#   3. residual bed, per-bar eq, automation (resynth helpers), stereo;
+#   4. score with the independent third-octave critic (Scripts/MusicCritic.py, compare()).
+# FR : iteration sur la piste "other" ; modules partages en lecture seule ; transcription NMF CQT a gabarits appris,
+# pyin sur les segments monophoniques, recalage des attaques, puis timbres, ecarts par note, residu, egaliseur.
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+
+from .. import resynth as RS
+from .. import sms
+
+ROOT = Path(__file__).resolve().parents[3]
+ROLES = ["otherLow", "otherMid", "otherHigh"]
+
+
+# ---------------------------------------------------------------- shared context (12 October 2026)
+
+def critic():
+    """The M3 critic module loaded read-only from Scripts/MusicCritic.py. FR : le critique M3, en lecture seule."""
+    spec = importlib.util.spec_from_file_location("music_critic_ro", ROOT / "Scripts" / "MusicCritic.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def context(base_version: str = "V_034") -> dict:
+    P = RS.params()
+    sr = P["sampleRate"]
+    bench = Path(P["paths"]["bench"])
+    prm = json.loads((bench / base_version / "params.json").read_text())
+    score = json.loads((bench / base_version / "score.json").read_text())
+    ref_st = RS._read(Path(P["paths"]["stems"]) / "other.wav", sr)
+    return {"P": P, "sr": sr, "bench": bench, "prm": prm, "score": score, "refStereo": ref_st, "ref": RS.mono(ref_st),
+            "n": prm["lengthSamples"]}
+
+
+def seeds_of(prm: dict, P: dict, roles=None) -> dict:
+    """Base roles keep the seed of resynth.render; extra roles (duration split, 12 October 2026) get seedBase + 100 + i."""
+    order = sorted(prm["voices"])
+    roles = list(roles or ROLES)
+    return {r: P["render"]["seedBase"] + (order.index(r) if r in order else 100 + i) for i, r in enumerate(roles)}
+
+
+def base_role(r: str) -> str:
+    return r[:-5] if r.endswith("Short") else r
+
+
+# ---------------------------------------------------------------- render of the stem (12 October 2026)
+
+def render_dry(voices: dict, notes: dict, P: dict, n: int, seeds: dict) -> np.ndarray:
+    """Sum of the three tonal voices, mono, no effects. FR : rendu sec des trois voix."""
+    x = np.zeros(n, np.float32)
+    for r in notes:
+        if notes.get(r) and not voices[r].get("mute"):
+            x += sms.render_role(voices[r], notes[r], P, n, seeds[r], 0.0)
+    return x
+
+
+def apply_fx(dry: np.ndarray, fx: dict, score: dict, P: dict, n: int, stages: dict | None = None) -> np.ndarray:
+    """Residual bed, per-bar eq and automation exactly as resynth.render does for the stem (mono, before stereo)."""
+    st = {"residual": True, "eq": True, "automation": True, **(stages or {})}
+    sr = P["sampleRate"]
+    if fx.get("residualP") or fx.get("automationP"):  # 12 October 2026: residual and automation settings of this candidate
+        P = RS.merge(copy.deepcopy(P), {"residual": fx.get("residualP") or {}, "automation": fx.get("automationP") or {}})
+    au = score["automation"]
+    t0 = score["tempo"]["t0"]
+    x = dry_shaped(dry, fx, sr)
+    if st["residual"] and fx.get("residual"):
+        lane = au["stems"].get("other") if au.get("stems") else None
+        seed = P["render"]["seedBase"] + 500 + RS.STEMS.index("other")
+        if fx.get("bed"):  # 13 October 2026: steady sine-cloud bed (render_residual_steady) instead of random-phase noise
+            x = x + render_residual_steady(fx["residual"], n, sr, P, lane, au["hopS"], seed, fx["bed"], t0)
+        else:
+            x = x + RS.render_residual(fx["residual"], n, sr, P, lane, au["hopS"], seed, 1.0, t0)
+    if st["eq"] and fx.get("eq"):
+        Pe = P if fx.get("rampS") is None else RS.merge(copy.deepcopy(P), {"eq": {"rampS": fx["rampS"]}})
+        x = RS.apply_eq(x, fx["eq"], sr, Pe, 1.0, t0)
+    if st["automation"] and fx.get("automation") and au["stems"].get("other"):
+        xc = fx.get("automationCrossoverHz")
+        if xc:  # 13 October 2026: gain riding above a crossover only; the low band keeps its own (eq) level
+            from scipy.signal import butter, sosfiltfilt
+            lo = sosfiltfilt(butter(4, xc, "low", fs=sr, output="sos"), x).astype(np.float32)
+            x = lo + RS.apply_automation(x - lo, au["stems"]["other"], au["hopS"], au["windowS"], sr, P)
+        else:
+            x = RS.apply_automation(x, au["stems"]["other"], au["hopS"], au["windowS"], sr, P)
+    if st.get("eqPost", True) and fx.get("eqPost"):  # 12 October 2026: second eq after the automation (dB domain)
+        Pe = P if fx.get("rampS") is None else RS.merge(copy.deepcopy(P), {"eq": {"rampS": fx["rampS"]}})
+        x = RS.apply_eq(x, fx["eqPost"], sr, Pe, 1.0, t0)
+    return x
+
+
+# 13 October 2026: settings of the steady residual bed (the interface). FR : reglages du lit de residu stable.
+BED_STEADY = {"_doc": "13 October 2026: residual bed rebuilt as a cloud of fixed sines (one every spacingBins bins of an "
+                      "nFft grid, frequency jittered by up to jitterBins of a bin, random phase) whose amplitudes follow "
+                      "the measured band table and the lane, instead of random-phase STFT noise. A random bed adds its own "
+                      "frame-to-frame power scatter on top of the reference's; a steady bed only carries the table level.",
+              "nFft": 4096, "spacingBins": 3, "jitterBins": 0.25, "fMinHz": 20.0, "chunk": 4096, "levelDb": -6.02}  # levelDb: measured gap to resynth.render_residual on a flat table (13 October 2026: -6.0 to -6.2 dB above 150 Hz), so marginDb keeps its meaning
+
+
+def render_residual_steady(res: dict, n: int, sr: int, P: dict, lane: list | None, hop_s: float, seed: int,
+                           B: dict | None = None, t0: float = 0.0) -> np.ndarray:
+    """13 October 2026: same table and lane as resynth.render_residual, synthesised additively. Sine k carries the power
+    of spacingBins bins of the measurement grid: a white noise of per-bin power p over spacingBins bins equals a sine of
+    amplitude sqrt(4 * M * p / (N * sum(w^2))), M bins of the N-point grid per sine (Parseval on the windowed frame).
+    FR : meme table et meme enveloppe, rendues par un nuage de sinus fixes au lieu d'un bruit a phase aleatoire."""
+    B = {**BED_STEADY, **(B if isinstance(B, dict) else {})}
+    R = P["residual"]
+    nf, hop = res["nFft"], res["hop"]
+    frames = n // hop + 1
+    times = np.arange(frames) * hop / sr
+    rng = np.random.default_rng(seed)
+    df = sr / B["nFft"]
+    k = np.arange(int(B["fMinHz"] / df) + 1, int(0.5 * sr / df) - 2, B["spacingBins"]).astype(np.float64)
+    f = (k + rng.uniform(-B["jitterBins"], B["jitterBins"], len(k))) * df
+    ph = rng.uniform(0, 2 * np.pi, len(k))
+    lc, lf = np.log2(res["centresHz"]), np.log2(f)
+    Pw = np.zeros((len(f), frames))
+    for sec in res["sections"]:
+        m = (times >= sec["start"]) & (times < sec["end"])
+        if m.any():
+            Pw[:, m] = (10 ** (np.interp(lf, lc, sec["bandsDb"]) / 10.0))[:, None]
+    if lane is not None and R["followLane"]:
+        lv = np.asarray(lane, np.float64)
+        g = np.interp(times, np.arange(len(lv)) * hop_s, lv)
+        for sec in res["sections"]:
+            m = (times >= sec["start"]) & (times < sec["end"])
+            if m.any():
+                lin = 10 ** (g[m] / 10.0)
+                Pw[:, m] *= (lin / (lin.mean() + 1e-30))[None, :]
+    w = np.hanning(nf + 1)[:-1]
+    # Per-bin power of the measurement grid (nFft nf) to sine amplitude, with spacingBins bins of the sine grid (B nFft).
+    spacing_hz = B["spacingBins"] * df
+    bins_per_sine = spacing_hz / (sr / nf)
+    A = np.sqrt(4.0 * bins_per_sine * Pw / (nf * (w ** 2).sum())) * 10 ** (B["levelDb"] / 20.0)
+    y = np.zeros(n, np.float64)
+    fr_s = np.arange(frames) * hop
+    for a in range(0, n, B["chunk"]):
+        b = min(n, a + B["chunk"])
+        t = np.arange(a, b)
+        # amplitude envelopes interpolated per sine at the chunk's samples (linear between table frames)
+        idx = np.clip(np.searchsorted(fr_s, t) - 1, 0, frames - 2)
+        u = (t - fr_s[idx]) / hop
+        amp = A[:, idx] * (1 - u)[None, :] + A[:, idx + 1] * u[None, :]
+        y[a:b] = (amp * np.cos(ph[:, None] + 2 * np.pi * f[:, None] * (t / sr)[None, :])).sum(axis=0)
+    return y.astype(np.float32)
+
+
+def dry_shaped(dry: np.ndarray, fx: dict, sr: int) -> np.ndarray:
+    """13 October 2026: optional zero-phase high-pass of the tonal render (fx.dryHighpassHz): below it the stem is left
+    to the steady bed, whose level is the measured table, instead of tonal partials that beat on their own.
+    FR : passe-haut optionnel du rendu tonal, le grave est laisse au lit stable."""
+    hp = fx.get("dryHighpassHz")
+    if not hp:
+        return dry.copy()
+    from scipy.signal import butter, sosfiltfilt
+    return sosfiltfilt(butter(4, hp, "high", fs=sr, output="sos"), dry).astype(np.float32)
+
+
+def notes_from_score(score: dict) -> dict:
+    return {r: [dict(nn) for nn in score["voices"].get(r, {}).get("notes", [])] for r in ROLES}
+
+
+def tf_score(ref: np.ndarray, ours: np.ndarray, sr: int, C=None) -> float:
+    C = C or critic()
+    return float(C.compare(ref, ours, sr)["score"])
+
+
+# ---------------------------------------------------------------- fitting of timbres and fx (12 October 2026)
+
+def fit_timbres(notes: dict, ctx: dict, dev: bool = True, dev_resume: bool = False, rounds: int | None = None,
+                calib_rounds: int | None = None, P_over: dict | None = None) -> tuple[dict, dict, dict]:
+    """sms tables for the three voices (analyse_stem), then per-note dev tables (eventdev.fit_stem).
+    Returns (voices, notes with dev, info). FR : tables de timbre puis ecarts par note."""
+    from .. import eventdev
+    P = RS.merge(copy.deepcopy(ctx["P"]), P_over or {})
+    for r in notes:  # 12 October 2026: a split role inherits its register role's analysis settings
+        if r != base_role(r) and base_role(r) in P["sms"]["roleSettings"]:
+            P["sms"]["roleSettings"].setdefault(r, dict(P["sms"]["roleSettings"][base_role(r)]))
+    if calib_rounds is not None:
+        P["sms"].setdefault("calibrationRoundsByStem", {})["other"] = calib_rounds
+    ev = {r: [dict(nn, i=j) for j, nn in enumerate(notes[r])] for r in notes if notes.get(r)}
+    if not dev_resume:
+        for r in ev:
+            for e in ev[r]:
+                e.pop("dev", None)
+    job = {"stem": "other", "P": P, "x": ctx["ref"], "events": ev, "kinds": {r: "tonal" for r in ev}}
+    res = sms.analyse_stem(job)
+    voices = copy.deepcopy(ctx["prm"]["voices"])
+    for r, sp in res["specs"].items():
+        voices[r] = sp
+    info = {"calibration": res["calibration"]}
+    if dev:
+        if rounds is not None:
+            P["eventDev"].setdefault("stemSettings", {}).setdefault("other", {})["rounds"] = rounds
+        if dev_resume:
+            P["eventDev"]["resume"] = True
+        dj = {"stem": "other", "P": P, "x": ctx["ref"], "n": ctx["n"], "events": ev, "specs": {r: voices[r] for r in ev},
+              "seeds": seeds_of(ctx["prm"], P, list(ev))}
+        dres = eventdev.fit_stem(dj)
+        info["dev"] = dres["history"]
+        for r, rows in dres["events"].items():
+            for e, row in zip(ev[r], rows):
+                e["dev"] = row["dev"]
+    out = {r: [{k: v for k, v in e.items() if k != "i"} for e in ev.get(r, [])] for r in notes}
+    return voices, out, info
+
+
+FX_SPAN_RAMP_S = {"bar": None, "half": 0.1, "beat": 0.05}  # 12 October 2026: eq crossfade per span size
+
+
+def fx_spans(score: dict, P: dict, kind: str) -> list:
+    """12 October 2026: spans of the residual and eq tables: bar (as resynth), half bar or beat (the musical grid;
+    measured on V_001: bar 95.66, half 95.98, beat 96.37). Never finer than a beat: below the grid a table per span
+    would turn into a vocoder of the reference. FR : spans du residu et de l'egaliseur, jamais plus fin que le temps."""
+    if kind == "bar":
+        return RS.fx_spans(score, P)
+    bt = [b["t"] for b in score["tempo"]["beats"]]
+    if kind == "half":
+        bt = bt[::2]
+    ed = [0.0] + bt + [score["tempo"]["duration"]]
+    return [(a, b) for a, b in zip(ed[:-1], ed[1:]) if b - a > 0.05]
+
+
+EQ_DB = {"nFft": 4096, "hop": 1024, "floorDb": 60.0, "maxDb": 24.0}  # 12 October 2026: dB-domain eq settings
+
+
+def measure_eq_db(ref: np.ndarray, ours: np.ndarray, spans: list, sr: int, P: dict, E: dict | None = None) -> dict:
+    """12 October 2026: per-span third-octave eq measured in the dB domain: the weighted median over frames of
+    (reference dB - ours dB), weights max(ref, ours) above a floor 60 dB under the reference peak (as the critic weighs
+    its error). resynth.measure_eq matches mean POWER, which leaves an on-off note pattern under in dB over most frames;
+    the median of the dB difference minimises the mean absolute dB error instead (measured on V_008: 96.81 to 97.08,
+    and 97.19 with the second pass after the automation). Same table format as resynth.measure_eq.
+    FR : egaliseur mesure en dB (mediane ponderee de l'ecart par trame), au lieu du rapport des puissances moyennes."""
+    import librosa
+    E = {**EQ_DB, **(E or {})}
+    c = RS.band_centres(P, sr)
+    W = RS._band_weights(np.fft.rfftfreq(E["nFft"], 1.0 / sr), c)
+
+    def bdb(x):
+        return 10 * np.log10(W @ (np.abs(librosa.stft(np.asarray(x, np.float32), n_fft=E["nFft"], hop_length=E["hop"])) ** 2) + 1e-20)
+    m = min(len(ref), len(ours))
+    r, o = bdb(ref[:m]), bdb(ours[:m])
+    fl = r.max() - E["floorDb"]
+    r2, o2 = np.maximum(r, fl), np.maximum(o, fl)
+    w = np.maximum(r2, o2) - fl
+    dd = r2 - o2
+    times = np.arange(r.shape[1]) * E["hop"] / sr
+    rows = []
+    for a, b in spans:
+        fm = (times >= a) & (times < b)
+        g = np.zeros(len(c))
+        if fm.any():
+            for i in range(len(c)):
+                ww, v = w[i, fm], dd[i, fm]
+                if ww.sum() <= 0:
+                    continue
+                o_ = np.argsort(v)
+                cw = np.cumsum(ww[o_])
+                g[i] = v[o_][min(len(v) - 1, int(np.searchsorted(cw, 0.5 * cw[-1])))]
+        rows.append({"start": round(a, 4), "end": round(b, 4), "gainsDb": [round(float(q), 2) for q in np.clip(g, -E["maxDb"], E["maxDb"])]})
+    return {"centresHz": [round(float(q), 2) for q in c], "sections": rows, "mode": "dbMedian"}
+
+
+def fit_fx(dry: np.ndarray, ctx: dict, score: dict, span: str = "bar", eq_mode: str = "power", eq_post: bool = False,
+           residual_margin_db: float | None = None, automation_smooth: int | None = None, bed=None,
+           automation_crossover_hz: float | None = None, dry_highpass_hz: float | None = None) -> dict:
+    """Residual bed measured on the dry stem, then the eq on dry plus bed, automation and stereo, as
+    ResynthMusic.fit_stem_fx does for every stem; span = bar, half or beat. FR : residu, egaliseur, automation, stereo."""
+    P, sr, n = ctx["P"], ctx["sr"], ctx["n"]
+    res_p = None
+    if residual_margin_db is not None:
+        # 12 October 2026: a bed larger than the measured deficit (marginDb < 0) leaves a noise floor under the notes
+        # that the dB eq then levels; measured on V_017: 0 dB 97.40, -3 dB 97.72, -6 dB 97.75, -10 dB 97.76.
+        # FR : un lit de bruit plus fort que le manque mesure, nivele ensuite par l'egaliseur en dB.
+        res_p = {"marginDb": float(residual_margin_db)}
+        P = RS.merge(copy.deepcopy(P), {"residual": res_p})
+    spans = fx_spans(score, P, span)
+    pre = {"dryHighpassHz": float(dry_highpass_hz)} if dry_highpass_hz else {}
+    fx = {**pre, "residual": RS.measure_residual(ctx["ref"], dry_shaped(dry, pre, sr), spans, sr, P, P["residual"].get("sectionGateDb", {}).get("other")),
+          "automation": True, "span": span, "rampS": FX_SPAN_RAMP_S[span]}
+    if res_p:
+        fx["residualP"] = res_p
+    if automation_crossover_hz:  # 13 October 2026: see apply_fx
+        fx["automationCrossoverHz"] = float(automation_crossover_hz)
+    if bed:  # 13 October 2026: steady sine-cloud bed (True or a dict over BED_STEADY)
+        fx["bed"] = {"mode": "steady", **(bed if isinstance(bed, dict) else {})}
+    if automation_smooth is not None:
+        # 12 October 2026: gain riding without smoothing follows the 50 ms lane closer (V_018: 2 frames 97.75, 1 frame
+        # 97.89, 4 frames 97.71). FR : automation sans lissage.
+        fx["automationP"] = {"smoothFrames": int(automation_smooth)}
+    bed = apply_fx(dry, fx, score, P, n, {"eq": False, "automation": False})
+    fx["eq"] = measure_eq_db(ctx["ref"], bed, spans, sr, P) if eq_mode == "db" else RS.measure_eq(ctx["ref"], bed, spans, sr, P)
+    if fx["rampS"] is None:
+        fx.pop("rampS")
+    if eq_post:
+        x = apply_fx(dry, fx, score, P, n)
+        fx["eqPost"] = measure_eq_db(ctx["ref"], x, spans, sr, P)
+    fx["stereo"] = RS.measure_stereo(ctx["refStereo"], sr, P)
+    return fx
+
+
+# ---------------------------------------------------------------- transcription (12 October 2026)
+# CQT of the reference stem; per-register templates learned from isolated notes (frames where one pitch dominates the
+# harmonic NMF of transcribe.py by isoDb and holds for isoMinMs), averaged on a pitch-relative axis and shifted to every
+# MIDI pitch of the register (shift-invariant source-filter view); NMF with those templates fixed plus a few free noise
+# components (KL multiplicative updates); note tracking with hysteresis; onset-aligned retiming on the stem's detected
+# onsets; pyin on the monophonic segments refines pitch and cents. Numbers only.
+# FR : transcription par NMF sur CQT a gabarits appris sur des notes isolees, pyin sur les segments monophoniques,
+# recalage des attaques sur les attaques detectees de la piste.
+
+TRANSCRIBE_DEFAULTS = {
+    "_doc": "12 October 2026: settings of the other-stem re-transcription (zrmd/audio/stems/other.py).",
+    "hop": 256, "binsPerOctave": 36, "fminNote": "C2", "octaves": 7, "minMidi": 36, "maxMidi": 96, "hpssMargin": 1.0,
+    "isoDb": 9.0, "isoMinMs": 60.0, "isoMinFrames": 20, "registerOct": 1, "templateBins": 180, "noiseComponents": 4,
+    "iterations": 120, "noiseMode": "smooth", "templateMask": "harmonic", "maskBins": 1.5, "maskHarmonics": 24, "sparsity": 0.0, "medianFrames": 3, "onDbBelowMax": 30.0, "offDbBelowMax": 36.0,
+    "frameRelDb": 18.0, "minNoteMs": 70.0, "splitRiseDb": 5.0, "splitWindowMs": 70.0, "onsetDelta": 0.04,
+    "onsetMatchMs": 50.0, "retime": True, "retimeMaxMs": 50.0, "endAlign": True, "ghostDb": 12.0,
+    "ghostIntervals": [12, 19, 24], "neighborDb": 10.0, "neighborIntervals": [1, 2], "fundamentalMinDb": -18.0,
+    "pyin": True, "pyinMinMs": 150.0, "pyinProb": 0.5, "pyinMaxSemi": 0.75, "pyinFrame": 4096, "pyinHop": 256,
+    "voiceSplitsMidi": [60, 72], "levelOffsetDb": -3.01, "fxSpan": "beat", "durSplitS": 0.25, "eqMode": "db", "eqPost": True, "residualMarginDb": -6.0, "automationSmoothFrames": 1,
+}
+
+
+def _db(a, floor=-120.0):
+    return np.maximum(20 * np.log10(np.maximum(np.asarray(a, np.float64), 1e-12)), floor)
+
+
+def _cqt(x: np.ndarray, sr: int, T: dict) -> tuple[np.ndarray, float]:
+    import librosa
+    fmin = float(librosa.note_to_hz(T["fminNote"]))
+    n_bins = T["binsPerOctave"] * T["octaves"]
+    V = np.abs(librosa.cqt(np.asarray(x, np.float32), sr=sr, hop_length=T["hop"], fmin=fmin, n_bins=n_bins,
+                           bins_per_octave=T["binsPerOctave"]))
+    t = np.arange(int(sr * 1.0)) / sr
+    C = np.abs(librosa.cqt(np.sin(2 * np.pi * 440.0 * t).astype(np.float32), sr=sr, hop_length=T["hop"], fmin=fmin,
+                           n_bins=n_bins, bins_per_octave=T["binsPerOctave"]))
+    calib = float(C[:, C.shape[1] // 4: 3 * C.shape[1] // 4].max(axis=0).mean())  # peak bin of a unit sine
+    return V, calib
+
+
+def _harmonic_dict(T: dict, pitches: list[int]) -> np.ndarray:
+    import librosa
+    bpo = T["binsPerOctave"]
+    nb = bpo * T["octaves"]
+    m0 = librosa.note_to_midi(T["fminNote"])
+    b = np.arange(nb)
+    W = np.zeros((nb, len(pitches)))
+    for j, p in enumerate(pitches):
+        for h in range(1, 11):
+            c = (p - m0) * bpo / 12.0 + bpo * math.log2(h)
+            if c > nb - 1:
+                break
+            g = np.exp(-0.5 * ((b - c) / 0.8) ** 2)
+            g[np.abs(b - c) > 1.5] = 0.0
+            W[:, j] += h ** -0.8 * g
+    return W / (W.sum(axis=0, keepdims=True) + 1e-12)
+
+
+def _nmf(V: np.ndarray, W: np.ndarray, n_fixed: int, iters: int, sparsity: float, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """KL multiplicative updates; the first n_fixed columns of W stay fixed (learned templates), the rest are free."""
+    rng = np.random.default_rng(seed)
+    W = W.copy()
+    H = np.full((W.shape[1], V.shape[1]), float(V.mean()) + 1e-9) * (0.5 + rng.random((W.shape[1], 1)))
+    eps = 1e-12
+    for _ in range(iters):
+        R = V / (W @ H + eps)
+        H *= (W.T @ R) / (W.sum(axis=0)[:, None] + sparsity + eps)
+        if W.shape[1] > n_fixed:
+            R = V / (W @ H + eps)
+            Wf = W[:, n_fixed:]
+            Wf *= (R @ H[n_fixed:].T) / (H[n_fixed:].sum(axis=1)[None, :] + eps)
+            s = Wf.sum(axis=0, keepdims=True) + eps
+            Wf /= s
+            H[n_fixed:] *= s.T
+            W[:, n_fixed:] = Wf
+    return W, H
+
+
+def learn_templates(V: np.ndarray, T: dict) -> tuple[np.ndarray, list[int], dict]:
+    """Per-register spectral templates from isolated notes. Isolated frame: the harmonic NMF activation of one pitch is
+    at least isoDb above every other pitch that is not its octave or twelfth ghost, for isoMinMs in a row. The CQT
+    frame (normalised) is read on a pitch-relative axis (bin 0 = fundamental); the median per register is the
+    template, shifted to every pitch of the register. FR : gabarits par registre appris sur les trames isolees."""
+    import librosa
+    bpo = T["binsPerOctave"]
+    nb = V.shape[0]
+    m0 = librosa.note_to_midi(T["fminNote"])
+    pitches = list(range(T["minMidi"], T["maxMidi"] + 1))
+    W0 = _harmonic_dict(T, pitches)
+    _, H = _nmf(V, np.concatenate([W0, np.ones((nb, 1)) / nb], axis=1), len(pitches), 60, 0.0)
+    A = _db(H[:len(pitches)])
+    order = np.argsort(-A, axis=0)
+    top, second = order[0], order[1]
+    gap = A[top, np.arange(A.shape[1])] - A[second, np.arange(A.shape[1])]
+    # a second pitch an octave, twelfth or two octaves above the top does not break isolation
+    iv = np.asarray(pitches)[second] - np.asarray(pitches)[top]
+    third = A[order[2], np.arange(A.shape[1])]
+    gap = np.where(np.isin(iv, [12, 19, 24]), A[top, np.arange(A.shape[1])] - third, gap)
+    loud = A[top, np.arange(A.shape[1])] >= A.max() - 40.0
+    iso = (gap >= T["isoDb"]) & loud
+    min_f = max(1, int(T["isoMinMs"] / 1000.0 * T.get("sr", 44100) / T["hop"]))
+    frames = []
+    i = 0
+    n = len(iso)
+    while i < n:
+        if iso[i]:
+            j = i
+            while j < n and iso[j] and top[j] == top[i]:
+                j += 1
+            if j - i >= min_f:
+                frames += [(k, pitches[top[i]]) for k in range(i, j)]
+            i = j
+        else:
+            i += 1
+    L = T["templateBins"]
+    regs: dict = {}
+    for k, p in frames:
+        f0b = int(round((p - m0) * bpo / 12.0))
+        col = V[f0b: f0b + L, k]
+        if len(col) < bpo:
+            continue
+        col = np.pad(col, (0, L - len(col)), constant_values=np.nan)
+        col = col / (np.nansum(col) + 1e-12)
+        regs.setdefault((p - T["minMidi"]) // (12 * T["registerOct"]), []).append(col)
+    tmpl = {}
+    for r, cols in regs.items():
+        if len(cols) >= T["isoMinFrames"]:
+            tmpl[r] = np.nan_to_num(np.nanmedian(np.asarray(cols), axis=0), nan=0.0)
+    W = np.zeros((nb, len(pitches)))
+    used = {}
+    for j, p in enumerate(pitches):
+        r = (p - T["minMidi"]) // (12 * T["registerOct"])
+        if not tmpl:
+            W[:, j] = W0[:, j]
+            used[p] = "harmonic"
+            continue
+        rr = min(tmpl, key=lambda q: abs(q - r))
+        f0b = int(round((p - m0) * bpo / 12.0))
+        k = min(L, nb - f0b)
+        W[f0b:f0b + k, j] = tmpl[rr][:k]
+        if T["templateMask"] == "harmonic":
+            # 12 October 2026: keep only the learned amplitudes at harmonic positions (h * f0 within maskBins): a frame
+            # called isolated inside a chord still carries its neighbours at +4 and +7 semitones, and an unmasked
+            # template then explains a whole chord with one pitch (selftest). FR : gabarit masque aux harmoniques.
+            rel = np.arange(nb)[:, None] - f0b - bpo * np.log2(np.arange(1, T["maskHarmonics"] + 1))[None, :]
+            W[:, j] *= (np.abs(rel).min(axis=1) <= T["maskBins"])
+        # 12 October 2026: below the fundamental a template is zero (a learned frame there holds neighbours, not the note)
+        used[p] = f"register{rr}"
+    W /= W.sum(axis=0, keepdims=True) + 1e-12
+    info = {"isolatedFrames": len(frames), "registers": {int(r): len(c) for r, c in regs.items()}, "learned": sorted(int(r) for r in tmpl)}
+    return W, pitches, info
+
+
+def track_notes(V: np.ndarray, W: np.ndarray, pitches: list[int], calib: float, onsets: np.ndarray, sr: int, T: dict) -> tuple[list[dict], dict]:
+    from scipy import signal
+    k = len(pitches)
+    nb = V.shape[0]
+    if T["noiseMode"] == "free":
+        rng = np.random.default_rng(3)
+        Wn = rng.random((nb, T["noiseComponents"]))
+        Wn /= Wn.sum(axis=0, keepdims=True)
+        Wf, H = _nmf(V, np.concatenate([W, Wn], axis=1), k, T["iterations"], T["sparsity"])
+    else:
+        # 12 October 2026: fixed smooth noise components (wide Gaussians on the bin axis): free ones learn harmonic
+        # shapes and steal notes (selftest noise share 0.52, recall 0.18). FR : bruit lisse fixe, il ne vole plus les notes.
+        b = np.arange(nb)[:, None]
+        cen = np.linspace(0, nb - 1, T["noiseComponents"])[None, :]
+        Wn = np.exp(-0.5 * ((b - cen) / (nb / T["noiseComponents"])) ** 2)
+        Wn /= Wn.sum(axis=0, keepdims=True)
+        Wf, H = _nmf(V, np.concatenate([W, Wn], axis=1), k + T["noiseComponents"], T["iterations"], T["sparsity"])
+    A = H[:k] / calib
+    if T["medianFrames"] > 1:
+        A = signal.medfilt(A, kernel_size=[1, T["medianFrames"]])
+    Adb = _db(A)
+    top = float(Adb.max())
+    Adb = np.where(Adb >= Adb.max(axis=0, keepdims=True) - T["frameRelDb"], Adb, -120.0)
+    hop_s = T["hop"] / sr
+    on_thr, off_thr = top - T["onDbBelowMax"], top - T["offDbBelowMax"]
+    min_f = max(1, int(T["minNoteMs"] / 1000 / hop_s))
+    win = max(1, int(T["splitWindowMs"] / 1000 / hop_s))
+    match = T["onsetMatchMs"] / 1000.0
+    raw = []
+    for j in range(k):
+        a = Adb[j]
+        active, start = False, 0
+        for i in range(len(a) + 1):
+            v = a[i] if i < len(a) else -999.0
+            if not active and v >= on_thr:
+                active, start = True, i
+            elif active and v < off_thr:
+                active = False
+                if i - start >= min_f:
+                    raw.append([j, start, i])
+            elif active and i - start >= max(min_f, 2 * win) and v - a[max(start, i - win):i].min() >= T["splitRiseDb"] \
+                    and onsets.size and np.min(np.abs(onsets - i * hop_s)) <= match and a[i - 1] < v:
+                raw.append([j, start, i])
+                start = i
+    import librosa
+    m0 = librosa.note_to_midi(T["fminNote"])
+    Vdb = _db(V / calib)
+    out = []
+    for j, a, b in raw:
+        fb = int(round((pitches[j] - m0) * T["binsPerOctave"] / 12.0))
+        f_db = float(np.median(Vdb[max(0, fb - 1):fb + 2, a:b].max(axis=0)))
+        if f_db < float(Adb[j, a:b].max()) + T["fundamentalMinDb"]:
+            continue
+        out.append({"t": a * hop_s, "dur": (b - a) * hop_s, "midi": int(pitches[j]),
+                    "levelDb": round(float(Adb[j, a:b].max()) + T["levelOffsetDb"], 2), "_a": a, "_b": b})
+    keep = []
+    for n1 in out:
+        ghost = False
+        for n0 in out:
+            if n1 is n0:
+                continue
+            iv = n1["midi"] - n0["midi"]
+            if iv in T["ghostIntervals"]:
+                need = T["ghostDb"]
+            elif abs(iv) in T["neighborIntervals"]:
+                need = T["neighborDb"]
+            else:
+                continue
+            ov = min(n1["_b"], n0["_b"]) - max(n1["_a"], n0["_a"])
+            if ov >= 0.8 * (n1["_b"] - n1["_a"]) and n0["levelDb"] - n1["levelDb"] >= need:
+                ghost = True
+                break
+        if not ghost:
+            keep.append(n1)
+    for n_ in keep:
+        n_.pop("_a")
+        n_.pop("_b")
+    noise = float((Wf[:, k:] @ H[k:]).sum() / ((Wf @ H).sum() + 1e-12))
+    return keep, {"rawNotes": len(raw), "notes": len(keep), "noiseShare": round(noise, 4)}
+
+
+def retime(notes: list[dict], onsets: np.ndarray, T: dict) -> int:
+    """Onset-aligned retiming: each note start moves to the nearest detected onset of the stem within retimeMaxMs;
+    with endAlign the end keeps its time (the duration absorbs the move). Returns the count moved."""
+    moved = 0
+    if not onsets.size:
+        return 0
+    for n_ in notes:
+        d = onsets - n_["t"]
+        i = int(np.argmin(np.abs(d)))
+        if abs(d[i]) <= T["retimeMaxMs"] / 1000.0 and abs(d[i]) > 1e-4:
+            end = n_["t"] + n_["dur"]
+            n_["t"] = float(onsets[i])
+            if T["endAlign"]:
+                n_["dur"] = max(0.03, end - n_["t"])
+            moved += 1
+    return moved
+
+
+def pyin_refine(x: np.ndarray, sr: int, notes: list[dict], T: dict) -> dict:
+    """pyin on the monophonic segments: a note that overlaps no other note for at least pyinMinMs gets the median
+    pyin pitch of its confident frames; within pyinMaxSemi of the transcribed pitch it sets midi and cents.
+    FR : pyin sur les segments monophoniques."""
+    import librosa
+    srt = sorted(notes, key=lambda q: q["t"])
+    changed, tried = 0, 0
+    for n_ in srt:
+        a, b = n_["t"], n_["t"] + n_["dur"]
+        solo_a, solo_b = a, b
+        for o in srt:
+            if o is n_:
+                continue
+            oa, ob = o["t"], o["t"] + o["dur"]
+            if ob <= a or oa >= b:
+                continue
+            # cut the solo span to the part not covered by o
+            if oa <= solo_a:
+                solo_a = max(solo_a, ob)
+            elif ob >= solo_b:
+                solo_b = min(solo_b, oa)
+            else:
+                solo_b = min(solo_b, oa)
+        if solo_b - solo_a < T["pyinMinMs"] / 1000.0:
+            continue
+        tried += 1
+        f = sms.midi_hz(n_["midi"])
+        seg = x[int(solo_a * sr): int(solo_b * sr)].astype(np.float32)
+        if len(seg) < T["pyinFrame"]:
+            continue
+        f0, _v, prob = librosa.pyin(seg, fmin=f * 2 ** (-2 / 12), fmax=f * 2 ** (2 / 12), sr=sr,
+                                    frame_length=T["pyinFrame"], hop_length=T["pyinHop"])
+        ok = np.isfinite(f0) & (prob >= T["pyinProb"])
+        if ok.sum() < 3:
+            continue
+        m = float(np.median(12 * np.log2(f0[ok] / 440.0) + 69))
+        if abs(m - n_["midi"]) <= T["pyinMaxSemi"]:
+            n_["cents"] = round(100 * (m - n_["midi"]), 1)
+            changed += 1
+        elif abs(m - round(m)) < 0.3 and abs(round(m) - n_["midi"]) == 1:
+            n_["midi"] = int(round(m))
+            n_["cents"] = round(100 * (m - n_["midi"]), 1)
+            changed += 1
+    return {"tried": tried, "changed": changed}
+
+
+def transcribe_other(x: np.ndarray, sr: int, T: dict) -> tuple[dict, dict]:
+    """The whole re-transcription: returns ({role: notes}, info)."""
+    import librosa
+    harm = librosa.effects.harmonic(np.asarray(x, np.float32), margin=T["hpssMargin"]) if T["hpssMargin"] else x
+    V, calib = _cqt(harm, sr, T)
+    env = librosa.onset.onset_strength(y=np.asarray(x, np.float32), sr=sr, hop_length=T["hop"])
+    onsets = librosa.onset.onset_detect(onset_envelope=env, sr=sr, hop_length=T["hop"], units="time", delta=T["onsetDelta"], backtrack=True)
+    W, pitches, tinfo = learn_templates(V, {**T, "sr": sr})
+    notes, ninfo = track_notes(V, W, pitches, calib, onsets, sr, T)
+    moved = retime(notes, onsets, T) if T["retime"] else 0
+    pinfo = pyin_refine(x, sr, notes, T) if T["pyin"] else {}
+    for n_ in notes:
+        n_["t"] = round(n_["t"], 5)
+        n_["dur"] = round(n_["dur"], 5)
+    edges = [-1] + list(T["voiceSplitsMidi"]) + [1000]
+    roles = {r: [] for r in ROLES}
+    for n_ in sorted(notes, key=lambda q: (q["t"], q["midi"])):
+        for r, lo, hi in zip(ROLES, edges[:-1], edges[1:]):
+            if lo < n_["midi"] <= hi:
+                # 12 October 2026: optional duration split, short notes (plucks) get their own timbre table
+                if T.get("durSplitS") and n_["dur"] < T["durSplitS"]:
+                    roles.setdefault(r + "Short", []).append(n_)
+                else:
+                    roles[r].append(n_)
+                break
+    info = {"templates": tinfo, "tracking": ninfo, "onsets": int(len(onsets)), "retimed": moved, "pyin": pinfo,
+            "perRole": {r: len(v) for r, v in roles.items()}}
+    return roles, info

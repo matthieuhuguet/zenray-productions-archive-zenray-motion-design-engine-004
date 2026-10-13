@@ -1,0 +1,58 @@
+# 12 October 2026: two-way validation of the glyph comparator (zrmd.analyze.fontmatch).
+# Green case: a line rendered with a known base font (Manrope 500, +0.02 em) must come back first with the
+#   right weight (within 25) and letter-spacing (within 0.01 em).
+# Red case: the same comparator must NOT rank another font first, and a different font image (Poppins 500)
+#   must not be claimed by Manrope.
+# Runs under pytest, or directly: python -I tests/test_fontmatch.py
+from __future__ import annotations
+
+import json
+import sys
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from zrmd.analyze.fontmatch import load_index, match_font  # noqa: E402
+from zrmd.analyze.typography import render_line  # noqa: E402
+
+TEXT = "Beautifully powerful"
+
+
+def synth(family: str, weight: float, tracking: float, size: float = 84.0) -> np.ndarray:
+    """Video-like target: rendered line, light gray on near black, slight blur, inside a wider dark frame."""
+    f = next(e["file"] for e in load_index([family]) if "italic" not in e["file"].lower())
+    ink = render_line(TEXT, f, size, weight, tracking_em=tracking)
+    img = (12 + ink * 205).astype(np.float32)
+    img = cv2.GaussianBlur(img, (0, 0), 0.7)
+    frame = np.full((img.shape[0] + 80, img.shape[1] + 200), 12, np.float32)
+    frame[40:40 + img.shape[0], 100:100 + img.shape[1]] = img
+    return frame.astype(np.uint8)
+
+
+def test_finds_known_font():
+    ranked = match_font(synth("Manrope", 500, 0.02), TEXT, top=10)
+    top = ranked[0]
+    print(json.dumps([{k: r[k] for k in ("family", "weight", "tracking_em", "score")} for r in ranked[:5]]))
+    assert top["family"] == "Manrope", top
+    assert abs(top["weight"] - 500) <= 25, top
+    assert abs(top["tracking_em"] - 0.02) <= 0.01 + 1e-9, top
+    # Margin: the runner-up from another family scores clearly worse.
+    other = next(r for r in ranked if r["family"] != "Manrope")
+    assert other["score"] > top["score"] * 1.3, (top, other)
+
+
+def test_rejects_other_font():
+    ranked = match_font(synth("Poppins", 500, 0.0), TEXT, top=0)
+    assert ranked[0]["family"] == "Poppins", ranked[0]
+    manrope = next(r for r in ranked if r["family"] == "Manrope")
+    assert manrope["rank"] > 1 and manrope["score"] > ranked[0]["score"] * 1.3, manrope
+
+
+if __name__ == "__main__":
+    for t in (test_finds_known_font, test_rejects_other_font):
+        t0 = time.time()
+        t()
+        print(f"PASS {t.__name__} {time.time() - t0:.1f}s")

@@ -1,0 +1,306 @@
+# 12 October 2026: task MI-vocals, procedural model of the "vocals" Demucs stem of onekey-pro-2.
+# The score says the stem carries no voice (voicedRatio 0.0, level -68.8 dB): what Demucs left there is leakage of the
+# other instruments plus a breathy bed. The model is therefore a formant pad whose band power is
+#     Ph[b, t] = sum_j 10 ** (gDb[j, span(t), b] / 10) * C_j[b, t] ** (1 + alpha[j, b])
+# where the components C_j are procedural signals only: the score's own four band envelopes (the "breath" bed), the
+# score's vocals automation lane, and the band power of OUR rendered drums, bass and other stems (the leakage, with an
+# optional reverb tail). gDb is one third-octave formant curve per component and per span (section or bar, the same
+# resolution as the bar equaliser of the other stems), alpha a per-band dynamic exponent. The reference stem is only
+# the fitting target, never rendered or copied.
+# Two renderers of Ph: "comb" (default) is a bin-locked partial pad, f0 = sr / hop of the measure grid, quadrature
+# phases, so its third-octave band power is deterministic and reproduces Ph; "noise" is random-phase noise with the
+# same expected power (natural breath, but its own fluctuation costs about 1 point, measured).
+# FR : modele procedural de la piste vocals : fuite de nos propres pistes + nappe de souffle, formants par mesure.
+from __future__ import annotations
+
+import copy
+import math
+
+import numpy as np
+
+# 12 October 2026: the interface (HDA parameters), at most 8 per category, defaults equal the delivered version (V_011).
+DEFAULTS = {
+    "model": {
+        "spanKind": "bar",            # section or bar: one formant curve per component per span
+        "components": ["env", "lane", "drums", "bass", "other"],
+        "tailS": 0.5,                 # reverb tail (exponential decay, s) added as extra components, 0 = none
+        "alpha": True,                # per-band dynamic exponent on each component
+        "iters": 3000,                # Adam steps of the fit
+        "lr": 0.03,
+        "smoothDb": 1e-3,             # smoothing of |dB| in the fit loss (dB^2)
+    },
+    "render": {
+        "mode": "hybrid",             # hybrid (our stems + noise pad + dynamic eq, delivered), comb or noise
+        "calibIters": 8,              # self-calibration passes of the comb against its own target Ph
+        "combStep": 2,                # partial spacing in bins of the measure FFT: 2 (f0 = 2 sr / nFft, measured 99.96 on its target) or 1 (measured 99.59)
+        "minHz": 20.0,                # partials under this are silent
+        "phase": "random",            # comb partial phases: random (frozen noise) or quadrature (pulse train, ploss 0)
+        "seed": 4242,                 # noise mode and random comb phases
+        "noiseNFft": 4096,
+        "noiseHop": 1024,
+        "gainNFft": 4096,             # hybrid mode: STFT of the dynamic gains
+        "gainHop": 1024,
+        "maxGainDb": 40.0,            # hybrid mode: clip of the dynamic gains around their per-band median
+    },
+    # Measure grid: equal to MusicCritic.CFG (nFft, hop, third-octave triangles), so the comb is locked on it.
+    "grid": {"nFft": 4096, "hop": 2048, "fMin": 30.0, "fMax": 16000.0, "bandsPerOct": 3, "floorDb": 60.0, "jndDb": 2.0},
+}
+
+
+def cfg(over: dict | None = None) -> dict:
+    c = copy.deepcopy(DEFAULTS)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict):
+            c.setdefault(k, {}).update(v)
+        else:
+            c[k] = v
+    return c
+
+
+# ---------------------------------------------------------------- measure grid (12 October 2026)
+
+def bands(sr: int, G: dict):
+    c = G["fMin"] * 2 ** (np.arange(0, int(G["bandsPerOct"] * math.log2(G["fMax"] / G["fMin"])) + 1) / G["bandsPerOct"])
+    f = np.fft.rfftfreq(G["nFft"], 1.0 / sr)
+    lf, lc = np.log2(np.maximum(f, 1e-6)), np.log2(c)
+    W = np.maximum(0.0, 1.0 - np.abs(lf[None, :] - lc[:, None]) * G["bandsPerOct"])
+    return c, W
+
+
+def band_power(x: np.ndarray, sr: int, G: dict, W: np.ndarray) -> np.ndarray:
+    """Linear band power [bands, frames], frames centred on m * hop (reflect padding, as the critic)."""
+    n, h = G["nFft"], G["hop"]
+    x = np.pad(np.asarray(x, np.float64), (n // 2, n // 2), mode="reflect")
+    m = 1 + (len(x) - n) // h
+    win = np.hanning(n + 1)[:-1]
+    idx = np.arange(n)[None, :] + h * np.arange(m)[:, None]
+    S = np.abs(np.fft.rfft(x[idx] * win, axis=1)) ** 2
+    return (S @ W.T).T
+
+
+def tf_score(ref_pw: np.ndarray, ours_pw: np.ndarray, G: dict) -> tuple[float, float]:
+    r, o = 10 * np.log10(ref_pw + 1e-20), 10 * np.log10(ours_pw + 1e-20)
+    k = min(r.shape[1], o.shape[1])
+    r, o = r[:, :k], o[:, :k]
+    fl = r.max() - G["floorDb"]
+    r2, o2 = np.maximum(r, fl), np.maximum(o, fl)
+    w = np.maximum(r2, o2) - fl
+    E = float((w * np.abs(o2 - r2)).sum() / (w.sum() + 1e-9) / G["jndDb"])
+    return 100 * 0.99 ** (E * E), E
+
+
+# ---------------------------------------------------------------- components (12 October 2026)
+
+def spans(score: dict, kind: str) -> list[tuple[float, float]]:
+    if kind == "section":
+        return [(s["start"], s["end"]) for s in score["sections"]]
+    bars = [(b["start"], b["end"]) for b in score["tempo"]["bars"]]
+    return [(0.0, bars[0][0])] + bars + [(bars[-1][1], 1e9)]
+
+
+def _tail(X: np.ndarray, tail_s: float, hop_s: float) -> np.ndarray:
+    a = math.exp(-hop_s / tail_s)
+    Y = np.zeros_like(X)
+    acc = np.zeros(X.shape[0])
+    for i in range(X.shape[1]):
+        acc = a * acc + (1 - a) * X[:, i]
+        Y[:, i] = acc
+    return Y
+
+
+def components(score: dict, our_stems: dict, sr: int, n_frames: int, C: dict) -> tuple[list[str], list[np.ndarray], np.ndarray]:
+    """Procedural component band powers [bands, frames], each normalised to unit mean per band."""
+    G = C["grid"]
+    c, W = bands(sr, G)
+    t = np.arange(n_frames) * G["hop"] / sr
+    hop = score["automation"]["hopS"]
+    names, out = [], []
+    for name in C["model"]["components"]:
+        if name == "env":
+            X = np.zeros((len(c), n_frames))
+            for band, curve in score["voices"]["vocals"]["bands"].items():
+                lo, hi = (float(v) for v in band.split("-"))
+                g = np.interp(t, np.arange(len(curve)) * hop, 10 ** (np.asarray(curve) / 10.0))
+                X[(c >= lo) & ((c < hi) | (hi >= 11000))] = g
+        elif name == "lane":
+            lane = np.asarray(score["automation"]["stems"]["vocals"], np.float64)
+            X = np.tile(np.interp(t, np.arange(len(lane)) * hop, 10 ** (lane / 10.0)), (len(c), 1))
+        elif name == "flat":
+            X = np.ones((len(c), n_frames))
+        else:
+            X = band_power(our_stems[name], sr, G, W)[:, :n_frames]
+        names.append(name)
+        out.append(X)
+        if C["model"]["tailS"] and name in ("drums", "bass", "other"):
+            names.append(name + "Tail")
+            out.append(_tail(X, C["model"]["tailS"], G["hop"] / sr))
+    out = [X / (X.mean(axis=1, keepdims=True) + 1e-30) for X in out]
+    return names, out, t
+
+
+# ---------------------------------------------------------------- fit (12 October 2026)
+
+def span_index(t: np.ndarray, sp: list) -> np.ndarray:
+    idx = np.zeros(len(t), int)
+    for i, (a, b) in enumerate(sp):
+        idx[(t >= a) & (t < b)] = i
+    return idx
+
+
+def model_power(gdb: np.ndarray, alpha: np.ndarray, comps: list, idx: np.ndarray) -> np.ndarray:
+    return sum((10 ** (gdb[j][idx].T / 10.0)) * np.exp(np.log(comps[j] + 1e-30) * (1 + alpha[j])[:, None]) for j in range(len(comps)))
+
+
+def fit(ref_pw: np.ndarray, comps: list, idx: np.ndarray, n_spans: int, C: dict, threads: int = 4) -> tuple[np.ndarray, np.ndarray]:
+    """Weighted |dB| fit (the critic's own loss, smoothed) of gDb and alpha by Adam."""
+    import torch
+    torch.set_num_threads(threads)
+    M, G = C["model"], C["grid"]
+    level = 10 * np.log10(ref_pw.mean(axis=1) + 1e-30)  # start each component at the mean level, minus 7 dB
+    L = [torch.log(torch.tensor(X) + 1e-30) for X in comps]
+    r = 10 * torch.log10(torch.tensor(ref_pw) + 1e-20)
+    fl = r.max() - G["floorDb"]
+    r2 = torch.clamp(r, min=fl)
+    g = torch.tensor(np.tile(level - 7.0, (len(comps), n_spans, 1)), dtype=torch.float64, requires_grad=True)
+    a = torch.zeros((len(comps), ref_pw.shape[0]), dtype=torch.float64, requires_grad=True)
+    opt = torch.optim.Adam([g, a] if M["alpha"] else [g], lr=M["lr"] * 10)  # gains in dB: 10x the log10 rate
+    I = torch.tensor(idx).long()
+    for _ in range(M["iters"]):
+        Ph = sum(10 ** (g[j][I].T / 10.0) * torch.exp(L[j] * (1 + a[j])[:, None]) for j in range(len(comps)))
+        o2 = torch.clamp(10 * torch.log10(Ph + 1e-20), min=fl)
+        w = torch.maximum(r2, o2) - fl
+        E = (w * torch.sqrt((o2 - r2) ** 2 + M["smoothDb"])).sum() / w.sum() / G["jndDb"]
+        opt.zero_grad()
+        E.backward()
+        opt.step()
+    return g.detach().numpy(), a.detach().numpy()
+
+
+# ---------------------------------------------------------------- renderers (12 October 2026)
+
+def render_comb(Ph: np.ndarray, n: int, sr: int, C: dict) -> np.ndarray:
+    """Partials on the bins of the measure FFT (every bin when combStep is 1, every even bin when 2). A partial on bin m
+    advances m * hop / nFft cycles per hop: a whole number on even bins, a half (a sign flip, applied per frame) on odd
+    bins, so every analysis frame sees the same magnitudes; quadrature phases (k * pi / 2) make the cross terms of
+    neighbouring partials vanish or stay constant. Partial powers start from Ph interpolated on log frequency, then
+    calibIters multiplicative passes (Richardson-Lucy on the band weights) correct the comb against its OWN target
+    Ph, never against the reference. FR : peigne cale sur la grille de mesure, puissance par bande deterministe."""
+    import librosa
+    G, R = C["grid"], C["render"]
+    nf, hop = G["nFft"], G["hop"]
+    fr = n // hop + 1
+    c, W = bands(sr, G)
+    f = np.fft.rfftfreq(nf, 1.0 / sr)
+    step = int(R.get("combStep", 2))
+    kb = np.arange(0, len(f), step)
+    lfk, lc = np.log2(np.maximum(f[kb], 1.0)), np.log2(c)
+    tgt = Ph[:, :fr]
+    if tgt.shape[1] < fr:
+        tgt = np.pad(tgt, ((0, 0), (0, fr - tgt.shape[1])), mode="edge")
+    live = (f[kb] >= R["minHz"]).astype(float)
+    if R.get("phase", "random") == "quadrature":
+        phase = np.exp(1j * np.pi / 2 * np.arange(len(kb)))
+    else:  # 12 October 2026: fixed random phase per partial: frozen noise, no pulse, cross terms constant
+        phase = np.exp(2j * np.pi * np.random.default_rng(R["seed"]).random(len(kb)))
+    flip = np.where((kb * hop * 2 // nf) % 2 == 1, -1.0, 1.0)  # half a cycle per hop on odd bins
+    sign = flip[:, None] ** np.arange(fr)[None, :]
+    Wk = W[:, kb] + 1e-12  # band weight at each partial
+    p = 10 ** (np.stack([np.interp(lfk, lc, 10 * np.log10(tgt[:, i] + 1e-30)) for i in range(fr)], axis=1) / 10.0)
+    y = np.zeros(n)
+    for it in range(max(1, R["calibIters"]) + 1):
+        M = np.zeros((len(f), fr), complex)
+        M[kb] = np.sqrt(p) * phase[:, None] * sign * live[:, None]
+        y = librosa.istft(M, hop_length=hop, n_fft=nf, length=n, window="hann")
+        if it == max(1, R["calibIters"]):
+            break
+        Y = band_power(y, sr, G, W)[:, :fr]
+        rho = tgt / (Y + 1e-30)
+        p = p * (Wk.T @ rho) / (Wk.sum(axis=0)[:, None])
+    return y.astype(np.float32)
+
+
+def render_noise(Ph: np.ndarray, n: int, sr: int, C: dict) -> np.ndarray:
+    import librosa
+    G, R = C["grid"], C["render"]
+    nf, hop = R["noiseNFft"], R["noiseHop"]
+    c, W = bands(sr, G)
+    fr = n // hop + 1
+    tt, tg = np.arange(fr) * hop / sr, np.arange(Ph.shape[1]) * G["hop"] / sr
+    f = np.fft.rfftfreq(nf, 1.0 / sr)
+    lf, lc = np.log2(np.maximum(f, 1.0)), np.log2(c)
+    gain = np.zeros(len(c))
+    y = np.zeros(n)
+    rng = np.random.default_rng(R["seed"])
+    ph = np.exp(2j * np.pi * rng.random((len(f), fr)))
+    for _ in range(max(1, R["calibIters"])):  # global per-band calibration against its own target only
+        Pt = np.stack([np.interp(tt, tg, 10 * np.log10(Ph[b] + 1e-30) + gain[b]) for b in range(len(c))])
+        D = np.stack([np.interp(lf, lc, Pt[:, i]) for i in range(fr)], axis=1)
+        y = librosa.istft(np.sqrt(10 ** (D / 10.0)) * ph * (f >= R["minHz"])[:, None], hop_length=hop, n_fft=nf, length=n)
+        Y = band_power(y, sr, G, W)[:, : Ph.shape[1]]
+        gain += 10 * np.log10(Ph.mean(axis=1) / (Y.mean(axis=1) + 1e-30))
+    return y.astype(np.float32)
+
+
+LEAK = ("drums", "bass", "other")
+
+
+def _stft_gain(x: np.ndarray, gain_db: np.ndarray, t_grid: np.ndarray, sr: int, C: dict) -> np.ndarray:
+    """Time-varying third-octave gain (dB, [bands, grid frames]) applied in an STFT (gainNFft, gainHop), interpolated
+    on log frequency and time. FR : egaliseur dynamique par tiers d'octave."""
+    import librosa
+    R, G = C["render"], C["grid"]
+    nf, hop = R["gainNFft"], R["gainHop"]
+    c, _ = bands(sr, G)
+    X = librosa.stft(np.asarray(x, np.float32), n_fft=nf, hop_length=hop)
+    tt = np.arange(X.shape[1]) * hop / sr
+    f = np.fft.rfftfreq(nf, 1.0 / sr)
+    lf, lc = np.log2(np.maximum(f, 1.0)), np.log2(c)
+    gt = np.stack([np.interp(tt, t_grid, gain_db[b]) for b in range(len(c))])
+    gf = np.stack([np.interp(lf, lc, gt[:, i]) for i in range(len(tt))], axis=1)
+    return librosa.istft(X * 10 ** (gf / 20.0), hop_length=hop, n_fft=nf, length=len(x))
+
+
+def render_hybrid(model: dict, comps: list, idx: np.ndarray, Ph: np.ndarray, t: np.ndarray, our_stems: dict,
+                  n: int, sr: int, C: dict) -> np.ndarray:
+    """12 October 2026: leakage components rendered as OUR stems through a multiband dynamic gain (their own
+    transients survive: the reference stem is peaky, drum hits leak into it), the other components as a noise pad,
+    then calibIters passes of a dynamic equaliser toward the model's own power Ph (never the reference).
+    FR : fuite rendue par nos propres pistes (attaques conservees), nappe de bruit, puis egaliseur vers Ph."""
+    R, G = C["render"], C["grid"]
+    _, W = bands(sr, G)
+    gdb, alpha = np.asarray(model["gainsDb"]), np.asarray(model["alpha"])
+    names = model["names"]
+    lim = R["maxGainDb"]
+    x = np.zeros(n)
+    pad = np.zeros_like(Ph)
+    for j, name in enumerate(names):
+        term = (10 ** (gdb[j][idx].T / 10.0)) * np.exp(np.log(comps[j] + 1e-30) * (1 + alpha[j])[:, None])
+        if name in LEAK:
+            S = band_power(our_stems[name], sr, G, W)[:, : Ph.shape[1]]
+            g = 10 * np.log10(term / (S + 1e-30))
+            g = np.clip(g, np.median(g, axis=1, keepdims=True) - lim, np.median(g, axis=1, keepdims=True) + lim)
+            x += _stft_gain(our_stems[name][:n], g, t, sr, C)
+        else:
+            pad += term
+    if pad.any():
+        x += render_noise(pad, n, sr, C)
+    for _ in range(R["calibIters"]):
+        Y = band_power(x, sr, G, W)[:, : Ph.shape[1]]
+        g = np.clip(10 * np.log10((Ph + 1e-30) / (Y + 1e-30)), -lim, lim)
+        x = _stft_gain(x, g, t, sr, C)
+    return x.astype(np.float32)
+
+
+def render(model: dict, score: dict, our_stems: dict, n: int, sr: int, C: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Pure function of the fitted tables, the score and our own stems -> mono vocals and its model power."""
+    fr = n // C["grid"]["hop"] + 1
+    names, comps, t = components(score, our_stems, sr, fr, C)
+    assert names == model["names"], f"component mismatch {names} != {model['names']}"
+    idx = span_index(t, [tuple(s) for s in model["spans"]])
+    Ph = model_power(np.asarray(model["gainsDb"]), np.asarray(model["alpha"]), comps, idx)
+    mode = C["render"]["mode"]
+    if mode == "hybrid":
+        y = render_hybrid(model, comps, idx, Ph, t, our_stems, n, sr, C)
+    else:
+        y = render_comb(Ph, n, sr, C) if mode == "comb" else render_noise(Ph, n, sr, C)
+    return y, Ph

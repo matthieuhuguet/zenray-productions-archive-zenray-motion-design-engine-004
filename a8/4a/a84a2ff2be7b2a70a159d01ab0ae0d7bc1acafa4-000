@@ -1,0 +1,36 @@
+// 12 October 2026, 11:55 CEST: the security gate, both ways (R06 lot L4): origin refused 403, header missing 403,
+// cross-site browser call without origin 403, private network preflight 204, body too large 413, unknown action 400,
+// allowed origin and header 200.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { createServer } from '../lib/server.mjs'
+import { loadConfig } from '../lib/config.mjs'
+import { listen, post } from './helpers.mjs'
+
+const config = loadConfig()
+const actions = { handle: async (body) => { if (body.action !== 'status') throw Object.assign(new Error('action inconnue'), { status: 400, code: 'unknown-action' }); return { service: 'test' } } }
+const media = { serve: (req, res) => res.end() }
+
+test('gate', async (t) => {
+  const server = createServer({ config, actions, media })
+  const base = await listen(server)
+  t.after(() => server.close())
+  const ok = await post(base, config, { action: 'status' }, { origin: 'https://zenray-progress.pages.dev' })
+  assert.equal(ok.status, 200)
+  assert.equal(ok.headers.get('access-control-allow-origin'), 'https://zenray-progress.pages.dev')
+  assert.equal((await ok.json()).service, 'test')
+  assert.equal((await post(base, config, { action: 'status' }, { origin: 'https://evil.example' })).status, 403)
+  const noHeader = await fetch(`${base}${config.bridge.path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"action":"status"}' })
+  assert.equal(noHeader.status, 403)
+  assert.equal((await noHeader.json()).code, 'client-required')
+  assert.equal((await post(base, config, { action: 'status' }, { 'sec-fetch-site': 'cross-site' })).status, 403)
+  const pre = await fetch(`${base}${config.bridge.path}`, { method: 'OPTIONS', headers: { origin: 'http://localhost:5173' } })
+  assert.equal(pre.status, 204)
+  assert.equal(pre.headers.get('access-control-allow-private-network'), 'true')
+  assert.match(pre.headers.get('access-control-allow-headers'), /x-zr-motion-client/)
+  const big = await post(base, config, JSON.stringify({ action: 'status', pad: 'x'.repeat(config.bridge.bodyLimitBytes + 10) }))
+  assert.equal(big.status, 413)
+  assert.equal((await post(base, config, { action: 'nope' })).status, 400)
+  assert.equal((await post(base, config, 'not json')).status, 400)
+  assert.equal((await fetch(`${base}/elsewhere`)).status, 404)
+})

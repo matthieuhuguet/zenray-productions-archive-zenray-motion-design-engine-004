@@ -1,0 +1,111 @@
+# 12 October 2026: sound fidelity report (R03 section 7), one JSON and one exit code.
+# Per event: S = 100 * 0.99 ** (E ** 2) on held-out seeds, shown with its identity ceiling; a missing event scores 0.
+# Timing: share of events whose anchor in the rendered SFX track lies within one frame plus 1 ms of the reference
+# anchor. Mix: integrated loudness (1 LU = one JND), short-term curve correlation, true peak under the ceiling.
+# Music: tempo, section boundaries, energy curve and key (no note comparison). Sound = geometric mean of SFX,
+# timing and mix; music has its own score. A window (start, end) restricts every measure to that span.
+# FR : rapport de fidelite du son, par evenement, calage, mixage et musique ; un JSON et un code de sortie.
+from __future__ import annotations
+
+import math
+
+import numpy as np
+
+from . import config, loudness, music
+from . import describe as D
+
+
+def _geo(values: list[float]) -> float:
+    v = np.maximum(np.asarray(values, dtype=float), 1e-6)
+    return float(np.exp(np.mean(np.log(v))))
+
+
+def rendered_anchor(track: np.ndarray, sr: int, ev: dict, background=None) -> float | None:
+    """Anchor of the event measured in our rendered SFX track (same window and descriptor as the reference); with
+    the event's measurement background added when the fit used one, so both anchors are read the same way."""
+    a, b = int(ev["windowStart"] * sr), int(ev["windowEnd"] * sr)
+    seg = track[a:b]
+    if len(seg) < 64 or not np.any(seg):
+        return None
+    if background is not None and len(background):
+        seg = seg + np.pad(background, (0, max(0, len(seg) - len(background))))[: len(seg)]
+    d = D.describe(seg)
+    return ev["windowStart"] + D.anchor_of(d, ev["refAnchorKind"])
+
+
+def curve_score(ref_mix: np.ndarray, gen_mix: np.ndarray, sr: int, start: float, end: float, cfg: dict) -> dict:
+    m = cfg["mix"]
+    a, b = int(start * sr), int(end * sr)
+    r, g = ref_mix[a:b], gen_mix[a:b]
+    long = (end - start) >= 4 * m["shortTermWindowS"]
+    w, h = (m["shortTermWindowS"], m["shortTermHopS"]) if long else (m["momentaryWindowS"], m["momentaryHopS"])
+    cr, _ = loudness.short_term(r, sr, w, h)
+    cg, _ = loudness.short_term(g, sr, w, h)
+    k = min(len(cr), len(cg))
+    corr = float(np.corrcoef(cr[:k], cg[:k])[0, 1]) if k >= cfg["verify"]["windowMinMomentaryPoints"] and np.std(cr[:k]) > 0 and np.std(cg[:k]) > 0 else None
+    return {"window": "short-term" if long else "momentary", "correlation": None if corr is None else round(corr, 4),
+            "meanDiffLu": round(float(np.mean(cg[:k] - cr[:k])), 2) if k else None}
+
+
+def report(ref: dict, gen: dict, sr: int, start: float | None = None, end: float | None = None, cfg: dict | None = None) -> dict:
+    """ref: {'mix': stereo, 'events': [...] with 'refAnchorKind', 'anchorS', 'windowStart', 'windowEnd', 'music': analysis}
+    gen: {'mix': stereo, 'sfx': mono SFX track, 'events': fitted results by id, 'music': analysis}."""
+    cfg = cfg or config.cfg()
+    v, base = cfg["verify"], cfg["score"]["base"]
+    thr = cfg["score"]["passThreshold"]
+    duration = len(ref["mix"]) / sr
+    start = 0.0 if start is None else start
+    end = duration if end is None else end
+    inside = [e for e in ref["events"] if start <= e["anchorS"] < end]
+    rows, weights, timing_hits = [], [], 0
+    for e in inside:
+        fit = gen["events"].get(e["id"])
+        s = fit["score"] if fit else v["missingScore"]
+        track = (gen.get("sfxByStem") or {}).get(e.get("stem"), gen["sfx"])
+        anchor = rendered_anchor(track, sr, e, (gen.get("backgrounds") or {}).get(e["id"])) if fit else None
+        dt = None if anchor is None else anchor - e["anchorS"]
+        # Same tolerance as the event score: one frame plus the slack, widened for a swell (no sharp instant) by
+        # anchorAttackFraction of its attack (R03 section 7.1).
+        tol = v["frameSeconds"] + v["timingSlackMs"] / 1000.0
+        if e.get("refAnchorKind") == "peak":
+            tol = max(tol, cfg["jnd"]["anchorAttackFraction"] * e.get("descriptors", {}).get("attackS", 0.0))
+        hit = dt is not None and abs(dt) <= tol
+        timing_hits += int(hit)
+        w = 10 ** (e["levelDb"] / 20.0) if v["sfxWeights"] == "loudness" else 1.0
+        weights.append(w)
+        rows.append({"id": e["id"], "kind": fit["kind"] if fit else None, "score": s, "ceiling": fit.get("ceiling") if fit else None,
+                     "atCeiling": bool(fit and s >= fit.get("ceiling", 100) - 0.3), "E": fit.get("E") if fit else None,
+                     "anchorRefS": round(e["anchorS"], 4), "anchorOursS": None if anchor is None else round(anchor, 4),
+                     "anchorErrorMs": None if dt is None else round(1000 * dt, 2), "timingOk": hit, "errors": fit.get("errors") if fit else None})
+    if rows:
+        sfx_score = float(np.average([r["score"] for r in rows], weights=weights))
+        timing = 100.0 * timing_hits / len(rows)
+    else:
+        sfx_score, timing = 100.0, 100.0
+    a, b = int(start * sr), int(end * sr)
+    lr = loudness.integrated(ref["mix"][a:b], sr)
+    lg = loudness.integrated(gen["mix"][a:b], sr)
+    tp = loudness.true_peak_db(gen["mix"][a:b], sr, cfg["mix"]["oversample"])
+    curve = curve_score(ref["mix"], gen["mix"], sr, start, end, cfg)
+    lufs_e = (lg - lr) / cfg["mix"]["lufsJnd"]
+    mix_parts = {"loudness": 100 * base ** (lufs_e ** 2), "curve": 100 * max(curve["correlation"] or 0.0, 0.0) if curve["correlation"] is not None else 100.0,
+                 "truePeak": 100.0 if tp <= cfg["mix"]["truePeakCeilingDbtp"] + 1e-6 else 0.0}
+    mix_score = _geo(list(mix_parts.values()))
+    ms = music.score(ref["music"], gen["music"], cfg)
+    if start > 0 or end < duration:
+        rb = [s["start"] for s in ref["music"]["sections"][1:] if start <= s["start"] < end]
+        gb = [s["start"] for s in gen["music"]["sections"][1:]]
+        errs = [min(abs(x - y) for y in gb) / (ref["music"]["period"] * cfg["music"]["scoreBoundaryBeats"]) for x in rb] if gb else [3.0] * len(rb)
+        e = math.sqrt(float(np.mean(np.square(errs)))) if errs else 0.0
+        ms["parts"]["sections"] = round(100 * base ** (e ** 2), 2)
+        ms["parts"]["energy"] = round(100 * max(curve["correlation"] or 0.0, 0.0), 2) if curve["correlation"] is not None else ms["parts"]["energy"]
+        ms["score"] = round(_geo(list(ms["parts"].values())), 2)
+        ms["windowNote"] = "tempo and key are global; sections and energy measured inside the window"
+    sound = _geo([sfx_score, timing, mix_score])
+    return {"window": {"start": round(start, 4), "end": round(end, 4)}, "events": len(rows),
+            "scores": {"sound": round(sound, 2), "sfx": round(sfx_score, 2), "timing": round(timing, 2), "mix": round(mix_score, 2), "music": ms["score"]},
+            "pass": bool(sound >= thr and ms["score"] >= thr), "threshold": thr,
+            "mix": {"parts": {k: round(x, 2) for k, x in mix_parts.items()}, "refLufs": round(lr, 2), "oursLufs": round(lg, 2),
+                    "truePeakDbtp": round(tp, 2), "curve": curve},
+            "music": ms, "perEvent": rows,
+            "noEventsNote": None if rows else "no reference SFX event inside this window: SFX and timing scores are 100 by definition (nothing missing, nothing extra)"}

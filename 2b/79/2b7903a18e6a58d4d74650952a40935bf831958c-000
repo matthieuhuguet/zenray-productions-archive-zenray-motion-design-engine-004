@@ -1,0 +1,168 @@
+# 12 October 2026, 16:45 CEST: measured colour field of a soft graphic element (orb, glow, gradient blob).
+# The element is described in its own normalised polar coordinates (rho = distance / radius, theta), as a small
+# grid of colours sampled every few frames, plus its centre and radius curves. A low-resolution field of an
+# abstract graphic is a measurement (like zenray-height's measured regions), not a copy of picture content.
+from __future__ import annotations
+
+import cv2
+import numpy as np
+
+from ..media import read_frames
+
+RHO_EDGES = np.array([0.0, 0.25, 0.45, 0.6, 0.72, 0.81, 0.87, 0.91, 0.94, 0.965, 0.985, 1.0])
+
+
+def disc_track(frames: np.ndarray, threshold: float = 25.0) -> list[dict | None]:
+    """Centre and radius of the main bright disc per frame (radius from the bbox width, robust to frame clipping)."""
+    out = []
+    for f in frames:
+        g = f.astype(np.float32).max(axis=2)
+        m = (g > threshold).astype(np.uint8)
+        n, lab, st, cen = cv2.connectedComponentsWithStats(m)
+        if n < 2:
+            out.append(None); continue
+        k = 1 + int(np.argmax(st[1:, 4]))
+        x, y, w, h, area = st[k]
+        cx, cy = x + w / 2.0, float(cen[k][1])
+        out.append({"cx": float(cx), "cy": cy, "r": float(w) / 2.0, "clipped": bool(h >= f.shape[0] - 1),
+                    "profile": radial_profile(lab == k, cx, cy, f.shape)})
+    return out
+
+
+def radial_profile(mask: np.ndarray, cx: float, cy: float, shape, n: int = 120) -> list[float]:
+    """Silhouette as distance from the centre to the farthest mask pixel per angle sector (star-shaped outline).
+    Sectors whose silhouette leaves the frame get the distance to the frame edge plus a margin (invisible anyway)."""
+    ys, xs = np.nonzero(mask)
+    ang = ((np.arctan2(ys - cy, xs - cx) + np.pi) / (2 * np.pi) * n).astype(int) % n
+    dist = np.hypot(xs - cx, ys - cy)
+    prof = np.zeros(n)
+    np.maximum.at(prof, ang, dist)
+    h, w = shape[:2]
+    edge = (xs <= 0) | (ys <= 0) | (xs >= w - 1) | (ys >= h - 1)
+    if edge.any():
+        clipped = np.unique(ang[edge])
+        prof[clipped] += 40.0
+    empty = prof == 0
+    if empty.any() and (~empty).any():
+        idx = np.arange(n)
+        prof[empty] = np.interp(idx[empty], idx[~empty], prof[~empty], period=n)
+    return [round(float(v) + 0.5, 2) for v in prof]
+
+
+def polar_field(frame: np.ndarray, cx: float, cy: float, r: float, n_theta: int = 32, profile=None) -> np.ndarray:
+    """Mean colour per (rho band, theta sector); rho is the distance over the silhouette radius at that angle
+    (profile) or over r; shape (len(RHO_EDGES)-1, n_theta, 3), NaN where outside the frame."""
+    h, w = frame.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    ang = (np.arctan2(yy - cy, xx - cx) + np.pi) / (2 * np.pi)
+    if profile is not None:
+        prof = np.asarray(profile, np.float32)
+        n = len(prof); q = ang * n - 0.5
+        i0 = np.floor(q).astype(int) % n; ww = q - np.floor(q)
+        radius = prof[i0] * (1 - ww) + prof[(i0 + 1) % n] * ww
+    else:
+        radius = np.full(ang.shape, r, np.float32)
+    rho = np.hypot(xx - cx, yy - cy) / np.maximum(radius, 1e-6)
+    theta = ang * n_theta
+    band = np.digitize(rho, RHO_EDGES) - 1
+    sector = np.clip(theta.astype(int), 0, n_theta - 1)
+    grid = np.full((len(RHO_EDGES) - 1, n_theta, 3), np.nan, np.float32)
+    valid = (band >= 0) & (band < len(RHO_EDGES) - 1)
+    idx = band[valid] * n_theta + sector[valid]
+    for c in range(3):
+        sums = np.bincount(idx, weights=frame[..., c][valid].astype(np.float64), minlength=grid.shape[0] * n_theta)
+        counts = np.bincount(idx, minlength=grid.shape[0] * n_theta)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            grid[..., c] = (sums / counts).reshape(grid.shape[:2])
+    return grid
+
+
+def cart_field(frame: np.ndarray, cx: float, cy: float, r: float, n: int = 40) -> np.ndarray:
+    """Mean colour on an n x n grid of the disc's normalised square (u, v in [-1, 1]); NaN outside the frame."""
+    h, w = frame.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    u = ((xx - cx) / max(r, 1e-6) + 1) / 2 * n
+    v = ((yy - cy) / max(r, 1e-6) + 1) / 2 * n
+    ok = (u >= 0) & (u < n) & (v >= 0) & (v < n) & (np.hypot(xx - cx, yy - cy) <= r * 0.93)
+    idx = (v[ok].astype(int) * n + u[ok].astype(int))
+    grid = np.full((n, n, 3), np.nan, np.float32)
+    counts = np.bincount(idx, minlength=n * n)
+    for c in range(3):
+        sums = np.bincount(idx, weights=frame[..., c][ok].astype(np.float64), minlength=n * n)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            grid[..., c] = (sums / counts).reshape(n, n)
+    return grid
+
+
+def _fill_nan(grid: np.ndarray) -> np.ndarray:
+    """Fill NaN cells from their nearest valid neighbours (iterative dilation)."""
+    g = grid.copy()
+    for _ in range(64):
+        bad = np.isnan(g[..., 0])
+        if not bad.any():
+            break
+        acc = np.zeros_like(g); cnt = np.zeros(g.shape[:2])
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            sh = np.roll(np.roll(g, dy, 0), dx, 1); ok = ~np.isnan(sh[..., 0])
+            acc[ok] += sh[ok]; cnt[ok] += 1
+        fill = bad & (cnt > 0)
+        g[fill] = acc[fill] / cnt[fill][:, None]
+    return np.nan_to_num(g)
+
+
+def centre_spot(frame_full: np.ndarray, cx: float, cy: float, search: int = 40) -> dict | None:
+    """A small dark spot near the disc centre (full-resolution frame): centre offset, radius, colour."""
+    h, w = frame_full.shape[:2]
+    x0, y0 = int(max(0, cx - search)), int(max(0, cy - search))
+    crop = frame_full[y0:int(min(h, cy + search)), x0:int(min(w, cx + search))].astype(np.float32)
+    if crop.size == 0:
+        return None
+    lum = crop.mean(axis=2)
+    bg = np.median(lum)
+    dark = (lum < bg - 40).astype(np.uint8)
+    n, lab, st, cen = cv2.connectedComponentsWithStats(dark)
+    if n < 2:
+        return None
+    k = 1 + int(np.argmax(st[1:, 4]))
+    if st[k, 4] < 3:
+        return None
+    r = float(np.sqrt(st[k, 4] / np.pi))
+    col = crop[lab == k].mean(axis=0)
+    return {"dx": float(cen[k][0] + x0 - cx), "dy": float(cen[k][1] + y0 - cy), "r": round(r, 2),
+            "color": [round(float(c), 1) for c in col]}
+
+
+def measure_orb(video: str, start: float, end: float, step: int = 2, size=(960, 540), n_theta: int = 48, n_cart: int = 48) -> dict:
+    frames = read_frames(video, size[0], size[1], start=start, duration=end - start)
+    full = read_frames(video, 1920, 1080, start=start, duration=end - start)
+    track = disc_track(frames)
+    for k, t in enumerate(track):
+        if t and k < len(full):
+            spot = centre_spot(full[k], t["cx"] * 1920 / size[0], t["cy"] * 1920 / size[0])
+            if spot:
+                t["spot"] = {**spot, "dx": spot["dx"] * size[0] / 1920, "dy": spot["dy"] * size[0] / 1920,
+                             "r": spot["r"] * size[0] / 1920}
+    scale = 1920 / size[0]
+    samples = []
+    for k in range(0, len(frames), step):
+        t = track[k]
+        if not t or t["r"] < 6:
+            continue
+        grid = polar_field(frames[k], t["cx"], t["cy"], t["r"], n_theta, t.get("profile"))
+        grid = np.where(np.isnan(grid), np.nanmean(grid, axis=1, keepdims=True), grid)
+        cart = _fill_nan(cart_field(frames[k], t["cx"], t["cy"], t["r"], n_cart))
+        samples.append({"frame": k, "cx": t["cx"] * scale, "cy": t["cy"] * scale, "r": t["r"] * scale,
+                        "clipped": t["clipped"], "field": np.round(np.nan_to_num(grid), 1).tolist(),
+                        "cart": np.round(cart, 1).tolist()})
+    return {"start": start, "end": end, "rho_edges": RHO_EDGES.tolist(), "n_theta": n_theta, "step": step, "n_cart": n_cart, "rim": 0.9,
+            "track": [None if t is None else {k: (v * scale if k in ("cx", "cy", "r") else ([round(x * scale, 2) for x in v] if k == "profile" else ({**v, "dx": v["dx"] * scale, "dy": v["dy"] * scale, "r": v["r"] * scale} if k == "spot" else v))) for k, v in t.items()} for t in track],
+            "samples": samples}
+
+
+def colour_grid(video: str, start: float, end: float, cols: int = 16, rows: int = 9, step: int = 2) -> dict:
+    """Low-resolution colour grid of a plate per frame (area average): its grade, light and mass motion,
+    never its shapes. Drawn back as a smoothly upscaled canvas in the plate's slot."""
+    frames = read_frames(video, cols, rows, start=start, duration=end - start)
+    keep = list(range(0, len(frames), step))
+    return {"cols": cols, "rows": rows, "step": step, "frames": len(frames),
+            "grid": [np.round(frames[k].astype(np.float32), 1).tolist() for k in keep]}

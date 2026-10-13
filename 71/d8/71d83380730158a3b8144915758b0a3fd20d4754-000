@@ -1,0 +1,51 @@
+# 12 October 2026: audio engine parameters, read once from datasets/sfx-params.json (path in settings.json).
+# get("a.b") returns a deep copy, so no caller can mutate the shared defaults.
+# FR : parametres du moteur son, lus une seule fois depuis sfx-params.json.
+from __future__ import annotations
+
+import copy
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
+
+from .. import settings
+
+
+def params_path() -> Path:
+    return settings.path("sfx_params")
+
+
+OVERRIDES_ENV = "ZRMD_SFX_OVERRIDES"
+
+
+def _merge(base: dict, over: dict) -> dict:
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+@lru_cache(maxsize=1)
+def load() -> dict:
+    """File values, then the per-run overrides passed as JSON in ZRMD_SFX_OVERRIDES (so worker processes see them)."""
+    data = json.loads(params_path().read_text(encoding="utf-8"))
+    extra = os.environ.get(OVERRIDES_ENV)
+    return _merge(data, json.loads(extra)) if extra else data
+
+
+def get(dotted: str | None = None):
+    node = load()
+    if dotted:
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                raise KeyError(f"sfx-params.json has no '{dotted}'")
+            node = node[part]
+    return copy.deepcopy(node)
+
+
+def cfg() -> dict:
+    """The whole parameter tree (shared, read-only by convention: use get() to obtain a private copy)."""
+    return load()

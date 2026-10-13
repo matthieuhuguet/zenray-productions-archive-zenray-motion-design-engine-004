@@ -1,0 +1,152 @@
+# 12 October 2026, 21:00 CEST: verifier of the F2 raster-to-vector asset creator (zrmd.vector.asset).
+# Green expectations: every synthetic SVG of datasets/vector/synthetic-svg-cases.json, rendered by Skia, vectorised,
+# cooked back to SVG and re-rendered, lands on its source (every layer at soft IoU >= verify.iou_min and sub-pixel
+# edge distance <= verify.edge_mean_max_px, composite colour MAE <= verify.colour_mae_max), with the expected
+# primitive kinds, paint types and blur. Red expectations: a deliberately wrong primitive forced on a layer is
+# rejected by the primitive rule, and a correct asset with one layer shifted by verify.shift_px fails the fidelity
+# rule. --sabotage switches refinement off and accepts any forced primitive, so the verifier must exit 1.
+# Usage: ~/.venvs/zenray-motion/bin/python -I Scripts/VerifySvgTrace.py [--json] [--out FILE] [--write] [--sabotage]
+#        [--case ID ...]
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import re
+import sys
+import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from zrmd import settings  # noqa: E402
+
+
+def _cfg() -> dict:
+    return settings.get("vector.trace")
+
+
+def case_svg(case: dict, w: int, h: int) -> str:
+    return (f"<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}'>"
+            f"<rect width='{w}' height='{h}' fill='{case['bg']}'/>{case['body']}</svg>")
+
+
+def shifted(params: dict, dx: float) -> dict:
+    """Copy of params with the first non-background layer moved dx pixels to the right."""
+    p = copy.deepcopy(params)
+    layer = next(l for l in sorted(p["layers"], key=lambda l: l["z"]) if l["z"] > 0)
+    g = layer["geometry"]
+    if layer["kind"] == "path":
+        nums = iter(range(10 ** 9))
+        g["d"] = re.sub(r"-?\d+\.?\d*(?:e-?\d+)?",
+                        lambda m: f"{float(m.group()) + (dx if next(nums) % 2 == 0 else 0):g}", g["d"])
+    elif layer["kind"] == "line":
+        g["x1"] += dx
+        g["x2"] += dx
+    elif layer["kind"] == "polyline":
+        g["polylines"] = [[[x + dx, y] for x, y in run] for run in g["polylines"]]
+    elif layer["kind"] == "stroke_path":
+        g["nodes"] = [[[[x + dx, y] for x, y in node] for node in c] for c in g["nodes"]]
+    else:
+        g["cx"] += dx
+    return p
+
+
+def run_case(args: tuple) -> dict:
+    case, w, h, sabotage, write = args
+    os.environ["OMP_NUM_THREADS"] = "1"
+    from zrmd.vector import asset as A
+    from zrmd.vector import render as R
+    cfg = _cfg()
+    vc = cfg["verify"]
+    rule = {**cfg, "fidelity": {**cfg["fidelity"], "iou_min": vc["iou_min"], "edge_mean_max_px": vc["edge_mean_max_px"],
+                                "colour_mae_max": vc["colour_mae_max"]}}
+    t0 = time.time()
+    # 12 October 2026: the synthetic source is drawn by the reference rasteriser (vector.trace.raster_ss), like a
+    # well anti-aliased frame, not by Skia at 1x whose curved strokes are 0.4 percent short of their exact area.
+    rgb = R.render_svg(case_svg(case, w, h), w, h, engine="skia", ss=int(cfg.get("raster_ss", 1)))[..., :3]
+    out = A.vectorise(rgb, f"verify-{case['id']}", {"kind": "synthetic", "case": case["id"]}, refine=not sabotage,
+                      sabotage=sabotage, workers=1, cfg=cfg)
+    params, an = out["params"], out["analysis"]
+    fid = A.evaluate(params, rgb, an, rule)
+    upper = [l for l in params["layers"] if l["z"] > 0]
+    kinds = Counter(l["kind"] for l in upper)
+    paints = Counter(l["paint"]["type"] for l in upper)
+    checks = {"fidelity": fid["pass"], "kinds": kinds == Counter(case["expect"]),
+              "paints": paints == Counter(case["paints"])}
+    if "background_paint" in case:
+        checks["background_paint"] = params["layers"][0]["paint"]["type"] == case["background_paint"]
+    if "blur" in case:
+        blurs = [l["effects"]["blur"] for l in upper]
+        checks["blur"] = bool(blurs) and abs(blurs[0] - case["blur"]) <= vc["blur_tol"] * case["blur"]
+    res = {"case": case["id"], "expect": "green", "ok": all(checks.values()), "checks": checks,
+           "kinds": dict(kinds), "paints": dict(paints), "min_iou": fid["min_iou"], "max_edge_mean": fid["max_edge_mean"],
+           "colour": fid["colour"], "layers": fid["layers"], "blur": [l["effects"]["blur"] for l in upper],
+           "seconds": round(time.time() - t0, 2)}
+    if write:
+        vdir = A.write_version(A.assets_root() / "_verify" / case["id"], params, rgb, fid, note="VerifySvgTrace")
+        res["written"] = str(vdir)
+    reds = []
+    # Red 1: the same asset with one layer shifted must fail the fidelity rule.
+    if upper:
+        fs = A.evaluate(shifted(params, vc["shift_px"]), rgb, an, rule)
+        reds.append({"case": f"{case['id']}:shift", "expect": "red", "ok": not fs["pass"], "min_iou": fs["min_iou"],
+                     "max_edge_mean": fs["max_edge_mean"]})
+    # Red 2: a deliberately wrong primitive forced on the first layer above the background must be rejected.
+    if case.get("wrong"):
+        z = min(l["z"] for l in upper)
+        fw = A.vectorise(rgb, f"verify-{case['id']}-wrong", refine=not sabotage, sabotage=sabotage, workers=1, cfg=cfg,
+                         force={z: case["wrong"]["kind"]})
+        rej = fw["params"]["trace"]["rejected"]
+        tried = rej[0]["tried"] if rej else next((l["fit"].get("tried") for l in fw["params"]["layers"] if l["z"] == z), [])
+        best = max((t.get("iou", 0) for t in tried), default=None)
+        reds.append({"case": f"{case['id']}:wrong-{case['wrong']['kind']}", "expect": "red", "ok": bool(rej),
+                     "best_iou": best})
+    return {"green": res, "red": reds}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--out")
+    ap.add_argument("--write", action="store_true", help="write each case as a version under assets_dir/_verify")
+    ap.add_argument("--sabotage", action="store_true", help="refinement off and forced primitives accepted: must exit 1")
+    ap.add_argument("--case", nargs="*")
+    a = ap.parse_args()
+    cfg = _cfg()
+    data = json.loads(Path(cfg["verify"]["cases"]).read_text())
+    w, h = data["canvas"]
+    cases = [c for c in data["cases"] if not a.case or c["id"] in a.case]
+    t0 = time.time()
+    with ProcessPoolExecutor(max_workers=min(cfg["workers"], len(cases))) as ex:
+        results = list(ex.map(run_case, [(c, w, h, a.sabotage, a.write) for c in cases]))
+    rows = [r["green"] for r in results] + [x for r in results for x in r["red"]]
+    ok = all(r["ok"] for r in rows)
+    report = {"date": "12 October 2026", "sabotage": a.sabotage, "ok": ok, "seconds": round(time.time() - t0, 1),
+              "rule": {k: cfg["verify"][k] for k in ("iou_min", "edge_mean_max_px", "colour_mae_max", "shift_px")},
+              "primitive_rule": {k: cfg["primitives"][k] for k in ("iou_min", "edge_mean_max_px")},
+              "green": sum(1 for r in rows if r["expect"] == "green" and r["ok"]),
+              "red": sum(1 for r in rows if r["expect"] == "red" and r["ok"]),
+              "failed": [r["case"] for r in rows if not r["ok"]], "rows": rows}
+    if a.out:
+        Path(a.out).write_text(json.dumps(report, indent=1, default=str))
+    if a.json:
+        print(json.dumps(report, indent=1, default=str))
+    else:
+        for r in rows:
+            mark = "ok " if r["ok"] else "BAD"
+            extra = (f"kinds={r.get('kinds')} iou={r.get('min_iou')} edge={r.get('max_edge_mean')} "
+                     f"mae={r.get('colour', {}).get('mae')} t={r.get('seconds')}s" if r["expect"] == "green"
+                     else f"iou={r.get('min_iou', r.get('best_iou'))}")
+            print(f"{mark} {r['expect']:5} {r['case']:28} {extra}" + ("" if r["ok"] else f" checks={r.get('checks')}"))
+        print(f"{'GREEN' if ok else 'RED'}: {report['green']} green and {report['red']} red cases as expected, "
+              f"{len(report['failed'])} failed, {report['seconds']} s")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

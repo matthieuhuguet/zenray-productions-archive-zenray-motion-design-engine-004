@@ -1,0 +1,191 @@
+# 12 October 2026: verifier of the differentiable sound bank (datasets/sound-bank, task A0).
+# Per block: contract (block.json equals what block.py generates, licence allowed, no em or en dash, defaults inside
+# bounds), determinism (two renders equal bit for bit, demo.wav equals a fresh render), identity (ploss score 100).
+# Then the two directions of the fitter, on targets rendered by the bank itself (defaults plus bank.verify.randomSets
+# random sets drawn in the inner 80 percent of every parameter range, fixed seed):
+#   green: dfit with the SAME block recovers the target, ploss score >= bank.verify.recoverMin (99.5);
+#   red  : on bank.verify.redTargets (outside the overlap of the blocks), dfit with every OTHER block must stay at
+#          or under bank.verify.wrongMax (90): a wrong block cannot pass. Cross fits on the random sets are reported
+#          as overlap information (an FM tone with a vanishing index is a sine), never graded.
+# --sabotage proves the verifier itself goes red: it declares a wrong block as the right one for the first case and
+# drops the licence of the first block in memory; the run must then exit 1.
+# Fits run on CPU in bank.verify.workers processes with one thread each (16 parallel CPU fits beat one MPS fit on
+# these 1 s windows, measured: see docs/build/A0-sound-harness.md); --mps-check also runs the first case on MPS.
+# Usage: python -I Scripts/VerifySoundBank.py [--blocks a,b] [--sets N] [--sabotage] [--mps-check] [--json]
+# Exit code 0 when everything is green, 1 otherwise.
+# FR : vérificateur de la banque de sons ; contrat, déterminisme, retrouve ses propres paramètres, refuse le mauvais bloc.
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import numpy as np  # noqa: E402
+
+from zrmd.audio import bank, config  # noqa: E402
+
+REQUIRED = ("id", "family", "description", "params", "tags", "sources", "licence")
+PARAM_KEYS = ("name", "unit", "min", "max", "default")
+ALLOWED = ("original", "mit", "bsd", "isc", "apache-2.0", "cc0", "public domain", "public-domain")
+FORBIDDEN_CHARS = ("—", "–")  # 12 October 2026: em dash and en dash are banned in every file.
+
+
+def contract_errors(bid: str, sabotage: bool = False) -> list[str]:
+    errs = []
+    d = bank.bank_dir() / bid
+    on_disk = json.loads((d / "block.json").read_text(encoding="utf-8"))
+    if sabotage:
+        on_disk.pop("licence", None)
+    errs += [f"block.json missing '{k}'" for k in REQUIRED if k not in on_disk]
+    if on_disk != json.loads(json.dumps(bank.block_meta(bid))):
+        errs.append("block.json differs from block.py (run Scripts/BuildSoundBank.py)")
+    lic = str(on_disk.get("licence", "")).lower()
+    if not any(lic.startswith(a) for a in ALLOWED):
+        errs.append(f"licence '{on_disk.get('licence')}' is not original, MIT, BSD, ISC, Apache-2.0, CC0 or public domain")
+    for p in on_disk.get("params", []):
+        errs += [f"param {p.get('name')} missing '{k}'" for k in PARAM_KEYS if k not in p]
+        if all(k in p for k in PARAM_KEYS) and not (p["min"] <= p["default"] <= p["max"]):
+            errs.append(f"param {p['name']} default outside [min, max]")
+    for f in ("block.py", "block.json"):
+        if any(c in (d / f).read_text(encoding="utf-8") for c in FORBIDDEN_CHARS):
+            errs.append(f"{f} contains an em or en dash")
+    return errs
+
+
+def determinism(bid: str) -> dict:
+    import soundfile as sf
+    from zrmd.audio import ploss
+    sr = config.get("bank.sampleRate")
+    a, b = bank.render_block(bid), bank.render_block(bid)
+    demo, dsr = sf.read(str(bank.bank_dir() / bid / "demo.wav"), dtype="float32")
+    # Bit-exact within a process; across processes the FFT may differ by one float32 ulp (measured 1.2e-7), hence
+    # bank.verify.demoTolerance for the stored demo. FR : exact dans un processus, à un ulp près entre processus.
+    tol = config.get("bank.verify.demoTolerance")
+    return {"renderEqual": bool(np.array_equal(a, b)), "demoEqual": bool(dsr == sr and demo.shape == a.shape and float(np.abs(demo - a).max()) <= tol),
+            "identityScore": round(ploss.score(a, a, sr)["score"], 4), "finite": bool(np.isfinite(a).all()), "peak": round(float(np.abs(a).max()), 4)}
+
+
+def target_sets(bid: str, n_random: int, seed: int) -> list[dict]:
+    cls = bank.block_class(bid)
+    rng = np.random.RandomState(seed + sum(map(ord, bid)))
+    sets = [{p["name"]: p["default"] for p in cls.PARAMS}]
+    probe = cls()
+    for _ in range(n_random):
+        u = rng.uniform(0.1, 0.9, len(cls.PARAMS))
+        probe.set_unit({p["name"]: float(x) for p, x in zip(cls.PARAMS, u)})
+        sets.append({k: round(v, 6) for k, v in probe.values().items()})
+    return sets
+
+
+def contrast_blocks(bid: str, v: dict) -> list[str]:
+    """12 October 2026 (A1): wrong blocks that must fail on the red target of bid: the explicit list in
+    bank.verify.contrast, else the first redFitsPerTarget blocks (sorted) whose family differs."""
+    named = v.get("contrast", {}).get(bid)
+    if named:
+        return list(named)
+    fam = bank.block_meta(bid).get("family")
+    other = [b for b in bank.list_blocks() if bank.block_meta(b).get("family") != fam]
+    return other[: v.get("redFitsPerTarget", 2)]
+
+
+def run_case(job: dict) -> dict:
+    """12 October 2026 (A2): an exception in one fit becomes a failed case (score 0, error named) instead of aborting
+    the whole pool and losing every finished fit. FR : une erreur d'ajustement devient un cas rouge nommé."""
+    try:
+        return _run_case(job)
+    except Exception as exc:
+        return {**{k: job[k] for k in ("target", "fit", "case", "expect")}, "params": job["params"], "score": 0.0, "b1Score": None,
+                "errors": {}, "fitted": {}, "seconds": 0.0, "device": job.get("device", "cpu"), "deviceFallback": None, "steps": 0,
+                "starts": 0, "exception": f"{type(exc).__name__}: {exc}"}
+
+
+def _run_case(job: dict) -> dict:
+    import torch
+    torch.set_num_threads(1)
+    from zrmd.audio import dfit
+    sr, seconds = config.get("bank.sampleRate"), job["seconds"]
+    target = bank.render_block(job["target"], job["params"], seconds, sr)
+    r = dfit.fit(target, [job["fit"]], sr, device=job.get("device", "cpu"))
+    return {**{k: job[k] for k in ("target", "fit", "case", "expect")}, "params": job["params"], "score": r["score"],
+            "b1Score": (r["b1"] or {}).get("score"), "errors": r["errors"], "fitted": r["params"][0], "seconds": r["seconds"],
+            "device": r["device"], "deviceFallback": r.get("deviceFallback"), "steps": len(r["lossCurve"]), "starts": r["startsRun"]}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    v = config.get("bank.verify")
+    ap.add_argument("--blocks", default="")
+    ap.add_argument("--sets", type=int, default=v["randomSets"])
+    ap.add_argument("--sabotage", action="store_true")
+    ap.add_argument("--mps-check", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    # 12 October 2026 (A1): with 50 blocks the all-against-all cross fits of A0 grow as N^2 (thousands of fits).
+    # --cross contrast (bank.verify.cross) fits each target only with its own block, and each red target with the wrong
+    # blocks listed in bank.verify.contrast[id] (else the first bank.verify.redFitsPerTarget blocks of other families);
+    # --cross all restores the A0 behaviour (every block on every target, overlap reported).
+    # FR : mode contraste, chaque cible n'est ajustée que par son bloc et par deux blocs faux nommés.
+    ap.add_argument("--cross", choices=["all", "contrast"], default=v.get("cross", "all"))
+    a = ap.parse_args()
+    t0 = time.time()
+    ids = [s for s in a.blocks.split(",") if s] or bank.list_blocks()
+    report = {"date": "12 October 2026", "blocks": {}, "cases": [], "thresholds": {"recoverMin": v["recoverMin"], "wrongMax": v["wrongMax"]}}
+    ok = True
+    for i, bid in enumerate(ids):
+        errs = contract_errors(bid, sabotage=a.sabotage and i == 0)
+        det = determinism(bid)
+        good = not errs and det["renderEqual"] and det["demoEqual"] and det["finite"] and det["identityScore"] >= 99.999
+        report["blocks"][bid] = {"contractErrors": errs, **det, "ok": good}
+        ok &= good
+    jobs = []
+    for bid in ids:
+        fitters = bank.list_blocks() if a.cross == "all" else [bid]
+        for ci, params in enumerate(target_sets(bid, a.sets, v["seed"])):
+            for fb in sorted(fitters, key=lambda b: b != bid):  # own block first, so --sabotage hits a recover case
+                expect = "recover" if fb == bid else "overlap"
+                if a.sabotage and not jobs and expect == "recover":
+                    fb = next(b for b in bank.list_blocks() if b != bid)  # sabotage: wrong block declared as right
+                jobs.append({"target": bid, "params": params, "fit": fb, "case": ci, "expect": expect, "seconds": v["seconds"]})
+        defaults = {p["name"]: p["default"] for p in bank.block_class(bid).PARAMS}
+        red = {**defaults, **v["redTargets"].get(bid, {})}
+        for fb in (bank.list_blocks() if a.cross == "all" else contrast_blocks(bid, v)):
+            if fb != bid:
+                jobs.append({"target": bid, "params": red, "fit": fb, "case": "red", "expect": "reject", "seconds": v["seconds"]})
+    if a.mps_check:
+        jobs.append({**jobs[0], "device": "mps", "expect": jobs[0]["expect"] + "-mps"})
+    with ProcessPoolExecutor(max_workers=v["workers"]) as ex:
+        results = list(ex.map(run_case, jobs))
+    for r in results:
+        if r["expect"].startswith("recover"):
+            r["ok"] = r["score"] >= v["recoverMin"]
+        elif r["expect"] == "reject":
+            r["ok"] = r["score"] <= v["wrongMax"]
+        else:
+            r["ok"] = True  # overlap information: a wrong block may legitimately imitate a target inside its overlap
+        ok &= r["ok"]
+        report["cases"].append(r)
+    green = [r["score"] for r in results if r["expect"] == "recover"]
+    red = [r["score"] for r in results if r["expect"] == "reject"]
+    overlap = [r["score"] for r in results if r["expect"] == "overlap"]
+    report["summary"] = {"pass": bool(ok), "recoverMinScore": min(green) if green else None, "rejectMaxScore": max(red) if red else None,
+                         "overlapMaxScore": max(overlap) if overlap else None,
+                         "cases": len(results), "failed": [f"{r['target']}#{r['case']} fit {r['fit']} ({r['expect']}): {r['score']}" for r in results if not r["ok"]],
+                         "seconds": round(time.time() - t0, 1), "sabotage": a.sabotage}
+    if a.json:
+        print(json.dumps(report, indent=1))
+    else:
+        for bid, b in report["blocks"].items():
+            print(f"{'OK ' if b['ok'] else 'RED'} {bid} contract={b['contractErrors'] or 'ok'} render={b['renderEqual']} demo={b['demoEqual']} identity={b['identityScore']}")
+        for r in results:
+            print(f"{'OK ' if r['ok'] else 'RED'} {r['target']}#{r['case']} fit {r['fit']:<22} {r['expect']:<11} ploss {r['score']:7.3f}  b1 {r['b1Score']}  {r['seconds']} s {r['device']}")
+        print(json.dumps(report["summary"]))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

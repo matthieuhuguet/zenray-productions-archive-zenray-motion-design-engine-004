@@ -1,0 +1,100 @@
+# 12 October 2026: the registry of the 18 SFX recipes of R03 section 3.
+# REGISTRY = {kind: Recipe}; Recipe.schema maps the unit cube to physical parameters (log or linear scale, from
+# sfx-params.json), Recipe.render(params, seed, sr) -> float32 mono numpy array. A parameter marked "fit": false
+# (pan, series count) is an event setting, kept at its value during fitting.
+# FR : registre des 18 recettes ; chacune porte son schema et sa fonction de rendu.
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Callable
+
+import numpy as np
+
+from .. import config
+from . import low, noise, tonal, transient
+
+
+class Schema:
+    """Parameter schema of one recipe (all bounds from sfx-params.json)."""
+
+    def __init__(self, spec: dict):
+        self.spec = spec
+        self.names = list(spec)
+        self.fit_names = [k for k in self.names if spec[k].get("fit", True)]
+
+    def _one(self, name: str, value: float) -> float:
+        s = self.spec[name]
+        if s["scale"] == "log":
+            lo, hi = math.log(s["min"]), math.log(s["max"])
+            v = math.exp(lo + value * (hi - lo))
+        else:
+            v = s["min"] + value * (s["max"] - s["min"])
+        return float(round(v)) if s.get("integer") else float(v)
+
+    def to_physical(self, unit, base: dict | None = None) -> dict:
+        """Unit vector over fit_names -> full physical dict (non-fitted names from `base`, else defaults)."""
+        out = dict(base) if base else self.defaults()
+        for name, value in zip(self.fit_names, np.clip(np.asarray(unit, dtype=float), 0.0, 1.0)):
+            out[name] = self._one(name, float(value))
+        return out
+
+    def to_unit(self, params: dict) -> np.ndarray:
+        unit = []
+        for name in self.fit_names:
+            s, v = self.spec[name], params[name]
+            if s["scale"] == "log":
+                lo, hi = math.log(s["min"]), math.log(s["max"])
+                unit.append((math.log(max(v, 1e-12)) - lo) / (hi - lo))
+            else:
+                unit.append((v - s["min"]) / (s["max"] - s["min"]))
+        return np.clip(np.array(unit, dtype=float), 0.0, 1.0)
+
+    def defaults(self) -> dict:
+        return {name: float(self.spec[name]["default"]) for name in self.names}
+
+    def clamp(self, params: dict) -> dict:
+        out = dict(params)
+        for name in self.names:
+            s = self.spec[name]
+            out[name] = float(min(max(params.get(name, s["default"]), s["min"]), s["max"]))
+        return out
+
+
+@dataclass(frozen=True)
+class Recipe:
+    kind: str
+    family: str
+    schema: Schema
+    render: Callable[[dict, int, int], np.ndarray]
+
+
+_FUNCS = {
+    "whoosh": ("noise", noise.whoosh), "swoosh": ("noise", noise.swoosh), "swipe": ("noise", noise.swipe),
+    "riser": ("noise", noise.riser), "downlifter": ("noise", noise.downlifter), "reverse": ("noise", noise.reverse),
+    "click": ("transient", transient.click), "tick": ("transient", transient.tick), "pop": ("transient", transient.pop),
+    "blip": ("transient", transient.blip), "glitch": ("transient", transient.glitch), "keyboard": ("transient", transient.keyboard),
+    "impact": ("low", low.impact), "boom": ("low", low.boom), "subdrop": ("low", low.subdrop), "trigger": ("low", low.trigger),
+    "ding": ("tonal", tonal.ding), "shimmer": ("tonal", tonal.shimmer),
+}
+
+
+def _build() -> dict:
+    specs = config.cfg()["recipes"]
+    missing = set(specs) ^ set(_FUNCS)
+    if missing:
+        raise KeyError(f"recipe list and sfx-params.json disagree on: {sorted(missing)}")
+    return {k: Recipe(k, fam, Schema(specs[k]), fn) for k, (fam, fn) in _FUNCS.items()}
+
+
+REGISTRY: dict[str, Recipe] = _build()
+KINDS = list(REGISTRY)
+
+
+def render_padded(kind: str, params: dict, seed: int, sr: int, shift_ms: float = 0.0) -> np.ndarray:
+    """One event inside a buffer with pre-roll and tail (descriptor convention), optionally delayed by shift_ms."""
+    a = config.cfg()["audio"]
+    body = REGISTRY[kind].render(params, seed, sr).astype(np.float64)
+    pre = int(round((a["preRollSeconds"] + shift_ms / 1000.0) * sr))
+    tail = int(round(a["tailSeconds"] * sr))
+    return np.concatenate([np.zeros(pre), body, np.zeros(tail)])

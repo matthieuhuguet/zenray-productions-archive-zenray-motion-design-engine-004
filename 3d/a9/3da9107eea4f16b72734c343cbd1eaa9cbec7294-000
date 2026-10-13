@@ -1,0 +1,65 @@
+# 12 October 2026: F3 verifier, both ways. Cases: (1) a cooked mark version compared with itself as reference
+# matches (IoU 1); (2) the same render shifted by 1 px does not match; (3) the text SVG re-rendered matches its
+# raster; (4) a variation with a changed parameter reports changed, a no-op variation reports unchanged.
+# --sabotage switches the match rule off (every case "matches"), so the red cases must turn the exit code to 1.
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import numpy as np  # noqa: E402
+from PIL import Image  # noqa: E402
+
+from zrmd import settings  # noqa: E402
+from zrmd.vector import marks as K, render as R  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mark", default="t-no-worries")
+    ap.add_argument("--version", default="V_003")
+    ap.add_argument("--sabotage", action="store_true")
+    ap.add_argument("--out", default=None)
+    a = ap.parse_args()
+    md = K.motion_dir("onekey-pro-2", a.mark)
+    P = json.loads((md / a.version / "params.json").read_text())
+    rgba = K.cook_text(P)
+    c = rgba[..., 3] / 255.0
+    ys, xs = np.nonzero(c > 0.01)
+    t, b, l, r = ys.min() - 8, ys.max() + 9, xs.min() - 8, xs.max() + 9
+    ref = {"c": c[t:b, l:r].astype(np.float32), "weight": np.ones((b - t, r - l), np.float32),
+           "B": np.zeros((b - t, r - l, 3), np.float32), "rgb": rgba[t:b, l:r, :3].astype(np.float32) * c[t:b, l:r, None],
+           "offset": (l, t)}
+    rule = settings.get("vector.marks.match")
+    if a.sabotage:
+        rule = {"iou_min": -1.0, "edge_mean_max_px": 1e9}
+
+    def judged(f):
+        return bool(f["iou_soft"] >= rule["iou_min"] and (f["edge_mean_px"] or 0) <= rule["edge_mean_max_px"])
+    cases = []
+    f = K.evaluate_rgba(rgba, ref)
+    cases.append({"case": "self", "expect": True, "got": judged(f), "iou_soft": f["iou_soft"]})
+    shifted = np.roll(rgba, 1, axis=1)
+    f = K.evaluate_rgba(shifted, ref)
+    cases.append({"case": "shift 1 px", "expect": False, "got": judged(f), "iou_soft": f["iou_soft"]})
+    svg_c = R.svg_mask(K.text_svg(P), 1920, 1080)
+    hi = float(np.maximum(svg_c, c).sum())
+    iou = float(np.minimum(svg_c, c).sum()) / hi
+    cases.append({"case": "svg vs raster", "expect": True, "got": iou >= settings.get("vector.verify.cross_renderer.iou_min", 0.98) or a.sabotage,
+                  "iou_soft": round(iou, 5)})
+    P2 = {**P, "colour": "#ff0000"}
+    changed = not np.array_equal(K.cook_text(P2), rgba)
+    cases.append({"case": "variation colour", "expect": True, "got": changed or a.sabotage})
+    same = not np.array_equal(K.cook_text(dict(P)), rgba)
+    cases.append({"case": "no-op variation", "expect": False, "got": same or a.sabotage})
+    ok = all(c_["expect"] == c_["got"] for c_ in cases)
+    out = {"date": "12 October 2026", "mark": a.mark, "version": a.version, "sabotage": a.sabotage, "ok": ok, "cases": cases}
+    print(json.dumps(out, indent=1))
+    if a.out:
+        Path(a.out).write_text(json.dumps(out, indent=1))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

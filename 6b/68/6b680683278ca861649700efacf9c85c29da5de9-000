@@ -1,0 +1,54 @@
+# 12 October 2026, 10:20 CEST: render a cooked HyperFrames project through the pinned private wrapper.
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from . import settings
+
+WRAPPER = settings.REPO / "Scripts" / "RunHyperframes.mjs"
+
+
+def hf(project: str | Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["node", str(WRAPPER), *args], cwd=str(project), capture_output=True, text=True, check=check)
+
+
+def render(project: str | Path, out: str | Path, fps: int = 60, workers: int = 1, quality: str = "looks") -> Path:
+    out = Path(out).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    result = hf(project, "render", "-f", str(fps), "-q", quality, "-w", str(workers), "-o", str(out), check=False)
+    if result.returncode != 0 or not out.exists():
+        raise RuntimeError(f"render failed ({result.returncode}): {result.stdout[-1500:]} {result.stderr[-1500:]}")
+    return out
+
+
+def lint(project: str | Path) -> str:
+    return hf(project, "lint", ".", "--json", check=False).stdout
+
+
+def still(project: str | Path, times: list[float], out_dir: str | Path, timeout_ms: int = 10000,
+          browser_gpu: str = "auto") -> list[Path]:
+    # 12 October 2026: lossless PNG stills at exact instants through `hyperframes snapshot` (one browser launch for
+    # every instant, a few seconds in total). Used by the shader bank, where an MP4 would add chroma subsampling and
+    # compression error on top of the GLSL-versus-twin comparison. Returns the PNGs in the order of `times`.
+    import re
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for old in out_dir.glob("frame-*.png"):
+        old.unlink()  # 12 October 2026: stale stills from a previous call in the same scratch folder only.
+    args = ["snapshot", ".", "--at", ",".join(f"{t:.6f}" for t in times), "--no-end", "--describe", "false",
+            "--timeout", str(timeout_ms), "-o", str(out_dir)]
+    if browser_gpu == "on":
+        args.append("--browser-gpu")
+    elif browser_gpu == "off":
+        args.append("--no-browser-gpu")
+    result = hf(project, *args, check=False)
+    found = {}
+    for p in out_dir.glob("frame-*.png"):
+        m = re.match(r"frame-(\d+)-", p.name)
+        if m:
+            found[int(m.group(1))] = p
+    if result.returncode != 0 or len(found) != len(times):
+        raise RuntimeError(f"still failed ({result.returncode}, {len(found)}/{len(times)} frames): "
+                           f"{result.stdout[-1500:]} {result.stderr[-1500:]}")
+    return [found[i] for i in range(len(times))]

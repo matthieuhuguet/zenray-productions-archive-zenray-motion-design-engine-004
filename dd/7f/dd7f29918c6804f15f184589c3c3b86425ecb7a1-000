@@ -1,0 +1,23 @@
+// 12 October 2026, 12:15 CEST: the engine runner parses the CLI's JSON and turns a failure into a named error.
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { createEngine, parseCliJson } from '../lib/engine.mjs'
+import { loadConfig } from '../lib/config.mjs'
+import { tempWorkshop, testConfig } from './helpers.mjs'
+
+test('parse', () => {
+  assert.deepEqual(parseCliJson('warning\n{\n "ok": true\n}\n'), { ok: true })
+  assert.equal(parseCliJson(''), null)
+  assert.equal(parseCliJson('not json'), null)
+})
+
+test('real engine, both ways', async () => {
+  const config = testConfig(tempWorkshop())
+  const engine = createEngine(config.engine)
+  const exposed = await engine.call(['exposed', 'selftest'])
+  assert.equal(exposed.version, 'V_001')
+  assert.ok(exposed.categories.colour.length <= exposed.max_per_category)
+  await assert.rejects(engine.call(['exposed', 'missing-motion']), /unknown motion/)
+  const broken = createEngine({ ...loadConfig().engine, python: '/nonexistent/python' })
+  await assert.rejects(broken.call(['motions']), { code: 'engine-missing' })
+})
